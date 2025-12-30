@@ -3,7 +3,6 @@
 
 const express = require("express");
 const cors = require("cors");
-const compression = require("compression");
 const { v4: uuid } = require("uuid");
 const path = require("path");
 const fs = require("fs");
@@ -11,41 +10,32 @@ const multer = require("multer");
 const crypto = require("crypto");
 
 const app = express();
-app.set("trust proxy", 1);
 const PORT = process.env.PORT || 4000;
 
 // Allow bigger JSON bodies (base64 images from frontend)
-// CORS (allow frontend on tutopay.online to call the Railway API)
-const allowedOrigins = new Set([
+const allowedOrigins = [
   "https://tutopay.online",
   "https://www.tutopay.online",
   "http://localhost:5500",
   "http://127.0.0.1:5500",
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-]);
+];
 
 const corsOptions = {
-  origin: (origin, cb) => {
-    // Allow requests with no origin (curl, Postman, server-to-server)
+  origin: function (origin, cb) {
+    // Allow non-browser tools (no Origin header) like curl/Postman
     if (!origin) return cb(null, true);
-
-    // Allow exact matches
-    if (allowedOrigins.has(origin)) return cb(null, true);
-
-    // Allow any subdomain of tutopay.online
-    if (/^https?:\/\/[a-z0-9-]+\.tutopay\.online$/i.test(origin)) return cb(null, true);
-
-    return cb(null, false);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    // Allow Railway preview domains too
+    if (/\.up\.railway\.app$/.test(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS: ' + origin));
   },
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true,
-  maxAge: 86400,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  optionsSuccessStatus: 204,
 };
+
 app.use(cors(corsOptions));
-app.use(compression());
-app.options("*", cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: "50mb" }));  // ⬅️ change 5mb → 50mb
 
 // (optional, but good for safety if you use urlencoded anywhere)
@@ -350,34 +340,39 @@ app.post("/api/auth/login", (req, res) => {
 });
 
 // -------- Items --------
-app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
-
 app.get("/api/items", (req, res) => {
-  // Optional pagination: /api/items?page=1&limit=50
-  const page = Math.max(parseInt(req.query.page || "1", 10), 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit || "0", 10), 0), 500);
+  // Default: return a lightweight list (no huge base64 images).
+  // Use ?full=1 to return full objects, including imageUrls/base64.
+  const full = String(req.query.full || '').toLowerCase();
+  const wantFull = full === '1' || full === 'true' || full === 'yes';
 
-  // Optional lite mode: /api/items?lite=1  (removes imageUrls array, keeps imageUrl)
-  const lite = String(req.query.lite || "") === "1";
+  if (wantFull) return res.json(items);
 
-  // Convert any legacy base64 images to /uploads URLs (one-time, in-memory)
-  items.forEach(convertItemImagesInPlace);
+  const lite = items.map((it) => {
+    const out = { ...it };
+    const urls = Array.isArray(it.imageUrls) ? it.imageUrls : (it.imageUrl ? [it.imageUrl] : []);
+    const thumb = urls.length ? urls[0] : null;
+    // If thumb is a huge base64 blob, don't send it in list responses.
+    if (typeof thumb === 'string' && thumb.startsWith('data:') && thumb.length > 2000) {
+      out.imageUrl = null;
+    } else {
+      out.imageUrl = thumb;
+    }
+    out.imageCount = urls.length;
+    delete out.imageUrls;
+    return out;
+  });
 
-  let out = items;
-  if (limit > 0) {
-    const start = (page - 1) * limit;
-    out = items.slice(start, start + limit);
-  }
-
-  if (lite) {
-    out = out.map((it) => {
-      const { imageUrls, ...rest } = it;
-      return rest;
-    });
-  }
-
-  res.json(out);
+  res.json(lite);
 });
+
+// Fetch full item details (including imageUrls) when user opens a listing
+app.get("/api/items/:id", (req, res) => {
+  const it = items.find((x) => x.id === req.params.id);
+  if (!it) return res.status(404).json({ error: 'Item not found' });
+  res.json(it);
+});
+
 app.post("/api/items", requireAuth, (req, res) => {
     const {
   title,
@@ -434,7 +429,6 @@ const item = {
   condition: condition || "used",
 };
 
-  convertItemImagesInPlace(item);
   items.push(item);
   res.status(201).json(item);
 });
@@ -1175,6 +1169,14 @@ app.get("/api/admin/audit", requireAuth, (req, res) => {
 });
 
 // -------- Start server --------
+
+// ---- JSON error handler (so frontend doesn't get HTML/doctype) ----
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: err.message || 'Server error' });
+});
+
 app.listen(PORT, () => {
   console.log(`TutoPay backend listening on port ${PORT}`);
 });
