@@ -10,7 +10,7 @@ const multer = require("multer");
 const crypto = require("crypto");
 
 const app = express();
-app.set("trust proxy", 1);
+app.set('trust proxy', 1); // so req.protocol works behind Railway
 const PORT = process.env.PORT || 4000;
 
 // Allow bigger JSON bodies (base64 images from frontend)
@@ -22,11 +22,55 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // Serve the frontend and uploaded dispute docs
 app.use(express.static("public"));
+app.use('/uploads', express.static(uploadDir)); // serve uploaded files/images
 
 // ===== Dispute document uploads (Multer) =====
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
+
+// --- Helpers: store base64(data:) images as real files in /uploads and return public URLs ---
+function _baseUrl(req) {
+  // On Railway, trust proxy is enabled so req.protocol should be correct
+  return `${req.protocol}://${req.get('host')}`;
+}
+function _storeMaybeDataImage(input, req) {
+  if (!input || typeof input !== 'string') return '';
+  if (!input.startsWith('data:image/')) return input; // already a URL
+  const comma = input.indexOf(',');
+  if (comma === -1) return '';
+  const meta = input.slice(0, comma);
+  const b64 = input.slice(comma + 1);
+  const m = /data:image\/(png|jpeg|jpg|webp|gif);base64/i.exec(meta);
+  const ext = m ? (m[1] === 'jpeg' ? 'jpg' : m[1]) : 'png';
+  const name = `img_${Date.now()}_${Math.random().toString(16).slice(2)}.${ext}`;
+  const filePath = path.join(uploadDir, name);
+  try {
+    fs.writeFileSync(filePath, Buffer.from(b64, 'base64'));
+    return `${_baseUrl(req)}/uploads/${name}`;
+  } catch (e) {
+    console.error('Failed to write image file:', e);
+    return '';
+  }
+}
+function _migrateItemImages(item, req) {
+  if (!item) return;
+  const urls = [];
+  const push = (u) => {
+    const out = _storeMaybeDataImage(u, req);
+    if (out) urls.push(out);
+  };
+  if (Array.isArray(item.imageUrls)) item.imageUrls.forEach(push);
+  if (item.imageUrl) push(item.imageUrl);
+  // De-dup and keep stable order
+  const seen = new Set();
+  item.imageUrls = urls.filter((u) => (seen.has(u) ? false : (seen.add(u), true)));
+  item.imageUrl = item.imageUrls[0] || '';
+}
+function _migrateAllItems(req) {
+  try { items.forEach((it) => _migrateItemImages(it, req)); } catch (e) {}
+}
+
 }
 
 const disputeUpload = multer({
@@ -320,6 +364,7 @@ app.post("/api/auth/login", (req, res) => {
 
 // -------- Items --------
 app.get("/api/items", (req, res) => {
+  _migrateAllItems(req);
   res.json(items);
 });
 
@@ -364,7 +409,9 @@ app.post("/api/items", requireAuth, (req, res) => {
   }
 
     const urlsArray = Array.isArray(imageUrls) ? imageUrls.slice(0, 15) : [];
-  const firstUrl = imageUrl || (urlsArray[0] || "");
+  // Convert any base64 data URLs into real files so /api/items stays small
+  const storedUrls = urlsArray.map(u => _storeMaybeDataImage(u, req)).filter(Boolean);
+  const firstUrl = _storeMaybeDataImage(imageUrl, req) || storedUrls[0] || "";
 
 const item = {
   code: itemNumber,
@@ -374,7 +421,7 @@ const item = {
   sellerPhone,
   holdHours: holdHours ? Number(holdHours) : 24,
   imageUrl: firstUrl || "",
-  imageUrls: urlsArray,
+  imageUrls: storedUrls,
   availability: availability || "available",
   condition: condition || "used",
 };
@@ -385,6 +432,7 @@ const item = {
 
 // Public: catalogue for a given seller
 app.get("/api/public/seller/:sellerPhone", (req, res) => {
+  _migrateAllItems(req);
   const phone = req.params.sellerPhone;
   const sellerItems = items.filter((i) => i.sellerPhone === phone);
   res.json(sellerItems);
@@ -392,27 +440,28 @@ app.get("/api/public/seller/:sellerPhone", (req, res) => {
 
 // Public: fetch item by code
 app.get("/api/public/item/:code", (req, res) => {
+  _migrateAllItems(req);
   const code = req.params.code;
   const item = items.find((it) => it.code === code);
 
-  if (!item) return res.status(404).json({ error: "Item not found." });
-
-  const holdDurationHours =
-    item && item.holdHours != null ? Number(item.holdHours) : 24;
+  if (!item) {
+    return res.status(404).json({ error: "Item not found." });
+  }
 
   res.json({
-    code: item.code,
-    title: item.title,
-    details: item.details || "",
-    price: item.price,
-    holdHours: holdDurationHours,
-    imageUrl: item.imageUrl,
-    imageUrls: Array.isArray(item.imageUrls)
-      ? item.imageUrls
-      : (item.imageUrl ? [item.imageUrl] : []),
-    availability: item.availability,
-    sellerPhone: item.sellerPhone,
-  });
+  code: item.code,
+  title: item.title,
+  details: item.details || "",
+  price: item.price,
+          holdHours: holdDurationHours,
+  imageUrl: item.imageUrl,
+  imageUrls: Array.isArray(item.imageUrls)
+    ? item.imageUrls
+    : (item.imageUrl ? [item.imageUrl] : []),
+  availability: item.availability,
+  holdHours: item.holdHours,
+  sellerPhone: item.sellerPhone,
+});
 });
 
 // -------- Transactions (escrow) --------
@@ -494,7 +543,6 @@ const tx = {
     amount: priceNum,
     deliveryMethod, // 'self_collect' or 'seller_delivery'
     deliveryPoint: deliveryPoint || "",
-    holdDurationHours,
     liveLocation: null, // { lat, lng, updatedAt }
     status: "pending",
     createdAt: nowIso(),
