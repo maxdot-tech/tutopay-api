@@ -3,6 +3,7 @@
 
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");
 const { v4: uuid } = require("uuid");
 const path = require("path");
 const fs = require("fs");
@@ -43,6 +44,7 @@ const corsOptions = {
   maxAge: 86400,
 };
 app.use(cors(corsOptions));
+app.use(compression());
 app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "50mb" }));  // ⬅️ change 5mb → 50mb
 
@@ -348,10 +350,34 @@ app.post("/api/auth/login", (req, res) => {
 });
 
 // -------- Items --------
-app.get("/api/items", (req, res) => {
-  res.json(items);
-});
+app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+app.get("/api/items", (req, res) => {
+  // Optional pagination: /api/items?page=1&limit=50
+  const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit || "0", 10), 0), 500);
+
+  // Optional lite mode: /api/items?lite=1  (removes imageUrls array, keeps imageUrl)
+  const lite = String(req.query.lite || "") === "1";
+
+  // Convert any legacy base64 images to /uploads URLs (one-time, in-memory)
+  items.forEach(convertItemImagesInPlace);
+
+  let out = items;
+  if (limit > 0) {
+    const start = (page - 1) * limit;
+    out = items.slice(start, start + limit);
+  }
+
+  if (lite) {
+    out = out.map((it) => {
+      const { imageUrls, ...rest } = it;
+      return rest;
+    });
+  }
+
+  res.json(out);
+});
 app.post("/api/items", requireAuth, (req, res) => {
     const {
   title,
@@ -408,6 +434,7 @@ const item = {
   condition: condition || "used",
 };
 
+  convertItemImagesInPlace(item);
   items.push(item);
   res.status(201).json(item);
 });
