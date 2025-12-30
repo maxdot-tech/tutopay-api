@@ -10,11 +10,40 @@ const multer = require("multer");
 const crypto = require("crypto");
 
 const app = express();
-app.set('trust proxy', 1); // so req.protocol works behind Railway
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 4000;
 
 // Allow bigger JSON bodies (base64 images from frontend)
-app.use(cors());
+// CORS (allow frontend on tutopay.online to call the Railway API)
+const allowedOrigins = new Set([
+  "https://tutopay.online",
+  "https://www.tutopay.online",
+  "http://localhost:5500",
+  "http://127.0.0.1:5500",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+]);
+
+const corsOptions = {
+  origin: (origin, cb) => {
+    // Allow requests with no origin (curl, Postman, server-to-server)
+    if (!origin) return cb(null, true);
+
+    // Allow exact matches
+    if (allowedOrigins.has(origin)) return cb(null, true);
+
+    // Allow any subdomain of tutopay.online
+    if (/^https?:\/\/[a-z0-9-]+\.tutopay\.online$/i.test(origin)) return cb(null, true);
+
+    return cb(null, false);
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+  maxAge: 86400,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "50mb" }));  // ⬅️ change 5mb → 50mb
 
 // (optional, but good for safety if you use urlencoded anywhere)
@@ -22,55 +51,11 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // Serve the frontend and uploaded dispute docs
 app.use(express.static("public"));
-app.use('/uploads', express.static(uploadDir)); // serve uploaded files/images
 
 // ===== Dispute document uploads (Multer) =====
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
-
-// --- Helpers: store base64(data:) images as real files in /uploads and return public URLs ---
-function _baseUrl(req) {
-  // On Railway, trust proxy is enabled so req.protocol should be correct
-  return `${req.protocol}://${req.get('host')}`;
-}
-function _storeMaybeDataImage(input, req) {
-  if (!input || typeof input !== 'string') return '';
-  if (!input.startsWith('data:image/')) return input; // already a URL
-  const comma = input.indexOf(',');
-  if (comma === -1) return '';
-  const meta = input.slice(0, comma);
-  const b64 = input.slice(comma + 1);
-  const m = /data:image\/(png|jpeg|jpg|webp|gif);base64/i.exec(meta);
-  const ext = m ? (m[1] === 'jpeg' ? 'jpg' : m[1]) : 'png';
-  const name = `img_${Date.now()}_${Math.random().toString(16).slice(2)}.${ext}`;
-  const filePath = path.join(uploadDir, name);
-  try {
-    fs.writeFileSync(filePath, Buffer.from(b64, 'base64'));
-    return `${_baseUrl(req)}/uploads/${name}`;
-  } catch (e) {
-    console.error('Failed to write image file:', e);
-    return '';
-  }
-}
-function _migrateItemImages(item, req) {
-  if (!item) return;
-  const urls = [];
-  const push = (u) => {
-    const out = _storeMaybeDataImage(u, req);
-    if (out) urls.push(out);
-  };
-  if (Array.isArray(item.imageUrls)) item.imageUrls.forEach(push);
-  if (item.imageUrl) push(item.imageUrl);
-  // De-dup and keep stable order
-  const seen = new Set();
-  item.imageUrls = urls.filter((u) => (seen.has(u) ? false : (seen.add(u), true)));
-  item.imageUrl = item.imageUrls[0] || '';
-}
-function _migrateAllItems(req) {
-  try { items.forEach((it) => _migrateItemImages(it, req)); } catch (e) {}
-}
-
 }
 
 const disputeUpload = multer({
@@ -364,7 +349,6 @@ app.post("/api/auth/login", (req, res) => {
 
 // -------- Items --------
 app.get("/api/items", (req, res) => {
-  _migrateAllItems(req);
   res.json(items);
 });
 
@@ -409,9 +393,7 @@ app.post("/api/items", requireAuth, (req, res) => {
   }
 
     const urlsArray = Array.isArray(imageUrls) ? imageUrls.slice(0, 15) : [];
-  // Convert any base64 data URLs into real files so /api/items stays small
-  const storedUrls = urlsArray.map(u => _storeMaybeDataImage(u, req)).filter(Boolean);
-  const firstUrl = _storeMaybeDataImage(imageUrl, req) || storedUrls[0] || "";
+  const firstUrl = imageUrl || (urlsArray[0] || "");
 
 const item = {
   code: itemNumber,
@@ -421,7 +403,7 @@ const item = {
   sellerPhone,
   holdHours: holdHours ? Number(holdHours) : 24,
   imageUrl: firstUrl || "",
-  imageUrls: storedUrls,
+  imageUrls: urlsArray,
   availability: availability || "available",
   condition: condition || "used",
 };
@@ -432,7 +414,6 @@ const item = {
 
 // Public: catalogue for a given seller
 app.get("/api/public/seller/:sellerPhone", (req, res) => {
-  _migrateAllItems(req);
   const phone = req.params.sellerPhone;
   const sellerItems = items.filter((i) => i.sellerPhone === phone);
   res.json(sellerItems);
@@ -440,7 +421,6 @@ app.get("/api/public/seller/:sellerPhone", (req, res) => {
 
 // Public: fetch item by code
 app.get("/api/public/item/:code", (req, res) => {
-  _migrateAllItems(req);
   const code = req.params.code;
   const item = items.find((it) => it.code === code);
 
