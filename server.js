@@ -341,29 +341,45 @@ app.post("/api/auth/login", (req, res) => {
 
 // -------- Items --------
 app.get("/api/items", (req, res) => {
-  // Default: return a lightweight list (no huge base64 images).
-  // Use ?full=1 to return full objects, including imageUrls/base64.
-  const full = String(req.query.full || '').toLowerCase();
-  const wantFull = full === '1' || full === 'true' || full === 'yes';
+  // Default: lightweight list (no base64 images) to save bandwidth.
+  // Use ?full=1 for full objects (including imageUrls).
+  const full = String(req.query.full || "") === "1";
 
-  if (wantFull) return res.json(items);
+  if (full) {
+    res.set("Cache-Control", "no-store");
+    return res.json(items);
+  }
 
-  const lite = items.map((it) => {
-    const out = { ...it };
-    const urls = Array.isArray(it.imageUrls) ? it.imageUrls : (it.imageUrl ? [it.imageUrl] : []);
-    const thumb = urls.length ? urls[0] : null;
-    // If thumb is a huge base64 blob, don't send it in list responses.
-    if (typeof thumb === 'string' && thumb.startsWith('data:') && thumb.length > 2000) {
-      out.imageUrl = null;
-    } else {
-      out.imageUrl = thumb;
-    }
-    out.imageCount = urls.length;
-    delete out.imageUrls;
-    return out;
+  const list = items.map((it) => {
+    const imageCount = Array.isArray(it.imageUrls) ? it.imageUrls.length : 0;
+    const hasAnyImage = imageCount > 0;
+
+    return {
+      id: it.id,
+      itemCode: it.itemCode,
+      itemNumber: it.itemNumber,
+      title: it.title || it.name,
+      name: it.name,
+      description: it.description,
+      price: it.price,
+      phone: it.phone,
+      sellerPhone: it.sellerPhone,
+      category: it.category,
+      availability: it.availability,
+      holdDuration: it.holdDuration,
+      createdAt: it.createdAt,
+
+      // UI helper fields
+      imageCount,
+      hasImages: hasAnyImage,
+      // Use a separate endpoint so the list JSON stays tiny.
+      thumbUrl: `/api/items/${encodeURIComponent(it.id)}/thumb`,
+    };
   });
 
-  res.json(lite);
+  // Let browser cache for a short time; refreshed by polling anyway.
+  res.set("Cache-Control", "public, max-age=10");
+  return res.json(list);
 });
 
 // Fetch full item details (including imageUrls) when user opens a listing
@@ -372,6 +388,51 @@ app.get("/api/items/:id", (req, res) => {
   if (!it) return res.status(404).json({ error: 'Item not found' });
   res.json(it);
 });
+
+
+app.get("/api/items/:id/thumb", (req, res) => {
+  const it = items.find((x) => x.id === req.params.id);
+  if (!it) return res.status(404).end();
+
+  // Prefer first uploaded image (data URL), else render a simple SVG placeholder.
+  const urls = Array.isArray(it.imageUrls) ? it.imageUrls : [];
+  const src = urls[0];
+
+  // If the stored image is a data URL, return it as an actual image response.
+  if (typeof src === "string" && src.startsWith("data:image/")) {
+    const match = src.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
+    if (match) {
+      const contentType = match[1];
+      const b64 = match[2];
+      try {
+        const buf = Buffer.from(b64, "base64");
+        res.set("Content-Type", contentType);
+        res.set("Cache-Control", "public, max-age=86400, immutable");
+        return res.send(buf);
+      } catch (e) {
+        // fall through to placeholder
+      }
+    }
+  }
+
+  // Safe, self-hosted placeholder (no external requests).
+  const label = String(it.name || it.title || it.itemCode || "Item")
+    .replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))
+    .slice(0, 22);
+
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 240 160">` +
+    `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
+    `<stop offset="0" stop-color="#1b2430"/><stop offset="1" stop-color="#0c121a"/></linearGradient></defs>` +
+    `<rect width="240" height="160" rx="18" fill="url(#g)"/>` +
+    `<text x="120" y="86" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" fill="#b9c6d6">${label}</text>` +
+    `</svg>`;
+
+  res.set("Content-Type", "image/svg+xml; charset=utf-8");
+  res.set("Cache-Control", "public, max-age=86400, immutable");
+  return res.send(svg);
+});
+
 
 app.post("/api/items", requireAuth, (req, res) => {
     const {
