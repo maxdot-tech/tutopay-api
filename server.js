@@ -69,25 +69,60 @@ const disputeUpload = multer({
 // Expose uploaded dispute docs (e.g. for admin review)
 app.use("/uploads", express.static(uploadDir));
 
+function saveDataUrlToUploads(dataUrl, prefix = "img") {
+  if (typeof dataUrl !== "string") return null;
+  if (!dataUrl.startsWith("data:")) return null;
+
+  const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
+  if (!match) return null;
+
+  const mime = match[1];
+  const b64 = match[2];
+  const ext = mime.includes("png")
+    ? "png"
+    : mime.includes("jpeg") || mime.includes("jpg")
+    ? "jpg"
+    : mime.includes("webp")
+    ? "webp"
+    : "bin";
+
+  const filename = `${prefix}-${Date.now()}-${Math.random()
+    .toString(16)
+    .slice(2)}.${ext}`;
+  const filepath = path.join(uploadDir, filename);
+  try {
+    fs.writeFileSync(filepath, Buffer.from(b64, "base64"));
+    return `/uploads/${filename}`;
+  } catch (e) {
+    return null;
+  }
+}
+
 // -------- In-memory "database" --------
 const items = [
   {
+    id: uuidv4(),
     code: "1000",
+    itemCode: "1000",
+    itemNumber: 1000,
     title: "Laptop, Lenovo (Used)",
     price: 5000,
     sellerPhone: "0977623456",
     holdHours: 24,
-    imageUrl: "https://via.placeholder.com/120x80.png?text=Lenovo+1",
+    imageUrls: [],
     availability: "available",
     condition: "used",
   },
   {
+    id: uuidv4(),
     code: "1001",
+    itemCode: "1001",
+    itemNumber: 1001,
     title: "Laptop, Lenovo (New)",
     price: 11500,
     sellerPhone: "0977100999",
     holdHours: 24,
-    imageUrl: "https://via.placeholder.com/120x80.png?text=Lenovo+2",
+    imageUrls: [],
     availability: "available",
     condition: "new",
   },
@@ -217,6 +252,24 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Save data URLs (base64 images) to /uploads and return a public path (/uploads/..)
+function saveDataUrlToUpload(dataUrl, prefix = "img") {
+  if (typeof dataUrl !== "string") return null;
+  if (!dataUrl.startsWith("data:")) return null;
+
+  // data:image/png;base64,AAAA...
+  const m = dataUrl.match(/^data:([\w/+.-]+);base64,(.+)$/);
+  if (!m) return null;
+  const mime = m[1];
+  const b64 = m[2];
+  const ext = mime.includes("png") ? "png" : mime.includes("jpeg") || mime.includes("jpg") ? "jpg" : mime.includes("webp") ? "webp" : "bin";
+  const filename = `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
+  const abs = path.join(UPLOADS_DIR, filename);
+  const buf = Buffer.from(b64, "base64");
+  fs.writeFileSync(abs, buf);
+  return `/uploads/${filename}`;
+}
+
 // -------- OTP START (demo: code logged to backend console) --------
 app.post("/api/otp/start", requireAuth, (req, res) => {
   const { purpose, txId } = req.body || {};
@@ -341,45 +394,29 @@ app.post("/api/auth/login", (req, res) => {
 
 // -------- Items --------
 app.get("/api/items", (req, res) => {
-  // Default: lightweight list (no base64 images) to save bandwidth.
-  // Use ?full=1 for full objects (including imageUrls).
-  const full = String(req.query.full || "") === "1";
+  // Default: return a lightweight list (no huge base64 images).
+  // Use ?full=1 to return full objects, including imageUrls/base64.
+  const full = String(req.query.full || '').toLowerCase();
+  const wantFull = full === '1' || full === 'true' || full === 'yes';
 
-  if (full) {
-    res.set("Cache-Control", "no-store");
-    return res.json(items);
-  }
+  if (wantFull) return res.json(items);
 
-  const list = items.map((it) => {
-    const imageCount = Array.isArray(it.imageUrls) ? it.imageUrls.length : 0;
-    const hasAnyImage = imageCount > 0;
-
-    return {
-      id: it.id,
-      itemCode: it.itemCode,
-      itemNumber: it.itemNumber,
-      title: it.title || it.name,
-      name: it.name,
-      description: it.description,
-      price: it.price,
-      phone: it.phone,
-      sellerPhone: it.sellerPhone,
-      category: it.category,
-      availability: it.availability,
-      holdDuration: it.holdDuration,
-      createdAt: it.createdAt,
-
-      // UI helper fields
-      imageCount,
-      hasImages: hasAnyImage,
-      // Use a separate endpoint so the list JSON stays tiny.
-      thumbUrl: `/api/items/${encodeURIComponent(it.id)}/thumb`,
-    };
+  const lite = items.map((it) => {
+    const out = { ...it };
+    const urls = Array.isArray(it.imageUrls) ? it.imageUrls : (it.imageUrl ? [it.imageUrl] : []);
+    const thumb = urls.length ? urls[0] : null;
+    // If thumb is a huge base64 blob, don't send it in list responses.
+    if (typeof thumb === 'string' && thumb.startsWith('data:') && thumb.length > 2000) {
+      out.imageUrl = null;
+    } else {
+      out.imageUrl = thumb;
+    }
+    out.imageCount = urls.length;
+    delete out.imageUrls;
+    return out;
   });
 
-  // Let browser cache for a short time; refreshed by polling anyway.
-  res.set("Cache-Control", "public, max-age=10");
-  return res.json(list);
+  res.json(lite);
 });
 
 // Fetch full item details (including imageUrls) when user opens a listing
@@ -388,51 +425,6 @@ app.get("/api/items/:id", (req, res) => {
   if (!it) return res.status(404).json({ error: 'Item not found' });
   res.json(it);
 });
-
-
-app.get("/api/items/:id/thumb", (req, res) => {
-  const it = items.find((x) => x.id === req.params.id);
-  if (!it) return res.status(404).end();
-
-  // Prefer first uploaded image (data URL), else render a simple SVG placeholder.
-  const urls = Array.isArray(it.imageUrls) ? it.imageUrls : [];
-  const src = urls[0];
-
-  // If the stored image is a data URL, return it as an actual image response.
-  if (typeof src === "string" && src.startsWith("data:image/")) {
-    const match = src.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
-    if (match) {
-      const contentType = match[1];
-      const b64 = match[2];
-      try {
-        const buf = Buffer.from(b64, "base64");
-        res.set("Content-Type", contentType);
-        res.set("Cache-Control", "public, max-age=86400, immutable");
-        return res.send(buf);
-      } catch (e) {
-        // fall through to placeholder
-      }
-    }
-  }
-
-  // Safe, self-hosted placeholder (no external requests).
-  const label = String(it.name || it.title || it.itemCode || "Item")
-    .replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))
-    .slice(0, 22);
-
-  const svg =
-    `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 240 160">` +
-    `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
-    `<stop offset="0" stop-color="#1b2430"/><stop offset="1" stop-color="#0c121a"/></linearGradient></defs>` +
-    `<rect width="240" height="160" rx="18" fill="url(#g)"/>` +
-    `<text x="120" y="86" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" fill="#b9c6d6">${label}</text>` +
-    `</svg>`;
-
-  res.set("Content-Type", "image/svg+xml; charset=utf-8");
-  res.set("Cache-Control", "public, max-age=86400, immutable");
-  return res.send(svg);
-});
-
 
 app.post("/api/items", requireAuth, (req, res) => {
     const {
@@ -474,18 +466,35 @@ app.post("/api/items", requireAuth, (req, res) => {
     return res.status(409).json({ error: "Item number already exists" });
   }
 
-    const urlsArray = Array.isArray(imageUrls) ? imageUrls.slice(0, 15) : [];
-  const firstUrl = imageUrl || (urlsArray[0] || "");
+  // Normalize images: convert base64 data URLs to /uploads/... files.
+  const rawUrls = Array.isArray(imageUrls) ? imageUrls.slice(0, 15) : [];
+  const normalizedUrls = rawUrls
+    .map((u, idx) => {
+      const saved = saveDataUrlToUploads(u, `item_${itemNumber}_${idx}`);
+      return saved || (typeof u === "string" ? u : "");
+    })
+    .filter(Boolean);
 
-const item = {
+  const rawFirst = imageUrl || rawUrls[0] || "";
+  const normalizedFirst =
+    saveDataUrlToUploads(rawFirst, `item_${itemNumber}_0`) ||
+    (typeof rawFirst === "string" ? rawFirst : "");
+
+  // If seller didn't provide an array but did provide a single imageUrl, include it.
+  const imageList = normalizedUrls.length ? normalizedUrls : (normalizedFirst ? [normalizedFirst] : []);
+
+  const item = {
+  id: uuidv4(),
   code: itemNumber,
+  itemCode: itemNumber,
+  itemNumber: Number(itemNumber),
   title,
   details: details || "",
   price: Number(price),
   sellerPhone,
   holdHours: holdHours ? Number(holdHours) : 24,
-  imageUrl: firstUrl || "",
-  imageUrls: urlsArray,
+  imageUrl: imageList[0] || "",
+  imageUrls: imageList,
   availability: availability || "available",
   condition: condition || "used",
 };
@@ -511,19 +520,18 @@ app.get("/api/public/item/:code", (req, res) => {
   }
 
   res.json({
-  code: item.code,
-  title: item.title,
-  details: item.details || "",
-  price: item.price,
-          holdHours: holdDurationHours,
-  imageUrl: item.imageUrl,
-  imageUrls: Array.isArray(item.imageUrls)
-    ? item.imageUrls
-    : (item.imageUrl ? [item.imageUrl] : []),
-  availability: item.availability,
-  holdHours: item.holdHours,
-  sellerPhone: item.sellerPhone,
-});
+    id: item.id,
+    code: item.code,
+    itemCode: item.itemCode || item.code,
+    itemNumber: item.itemNumber || Number(item.code),
+    title: item.title,
+    details: item.details || "",
+    price: item.price,
+    imageUrls: Array.isArray(item.imageUrls) ? item.imageUrls : [],
+    availability: item.availability,
+    holdHours: item.holdHours,
+    sellerPhone: item.sellerPhone,
+  });
 });
 
 // -------- Transactions (escrow) --------
