@@ -10,10 +10,6 @@ const multer = require("multer");
 const crypto = require("crypto");
 
 const app = express();
-
-// Serve uploaded files
-const path = require("path");
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 const PORT = process.env.PORT || 4000;
 
 // Allow bigger JSON bodies (base64 images from frontend)
