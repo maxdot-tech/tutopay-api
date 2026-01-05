@@ -69,9 +69,72 @@ const disputeUpload = multer({
 // Expose uploaded dispute docs (e.g. for admin review)
 app.use("/uploads", express.static(uploadDir));
 
+// ===== Item image helpers (convert base64 data URLs to real files in /uploads) =====
+function extFromMime(mime) {
+  if (!mime) return "png";
+  if (mime.includes("jpeg")) return "jpg";
+  if (mime.includes("png")) return "png";
+  if (mime.includes("webp")) return "webp";
+  if (mime.includes("gif")) return "gif";
+  return "png";
+}
+
+function saveDataUrlToUploads(dataUrl, prefix = "item") {
+  if (typeof dataUrl !== "string") return "";
+  if (!dataUrl.startsWith("data:")) return dataUrl; // already a normal URL/path
+  const m = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
+  if (!m) return "";
+  const mime = m[1];
+  const b64 = m[2];
+  const buf = Buffer.from(b64, "base64");
+  const ext = extFromMime(mime);
+  const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+  const filename = `${prefix}-${unique}.${ext}`;
+  const fp = path.join(uploadDir, filename);
+  fs.writeFileSync(fp, buf);
+  return `/uploads/${filename}`;
+}
+
+function migrateItemImagesInPlace(item) {
+  if (!item || typeof item !== "object") return item;
+
+  // Ensure every item has a stable id for future lookups
+  if (!item.id) item.id = uuid();
+
+  const urls = Array.isArray(item.imageUrls)
+    ? item.imageUrls.slice()
+    : (item.imageUrl ? [item.imageUrl] : []);
+
+  // Convert any base64 blobs into uploaded files
+  const cache = new Map();
+  const convert = (u) => {
+    if (typeof u !== "string") return "";
+    if (!u.startsWith("data:")) return u;
+    if (cache.has(u)) return cache.get(u);
+    const saved = saveDataUrlToUploads(u, "item");
+    cache.set(u, saved);
+    return saved;
+  };
+
+  const converted = urls.map(convert).filter(Boolean);
+
+  // Keep item.imageUrl aligned with first image for compatibility
+  if (converted.length) {
+    item.imageUrls = converted;
+    item.imageUrl = converted[0];
+  } else {
+    item.imageUrls = [];
+    item.imageUrl = "";
+  }
+
+  return item;
+}
+
+
 // -------- In-memory "database" --------
 const items = [
   {
+    id: uuid(),
     code: "1000",
     title: "Laptop, Lenovo (Used)",
     price: 5000,
@@ -82,6 +145,7 @@ const items = [
     condition: "used",
   },
   {
+    id: uuid(),
     code: "1001",
     title: "Laptop, Lenovo (New)",
     price: 11500,
@@ -341,6 +405,8 @@ app.post("/api/auth/login", (req, res) => {
 
 // -------- Items --------
 app.get("/api/items", (req, res) => {
+  // Ensure images are served as /uploads files (not giant base64 blobs)
+  items.forEach(migrateItemImagesInPlace);
   // Default: return a lightweight list (no huge base64 images).
   // Use ?full=1 to return full objects, including imageUrls/base64.
   const full = String(req.query.full || '').toLowerCase();
@@ -368,9 +434,10 @@ app.get("/api/items", (req, res) => {
 
 // Fetch full item details (including imageUrls) when user opens a listing
 app.get("/api/items/:id", (req, res) => {
-  const key = String(req.params.id);
-  const it = items.find((x) => String(x.id || '') === key || String(x.code || '') === key);
-  if (!it) return res.status(404).json({ error: 'Item not found' });
+  items.forEach(migrateItemImagesInPlace);
+  const idOrCode = String(req.params.id || "");
+  const it = items.find((x) => x.id === idOrCode) || items.find((x) => x.code === idOrCode);
+  if (!it) return res.status(404).json({ error: "Item not found" });
   res.json(it);
 });
 
@@ -414,21 +481,35 @@ app.post("/api/items", requireAuth, (req, res) => {
     return res.status(409).json({ error: "Item number already exists" });
   }
 
-    const urlsArray = Array.isArray(imageUrls) ? imageUrls.slice(0, 15) : [];
-  const firstUrl = imageUrl || (urlsArray[0] || "");
+const cache = new Map();
+  const convert = (u) => {
+    if (typeof u !== "string") return "";
+    if (!u.startsWith("data:")) return u;
+    if (cache.has(u)) return cache.get(u);
+    const saved = saveDataUrlToUploads(u, "item");
+    cache.set(u, saved);
+    return saved;
+  };
 
-const item = {
-  code: itemNumber,
-  title,
-  details: details || "",
-  price: Number(price),
-  sellerPhone,
-  holdHours: holdHours ? Number(holdHours) : 24,
-  imageUrl: firstUrl || "",
-  imageUrls: urlsArray,
-  availability: availability || "available",
-  condition: condition || "used",
-};
+  const urlsArray = Array.isArray(imageUrls) ? imageUrls.slice(0, 15) : [];
+  const convertedUrls = urlsArray.map(convert).filter(Boolean);
+  const firstUrl = imageUrl || (convertedUrls[0] || (urlsArray[0] || ""));
+  const convertedFirst = convert(firstUrl) || convertedUrls[0] || "";
+
+  const item = {
+    id: uuid(),
+    code: itemNumber,
+    title,
+    details: details || "",
+    price: Number(price),
+    sellerPhone,
+    holdHours: holdHours ? Number(holdHours) : 24,
+    imageUrl: convertedFirst || "",
+    imageUrls: convertedUrls,
+    availability: availability || "available",
+    condition: condition || "used",
+    category: req.body && req.body.category ? String(req.body.category) : "",
+  };
 
   items.push(item);
   res.status(201).json(item);
@@ -443,26 +524,31 @@ app.get("/api/public/seller/:sellerPhone", (req, res) => {
 
 // Public: fetch item by code
 app.get("/api/public/item/:code", (req, res) => {
-  const code = req.params.code;
+  const code = String(req.params.code || "").trim();
   const item = items.find((it) => it.code === code);
 
   if (!item) {
     return res.status(404).json({ error: "Item not found." });
   }
 
+  migrateItemImagesInPlace(item);
+
   res.json({
-  code: item.code,
-  title: item.title,
-  details: item.details || "",
-  price: item.price,
-  imageUrl: item.imageUrl,
-  imageUrls: Array.isArray(item.imageUrls)
-    ? item.imageUrls
-    : (item.imageUrl ? [item.imageUrl] : []),
-  availability: item.availability,
-  holdHours: item.holdHours,
-  sellerPhone: item.sellerPhone,
-});
+    id: item.id,
+    code: item.code,
+    title: item.title,
+    details: item.details || "",
+    price: item.price,
+    holdHours: item.holdHours,
+    imageUrl: item.imageUrl,
+    imageUrls: Array.isArray(item.imageUrls)
+      ? item.imageUrls
+      : (item.imageUrl ? [item.imageUrl] : []),
+    availability: item.availability,
+    condition: item.condition || "used",
+    category: item.category || "",
+    sellerPhone: item.sellerPhone,
+  });
 });
 
 // -------- Transactions (escrow) --------
@@ -494,6 +580,7 @@ app.post("/api/transactions", requireAuth, (req, res) => {
 
   const itemCodeStr = String(itemCode || "").trim();
 const item = findItem(itemCodeStr);
+  if (item) migrateItemImagesInPlace(item);
 const priceNum = Number(amount);
   if (Number.isNaN(priceNum) || priceNum <= 0) {
     return res.status(400).json({ error: "Invalid amount" });
@@ -542,12 +629,13 @@ const tx = {
     toPhone,
   itemCode: itemCodeStr,
     amount: priceNum,
-    holdDurationHours,
     deliveryMethod, // 'self_collect' or 'seller_delivery'
     deliveryPoint: deliveryPoint || "",
     liveLocation: null, // { lat, lng, updatedAt }
     status: "pending",
     createdAt: nowIso(),
+    holdDurationHours: holdDurationHours,
+
     holdExpiresAt,
     holdStartedAt: null,
     transitStartedAt: null,
@@ -561,6 +649,7 @@ const tx = {
           title: item.title,
           details: item.details || "",
           price: item.price,
+          holdHours: item.holdHours,
           imageUrl: item.imageUrl || "",
           imageUrls: Array.isArray(item.imageUrls)
             ? item.imageUrls
