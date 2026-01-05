@@ -273,10 +273,23 @@ function requireAuth(req, res, next) {
 let nextItemNumber = 1002;
 
 // -------- Helpers --------
-function findItem(code) {
-  return items.find((i) => i.code === code);
+function normalizeItemCode(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  // If a user types something like TP-1004 or Item #1004, extract digits.
+  const m = s.match(/\d+/g);
+  return m ? m.join("") : s;
 }
 
+function findItem(code) {
+  const want = normalizeItemCode(code);
+  if (!want) return null;
+  // Try normalized compare (handles TP-1004 style inputs)
+  const byNorm = items.find((i) => normalizeItemCode(i.code) === want);
+  if (byNorm) return byNorm;
+  // Fallback to exact string match
+  return items.find((i) => String(i.code) === String(code));
+}
 function nowIso() {
   return new Date().toISOString();
 }
@@ -436,8 +449,8 @@ app.get("/api/items", (req, res) => {
 app.get("/api/items/:id", (req, res) => {
   items.forEach(migrateItemImagesInPlace);
   const idOrCode = String(req.params.id || "");
-  const it = items.find((x) => x.id === idOrCode) || items.find((x) => x.code === idOrCode);
-  if (!it) return res.status(404).json({ error: "Item not found" });
+  const it = items.find((x) => x.id === idOrCode) || findItem(idOrCode);
+if (!it) return res.status(404).json({ error: "Item not found" });
   res.json(it);
 });
 
@@ -524,10 +537,9 @@ app.get("/api/public/seller/:sellerPhone", (req, res) => {
 
 // Public: fetch item by code
 app.get("/api/public/item/:code", (req, res) => {
-  const code = String(req.params.code || "").trim();
-  const item = items.find((it) => it.code === code);
-
-  if (!item) {
+  const codeRaw = String(req.params.code || "").trim();
+  const item = findItem(codeRaw);
+if (!item) {
     return res.status(404).json({ error: "Item not found." });
   }
 
