@@ -276,9 +276,16 @@ let nextItemNumber = 1002;
 function normalizeItemCode(raw) {
   const s = String(raw || "").trim();
   if (!s) return "";
-  // If a user types something like TP-1004 or Item #1004, extract digits.
-  const m = s.match(/\d+/g);
-  return m ? m.join("") : s;
+  // IMPORTANT: do NOT join all digit groups.
+  // Example: "TP-1003-496" MUST resolve to item "1003", not "1003496".
+
+  // If the code looks like an official TP code, prefer the first number after TP.
+  const mTp = s.match(/tp\s*[-_#:\s]*\s*(\d+)/i);
+  if (mTp && mTp[1]) return mTp[1];
+
+  // Otherwise, grab the first digit group (e.g. "Item #1004" -> "1004")
+  const groups = s.match(/\d+/g);
+  return groups && groups.length ? groups[0] : s;
 }
 
 function findItem(code) {
