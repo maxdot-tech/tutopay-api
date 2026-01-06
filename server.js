@@ -12,6 +12,12 @@ const crypto = require("crypto");
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// ===== Payments mode =====
+// demo: no external calls (instant success)
+// mtn_sandbox / airtel_sandbox: prepared hooks (requires env vars + Node 18+ fetch)
+const PAYMENTS_MODE = (process.env.PAYMENTS_MODE || "demo").toLowerCase();
+
+
 // Allow bigger JSON bodies (base64 images from frontend)
 const allowedOrigins = [
   "https://tutopay.online",
@@ -269,6 +275,67 @@ function requireAuth(req, res, next) {
   req.user = sessions.get(token); // { id, phone, role, kycLevel }
   next();
 }
+
+// ===== Idempotency middleware (prevents duplicates on retries/double-taps) =====
+const IDEM_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const idempotencyStore = new Map(); // key -> { requestHash, statusCode, body, createdAt }
+
+function _hashBody(body) {
+  try {
+    const str = typeof body === "string" ? body : JSON.stringify(body || {});
+    return crypto.createHash("sha256").update(str).digest("hex");
+  } catch (e) {
+    return "na";
+  }
+}
+
+function _cleanupIdempotency() {
+  const now = Date.now();
+  for (const [k, v] of idempotencyStore.entries()) {
+    if (!v || now - v.createdAt > IDEM_TTL_MS) idempotencyStore.delete(k);
+  }
+}
+
+function idempotencyMiddleware(req, res, next) {
+  const key = req.get("Idempotency-Key");
+  if (!key) return next();
+
+  _cleanupIdempotency();
+  const userPart = req.user && req.user.phone ? req.user.phone : "anon";
+  const storeKey = `${userPart}:${req.method}:${req.originalUrl}:${key}`;
+  const requestHash = _hashBody(req.body);
+
+  const existing = idempotencyStore.get(storeKey);
+  if (existing) {
+    if (existing.requestHash && existing.requestHash !== requestHash) {
+      return res.status(409).json({ error: "Idempotency key reuse with different payload." });
+    }
+    return res.status(existing.statusCode || 200).json(existing.body);
+  }
+
+  const origStatus = res.status.bind(res);
+  const origJson = res.json.bind(res);
+
+  let statusCode = 200;
+  res.status = (code) => {
+    statusCode = code;
+    return origStatus(code);
+  };
+
+  res.json = (body) => {
+    idempotencyStore.set(storeKey, {
+      requestHash,
+      statusCode,
+      body,
+      createdAt: Date.now(),
+    });
+    return origJson(body);
+  };
+
+  return next();
+}
+
+
 
 let nextItemNumber = 1002;
 
@@ -571,7 +638,7 @@ if (!item) {
 });
 
 // -------- Transactions (escrow) --------
-app.post("/api/transactions", requireAuth, (req, res) => {
+app.post("/api/transactions", requireAuth, idempotencyMiddleware, (req, res) => {
   const {
     fromPhone,
     toPhone,
@@ -651,8 +718,12 @@ const tx = {
     deliveryMethod, // 'self_collect' or 'seller_delivery'
     deliveryPoint: deliveryPoint || "",
     liveLocation: null, // { lat, lng, updatedAt }
-    status: "pending",
+    status: "pending_payment",
     createdAt: nowIso(),
+    paymentProvider: PAYMENTS_MODE,
+    paymentStatus: "unpaid",
+    paymentRef: null,
+    paidAt: null,
     holdDurationHours: holdDurationHours,
 
     holdExpiresAt,
@@ -692,6 +763,58 @@ const tx = {
 res.status(201).json(tx);
 });
 
+// Option B: initiate payment AFTER escrow is created
+app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async (req, res) => {
+  const id = req.params.id;
+  const tx = transactions.find((t) => t.id === id);
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+
+  const isBuyer = req.user.phone === tx.fromPhone && (req.user.role === "buyer" || req.user.role === "admin");
+  const isAdmin = req.user.role === "admin";
+  if (!isBuyer && !isAdmin) {
+    return res.status(403).json({ error: "Only the buyer can initiate payment." });
+  }
+
+  if (tx.paymentStatus === "paid" || tx.status !== "pending_payment") {
+    return res.json(tx);
+  }
+
+  if (PAYMENTS_MODE === "demo") {
+    tx.paymentProvider = "demo";
+    tx.paymentStatus = "paid";
+    tx.paymentRef = tx.paymentRef || ("demo_" + uuid());
+    tx.paidAt = nowIso();
+    tx.status = "pending"; // now seller can hold
+    logAudit(req, "tx_pay_demo", { txId: tx.id, paymentRef: tx.paymentRef });
+    return res.json(tx);
+  }
+
+  tx.paymentProvider = PAYMENTS_MODE;
+  tx.paymentStatus = "pending";
+  tx.paymentRef = tx.paymentRef || uuid();
+  logAudit(req, "tx_pay_start", { txId: tx.id, provider: PAYMENTS_MODE, paymentRef: tx.paymentRef });
+
+  return res.json(tx);
+});
+
+app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddleware, async (req, res) => {
+  const id = req.params.id;
+  const tx = transactions.find((t) => t.id === id);
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+
+  const isBuyer = req.user.phone === tx.fromPhone && (req.user.role === "buyer" || req.user.role === "admin");
+  const isSeller = req.user.phone === tx.toPhone && (req.user.role === "seller" || req.user.role === "admin");
+  const isAdmin = req.user.role === "admin";
+  if (!isBuyer && !isSeller && !isAdmin) {
+    return res.status(403).json({ error: "Not allowed." });
+  }
+
+  // TODO: implement provider status check using tx.paymentRef
+  return res.json(tx);
+});
+
+
+
 // Auto-resolve certain dispute states (e.g. auto-refund after 72h)
 function maybeAutoResolveDispute(tx) {
   if (!tx.disputeActive || !tx.dispute) return;
@@ -725,7 +848,7 @@ app.get("/api/transactions", requireAuth, (req, res) => {
 });
 
 // Advance or update a transaction state
-app.post("/api/transactions/:id/action", requireAuth, (req, res) => {
+app.post("/api/transactions/:id/action", requireAuth, idempotencyMiddleware, (req, res) => {
   const { action } = req.body || {};
   const id = req.params.id;
   const tx = transactions.find((t) => t.id === id);
@@ -771,6 +894,11 @@ app.post("/api/transactions/:id/action", requireAuth, (req, res) => {
 
   switch (action) {
     case "seller_hold": {
+      // Option B: cannot hold until buyer payment is confirmed
+      if (tx.status === "pending_payment" || tx.paymentStatus !== "paid") {
+        return res.status(400).json({ error: "Cannot hold item until payment is confirmed." });
+      }
+
       if (tx.deliveryMethod !== "self_collect" || tx.status !== "pending") {
         return res
           .status(400)
