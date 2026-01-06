@@ -185,6 +185,252 @@ const requests = [];
 // Each entry: { id, timestamp, ip, userPhone, userRole, eventType, details }
 const auditLog = [];
 
+// ===== PostgreSQL persistence (Railway) =====
+// If DATABASE_URL exists and pg is installed, we persist users/items/transactions/requests/audit logs.
+// If not, the app continues using in-memory arrays (demo mode).
+const HAS_DATABASE_URL = !!process.env.DATABASE_URL;
+let _pgPool = null;
+let _dbReady = false;
+
+function dbEnabled() {
+  return !!(_dbReady && _pgPool);
+}
+
+async function dbInit() {
+  if (!HAS_DATABASE_URL) {
+    console.log("[DB] DATABASE_URL not set — using in-memory storage.");
+    return;
+  }
+
+  let Pool;
+  try {
+    ({ Pool } = require("pg"));
+  } catch (e) {
+    console.warn("[DB] pg module not installed. Run: npm i pg. Using in-memory storage for now.");
+    return;
+  }
+
+  try {
+    _pgPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false }, // Railway Postgres often requires SSL
+      max: 5,
+    });
+
+    // Quick ping
+    await _pgPool.query("SELECT 1 as ok");
+    await dbEnsureSchema();
+    await dbLoadIntoMemory();
+    _dbReady = true;
+    console.log("[DB] Connected + schema ready.");
+  } catch (e) {
+    console.error("[DB] Failed to init Postgres. Using in-memory storage.", e.message);
+    _pgPool = null;
+    _dbReady = false;
+  }
+}
+
+async function dbEnsureSchema() {
+  if (!_pgPool) return;
+  // JSONB “document” tables — minimal change to existing logic
+  await _pgPool.query(`
+    CREATE TABLE IF NOT EXISTS tutopay_users (
+      phone TEXT PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS tutopay_items (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS tutopay_transactions (
+      id TEXT PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS tutopay_requests (
+      id TEXT PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS tutopay_audit (
+      id TEXT PRIMARY KEY,
+      ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      data JSONB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS tutopay_idempotency (
+      key TEXT PRIMARY KEY,
+      request_hash TEXT,
+      status_code INT,
+      response JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS tutopay_items_code_idx ON tutopay_items(code);
+    CREATE INDEX IF NOT EXISTS tutopay_audit_ts_idx ON tutopay_audit(ts);
+    CREATE INDEX IF NOT EXISTS tutopay_idem_expires_idx ON tutopay_idempotency(expires_at);
+  `);
+}
+
+async function dbLoadIntoMemory() {
+  if (!_pgPool) return;
+
+  // Users
+  try {
+    const u = await _pgPool.query("SELECT data FROM tutopay_users");
+    if (u.rows && u.rows.length) {
+      users.length = 0;
+      for (const r of u.rows) users.push(r.data);
+    }
+  } catch (e) {}
+
+  // Items (seed if empty)
+  try {
+    const it = await _pgPool.query("SELECT data FROM tutopay_items ORDER BY updated_at ASC");
+    if (it.rows && it.rows.length) {
+      const loaded = it.rows.map(r => r.data);
+      items.length = 0;
+      for (const obj of loaded) items.push(obj);
+      // Keep nextItemNumber in sync with max code
+      const maxCode = loaded
+        .map(i => parseInt(String(i.code || i.id || ""), 10))
+        .filter(n => Number.isFinite(n))
+        .reduce((a,b)=>Math.max(a,b), 0);
+      if (maxCode && maxCode >= nextItemNumber) nextItemNumber = maxCode + 1;
+    } else {
+      // Seed demo items on first run
+      for (const item of items) await dbUpsertItem(item);
+    }
+  } catch (e) {}
+
+  // Transactions
+  try {
+    const tx = await _pgPool.query("SELECT data FROM tutopay_transactions ORDER BY updated_at ASC");
+    if (tx.rows && tx.rows.length) {
+      transactions.length = 0;
+      for (const r of tx.rows) transactions.push(r.data);
+    }
+  } catch (e) {}
+
+  // Requests
+  try {
+    const rq = await _pgPool.query("SELECT data FROM tutopay_requests ORDER BY updated_at ASC");
+    if (rq.rows && rq.rows.length) {
+      requests.length = 0;
+      for (const r of rq.rows) requests.push(r.data);
+    }
+  } catch (e) {}
+
+  // Audit (keep last 2000 for memory)
+  try {
+    const a = await _pgPool.query("SELECT data FROM tutopay_audit ORDER BY ts DESC LIMIT 2000");
+    if (a.rows && a.rows.length) {
+      auditLog.length = 0;
+      for (const r of a.rows.reverse()) auditLog.push(r.data);
+    }
+  } catch (e) {}
+
+  // Idempotency cache (optional)
+  try {
+    const idem = await _pgPool.query("SELECT key, request_hash, status_code, response, EXTRACT(EPOCH FROM expires_at)*1000 AS expires_ms FROM tutopay_idempotency WHERE expires_at > NOW()");
+    for (const r of idem.rows || []) {
+      idempotencyStore.set(r.key, {
+        requestHash: r.request_hash,
+        statusCode: r.status_code,
+        body: r.response,
+        createdAt: Date.now(),
+        expiresAt: Number(r.expires_ms) || Date.now(),
+      });
+    }
+  } catch (e) {}
+}
+
+async function dbUpsertUser(user) {
+  if (!dbEnabled()) return;
+  const phone = String(user.phone || "").trim();
+  if (!phone) return;
+  await _pgPool.query(
+    `INSERT INTO tutopay_users(phone, data, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (phone) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()`,
+    [phone, JSON.stringify(user)]
+  );
+}
+
+async function dbUpsertItem(item) {
+  if (!dbEnabled()) return;
+  const id = String(item.id || "").trim();
+  const code = item.code ? String(item.code).trim() : null;
+  if (!id) return;
+  await _pgPool.query(
+    `INSERT INTO tutopay_items(id, code, data, updated_at)
+     VALUES ($1, $2, $3::jsonb, NOW())
+     ON CONFLICT (id) DO UPDATE SET code=EXCLUDED.code, data=EXCLUDED.data, updated_at=NOW()`,
+    [id, code, JSON.stringify(item)]
+  );
+}
+
+async function dbDeleteItem(id) {
+  if (!dbEnabled()) return;
+  await _pgPool.query("DELETE FROM tutopay_items WHERE id=$1", [String(id)]);
+}
+
+async function dbUpsertTransaction(tx) {
+  if (!dbEnabled()) return;
+  const id = String(tx.id || "").trim();
+  if (!id) return;
+  await _pgPool.query(
+    `INSERT INTO tutopay_transactions(id, data, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()`,
+    [id, JSON.stringify(tx)]
+  );
+}
+
+async function dbUpsertRequest(rq) {
+  if (!dbEnabled()) return;
+  const id = String(rq.id || "").trim();
+  if (!id) return;
+  await _pgPool.query(
+    `INSERT INTO tutopay_requests(id, data, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()`,
+    [id, JSON.stringify(rq)]
+  );
+}
+
+async function dbInsertAudit(entry) {
+  if (!dbEnabled()) return;
+  const id = String(entry.id || uuid()).trim();
+  const ts = entry.timestamp ? new Date(entry.timestamp) : new Date();
+  await _pgPool.query(
+    `INSERT INTO tutopay_audit(id, ts, data) VALUES ($1, $2, $3::jsonb)
+     ON CONFLICT (id) DO NOTHING`,
+    [id, ts, JSON.stringify(entry)]
+  );
+}
+
+async function dbIdemGet(key) {
+  if (!dbEnabled()) return null;
+  const r = await _pgPool.query("SELECT request_hash, status_code, response FROM tutopay_idempotency WHERE key=$1 AND expires_at > NOW()", [key]);
+  return r.rows && r.rows[0] ? r.rows[0] : null;
+}
+
+async function dbIdemSet(key, requestHash, statusCode, response, ttlMs) {
+  if (!dbEnabled()) return;
+  const expiresAt = new Date(Date.now() + (ttlMs || 30*60*1000));
+  await _pgPool.query(
+    `INSERT INTO tutopay_idempotency(key, request_hash, status_code, response, expires_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5)
+     ON CONFLICT (key) DO UPDATE SET request_hash=EXCLUDED.request_hash, status_code=EXCLUDED.status_code, response=EXCLUDED.response, expires_at=EXCLUDED.expires_at`,
+    [key, requestHash, statusCode || 200, JSON.stringify(response), expiresAt]
+  );
+}
+
+
+
 function logAudit(req, eventType, details = {}) {
   const entry = {
     id: uuid(),
@@ -206,6 +452,8 @@ function logAudit(req, eventType, details = {}) {
   }
 
   auditLog.push(entry);
+  // persist audit log
+  if (dbEnabled()) { dbInsertAudit(entry).catch(() => {}); }
 
   // keep only last 1000 entries in memory
   if (auditLog.length > 1000) {
@@ -296,7 +544,7 @@ function _cleanupIdempotency() {
   }
 }
 
-function idempotencyMiddleware(req, res, next) {
+async function idempotencyMiddleware(req, res, next) {
   const key = req.get("Idempotency-Key");
   if (!key) return next();
 
@@ -305,7 +553,22 @@ function idempotencyMiddleware(req, res, next) {
   const storeKey = `${userPart}:${req.method}:${req.originalUrl}:${key}`;
   const requestHash = _hashBody(req.body);
 
-  const existing = idempotencyStore.get(storeKey);
+  // Check Postgres idempotency cache (persists across redeploys)
+  if (dbEnabled()) {
+    try {
+      const dbExisting = await dbIdemGet(storeKey);
+      if (dbExisting) {
+        if (dbExisting.request_hash && dbExisting.request_hash !== requestHash) {
+          return res.status(409).json({ error: "Idempotency key reuse with different payload." });
+        }
+        return res.status(dbExisting.status_code || 200).json(dbExisting.response);
+      }
+    } catch (e) {
+      // ignore DB cache errors
+    }
+  }
+
+const existing = idempotencyStore.get(storeKey);
   if (existing) {
     if (existing.requestHash && existing.requestHash !== requestHash) {
       return res.status(409).json({ error: "Idempotency key reuse with different payload." });
@@ -329,6 +592,7 @@ function idempotencyMiddleware(req, res, next) {
       body,
       createdAt: Date.now(),
     });
+    if (dbEnabled()) { dbIdemSet(storeKey, requestHash, statusCode, body, IDEM_TTL_MS).catch(() => {}); }
     return origJson(body);
   };
 
@@ -446,6 +710,7 @@ app.post("/api/auth/login", (req, res) => {
       kycLevel: "basic",
     };
     users.push(user);
+    if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
     console.log("Created demo user:", user.phone, user.role);
   } else {
     if (user.pinHash !== hashPin(pin)) {
@@ -751,6 +1016,7 @@ const tx = {
   };
 
   transactions.push(tx);
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
   logAudit(req, "tx_create", {
   txId: tx.id,
   fromPhone,
@@ -776,6 +1042,7 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
   }
 
   if (tx.paymentStatus === "paid" || tx.status !== "pending_payment") {
+    if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
     return res.json(tx);
   }
 
@@ -786,6 +1053,7 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
     tx.paidAt = nowIso();
     tx.status = "pending"; // now seller can hold
     logAudit(req, "tx_pay_demo", { txId: tx.id, paymentRef: tx.paymentRef });
+    if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
     return res.json(tx);
   }
 
@@ -794,7 +1062,8 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
   tx.paymentRef = tx.paymentRef || uuid();
   logAudit(req, "tx_pay_start", { txId: tx.id, provider: PAYMENTS_MODE, paymentRef: tx.paymentRef });
 
-  return res.json(tx);
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+    return res.json(tx);
 });
 
 app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddleware, async (req, res) => {
@@ -810,7 +1079,8 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddle
   }
 
   // TODO: implement provider status check using tx.paymentRef
-  return res.json(tx);
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+    return res.json(tx);
 });
 
 
@@ -978,7 +1248,8 @@ break;
     newStatus: tx.status,
   });
 
-  return res.json(tx);
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+    return res.json(tx);
 });
 
 
@@ -1056,7 +1327,8 @@ app.post("/api/transactions/:id/dispute", requireAuth, (req, res) => {
     reasonText: tx.dispute.reasonText,
   });
 
-  return res.json(tx);
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+    return res.json(tx);
 });
 
 // Seller decision on an escrow refund request
@@ -1163,6 +1435,9 @@ app.post("/api/transactions/:id/dispute/decision", requireAuth, (req, res) => {
     disputeStatus: tx.dispute.status,
     txStatus: tx.status,
   });
+
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+
 
   res.json(tx);
 });
@@ -1301,6 +1576,7 @@ app.post("/api/requests", requireAuth, (req, res) => {
   };
 
   requests.push(reqObj);
+  if (dbEnabled()) { dbUpsertRequest(reqObj).catch(() => {}); }
   res.status(201).json(reqObj);
 });
 
@@ -1363,6 +1639,7 @@ function handleRequestReply(req, res) {
 
     requests[rIndex] = updated;
 
+    if (dbEnabled()) { dbUpsertRequest(updated).catch(() => {}); }
     return res.json(updated);
   } catch (err) {
     console.error("handleRequestReply error:", err);
@@ -1414,6 +1691,14 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`TutoPay backend listening on port ${PORT}`);
+async function startServer() {
+  await dbInit();
+  app.listen(PORT, () => {
+    console.log(`TutoPay API running on port ${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
 });
