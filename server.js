@@ -17,6 +17,130 @@ const PORT = process.env.PORT || 4000;
 // mtn_sandbox / airtel_sandbox: prepared hooks (requires env vars + Node 18+ fetch)
 const PAYMENTS_MODE = (process.env.PAYMENTS_MODE || "demo").toLowerCase();
 
+// ===== Airtel Money (sandbox) integration helpers =====
+// Uses Airtel Africa Open API (UAT base URL) — Collection / USSD Push.
+// Docs/examples: https://openapiuat.airtel.africa with POST /auth/oauth2/token and POST /merchant/v1/payments/
+const AIRTEL_BASE_URL =
+  process.env.AIRTEL_BASE_URL ||
+  (PAYMENTS_MODE === "airtel_sandbox"
+    ? "https://openapiuat.airtel.africa"
+    : "https://openapi.airtel.africa");
+
+const AIRTEL_CLIENT_ID = process.env.AIRTEL_CLIENT_ID || "";
+const AIRTEL_CLIENT_SECRET = process.env.AIRTEL_CLIENT_SECRET || "";
+const AIRTEL_COUNTRY = String(process.env.AIRTEL_COUNTRY || "ZM").toUpperCase();   // ISO alpha-2 (e.g., ZM)
+const AIRTEL_CURRENCY = String(process.env.AIRTEL_CURRENCY || "ZMW").toUpperCase(); // ISO currency (e.g., ZMW)
+
+let airtelTokenCache = { token: null, expiresAt: 0 };
+
+function airtelMsisdnFromPhone(phone) {
+  // Airtel expects MSISDN without country code for many markets (e.g., "0977..." -> "977...").
+  // If your sandbox expects a different format, tweak this function only.
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.startsWith("0")) return digits.slice(1);
+  if (digits.startsWith("260")) return digits.slice(3);
+  if (digits.startsWith("00")) return digits.replace(/^00/, "");
+  return digits;
+}
+
+async function airtelGetAccessToken() {
+  const now = Date.now();
+  if (airtelTokenCache.token && airtelTokenCache.expiresAt > now) {
+    return airtelTokenCache.token;
+  }
+
+  if (!AIRTEL_CLIENT_ID || !AIRTEL_CLIENT_SECRET) {
+    throw new Error("Missing AIRTEL_CLIENT_ID / AIRTEL_CLIENT_SECRET");
+  }
+
+  const url = `${AIRTEL_BASE_URL}/auth/oauth2/token`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "*/*" },
+    body: JSON.stringify({
+      client_id: AIRTEL_CLIENT_ID,
+      client_secret: AIRTEL_CLIENT_SECRET,
+      grant_type: "client_credentials",
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.access_token) {
+    const msg = data && (data.error_description || data.error || data.message);
+    throw new Error(`Airtel token error (${res.status}): ${msg || "unknown"}`);
+  }
+
+  const expiresInSec = Number(data.expires_in || 0);
+  // Refresh 60s early to avoid edge expiry
+  airtelTokenCache = {
+    token: data.access_token,
+    expiresAt: now + Math.max(0, expiresInSec * 1000 - 60_000),
+  };
+  return airtelTokenCache.token;
+}
+
+async function airtelInitiateCollection({ msisdn, amount, transactionId, reference }) {
+  const token = await airtelGetAccessToken();
+  const url = `${AIRTEL_BASE_URL}/merchant/v1/payments/`;
+
+  const payload = {
+    reference: reference || "TutoPay",
+    subscriber: {
+      country: AIRTEL_COUNTRY,
+      currency: AIRTEL_CURRENCY,
+      msisdn: msisdn, // phone without country code in many sandboxes
+    },
+    transaction: {
+      amount: String(amount),
+      country: AIRTEL_COUNTRY,
+      currency: AIRTEL_CURRENCY,
+      id: String(transactionId),
+    },
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "*/*",
+      "X-Country": AIRTEL_COUNTRY,
+      "X-Currency": AIRTEL_CURRENCY,
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data && (data.message || data.error || data.error_description);
+    throw new Error(`Airtel initiate error (${res.status}): ${msg || "unknown"}`);
+  }
+  return data;
+}
+
+async function airtelCheckCollectionStatus(transactionId) {
+  const token = await airtelGetAccessToken();
+  const url = `${AIRTEL_BASE_URL}/standard/v1/payments/${encodeURIComponent(String(transactionId))}`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: "*/*",
+      "X-Country": AIRTEL_COUNTRY,
+      "X-Currency": AIRTEL_CURRENCY,
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data && (data.message || data.error || data.error_description);
+    throw new Error(`Airtel status error (${res.status}): ${msg || "unknown"}`);
+  }
+  return data;
+}
+
 
 // Allow bigger JSON bodies (base64 images from frontend)
 const allowedOrigins = [
@@ -1057,13 +1181,57 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
     return res.json(tx);
   }
 
+  // ===== Airtel Money sandbox (Collection / USSD Push) =====
+  if (PAYMENTS_MODE === "airtel_sandbox") {
+    tx.paymentProvider = "airtel_sandbox";
+    tx.paymentStatus = "pending";
+    tx.paymentRef = tx.paymentRef || uuid();
+
+    const msisdn = airtelMsisdnFromPhone(tx.fromPhone);
+
+    try {
+      const resp = await airtelInitiateCollection({
+        msisdn,
+        amount: tx.amount,
+        transactionId: tx.paymentRef,
+        reference: `TutoPay-${tx.id}`,
+      });
+
+      tx.paymentMeta = tx.paymentMeta || {};
+      tx.paymentMeta.airtel = {
+        initiatedAt: nowIso(),
+        transactionId: tx.paymentRef,
+        response: resp,
+      };
+
+      logAudit(req, "tx_pay_airtel_start", {
+        txId: tx.id,
+        paymentRef: tx.paymentRef,
+        msisdn,
+      });
+
+      if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+      return res.json(tx);
+    } catch (err) {
+      console.error("Airtel initiate error:", err);
+      tx.paymentStatus = "unpaid"; // allow retry
+      if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+      return res.status(502).json({
+        error:
+          "Airtel Money sandbox payment initiation failed. " +
+          (err && err.message ? err.message : ""),
+      });
+    }
+  }
+
+  // ===== Default / other providers (placeholder) =====
   tx.paymentProvider = PAYMENTS_MODE;
   tx.paymentStatus = "pending";
   tx.paymentRef = tx.paymentRef || uuid();
   logAudit(req, "tx_pay_start", { txId: tx.id, provider: PAYMENTS_MODE, paymentRef: tx.paymentRef });
 
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
-    return res.json(tx);
+  return res.json(tx);
 });
 
 app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddleware, async (req, res) => {
@@ -1078,9 +1246,74 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddle
     return res.status(403).json({ error: "Not allowed." });
   }
 
-  // TODO: implement provider status check using tx.paymentRef
-  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+  // If already paid, nothing to do
+  if (tx.paymentStatus === "paid" || tx.status === "pending") {
+    if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
     return res.json(tx);
+  }
+
+  // ===== Airtel Money sandbox status check =====
+  const provider = String(tx.paymentProvider || PAYMENTS_MODE || "").toLowerCase();
+  if (provider === "airtel_sandbox") {
+    if (!tx.paymentRef) {
+      if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+      return res.json(tx);
+    }
+
+    try {
+      const resp = await airtelCheckCollectionStatus(tx.paymentRef);
+
+      // Common: resp.data.data.transaction.status OR resp.data.transaction.status OR resp.transaction.status
+      const t =
+        (resp && resp.data && resp.data.data && resp.data.data.transaction) ||
+        (resp && resp.data && resp.data.transaction) ||
+        (resp && resp.data && resp.data.txn) ||
+        (resp && resp.transaction) ||
+        null;
+
+      const status = t && t.status ? String(t.status) : null;
+      const message = t && t.message ? String(t.message) : null;
+
+      tx.paymentMeta = tx.paymentMeta || {};
+      tx.paymentMeta.airtel = tx.paymentMeta.airtel || {};
+      tx.paymentMeta.airtel.lastRequeryAt = nowIso();
+      tx.paymentMeta.airtel.lastStatus = status;
+      tx.paymentMeta.airtel.lastMessage = message;
+      tx.paymentMeta.airtel.lastResponse = resp;
+
+      if (status === "TS") {
+        tx.paymentProvider = "airtel_sandbox";
+        tx.paymentStatus = "paid";
+        tx.paidAt = nowIso();
+        tx.status = "pending"; // seller can now hold
+        logAudit(req, "tx_pay_airtel_paid", { txId: tx.id, paymentRef: tx.paymentRef });
+      } else if (status === "TF") {
+        tx.paymentProvider = "airtel_sandbox";
+        tx.paymentStatus = "failed";
+        tx.status = "pending_payment"; // allow buyer to try again
+        logAudit(req, "tx_pay_airtel_failed", { txId: tx.id, paymentRef: tx.paymentRef, message });
+      } else {
+        // TIP (in progress), TA (ambiguous), or unknown
+        tx.paymentProvider = "airtel_sandbox";
+        tx.paymentStatus = "pending";
+        logAudit(req, "tx_pay_airtel_pending", { txId: tx.id, paymentRef: tx.paymentRef, status, message });
+      }
+
+      if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+      return res.json(tx);
+    } catch (err) {
+      console.error("Airtel requery error:", err);
+      return res.status(502).json({
+        error:
+          "Airtel Money sandbox status check failed. " +
+          (err && err.message ? err.message : ""),
+      });
+    }
+  }
+
+  // Default: no provider integration yet
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+  return res.json(tx);
 });
 
 
