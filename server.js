@@ -199,6 +199,21 @@ const disputeUpload = multer({
 // Expose uploaded dispute docs (e.g. for admin review)
 app.use("/uploads", express.static(uploadDir));
 
+
+// Lightweight health endpoint (Railway/uptime checks)
+app.get("/health", async (req, res) => {
+  try {
+    const db = dbEnabled();
+    if (db) {
+      try { await pool.query("SELECT 1"); }
+      catch (e) { return res.status(503).json({ ok: false, db: "down", error: "db_unreachable" }); }
+    }
+    return res.json({ ok: true, db: db ? "up" : "not_ready", mode: PAYMENTS_MODE });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "health_check_failed" });
+  }
+});
+
 // ===== Item image helpers (convert base64 data URLs to real files in /uploads) =====
 function extFromMime(mime) {
   if (!mime) return "png";
@@ -1924,10 +1939,38 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Server error' });
 });
 
+let _server;
+
 async function startServer() {
-  await dbInit();
-  app.listen(PORT, () => {
+  // Bind the HTTP port ASAP so platforms like Railway can detect the open port.
+  const host = process.env.HOST || "0.0.0.0";
+  _server = app.listen(PORT, host, () => {
     console.log(`TutoPay API running on port ${PORT}`);
+  });
+
+  // Init DB after the server starts. If DB init fails, keep the server alive and expose it via /health.
+  try {
+    await dbInit();
+  } catch (err) {
+    console.error("[DB] Init failed (server will keep running):", err);
+  }
+
+  const shutdown = async (signal) => {
+    console.log(`[Shutdown] Received ${signal}. Closing...`);
+    try { _server?.close(() => console.log("[Shutdown] HTTP server closed.")); } catch (e) {}
+    try { await pool?.end?.(); } catch (e) {}
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+
+  // Extra visibility for crashes (helps debug "Stopping Container"/SIGTERM situations)
+  process.on("unhandledRejection", (reason) => {
+    console.error("[unhandledRejection]", reason);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error("[uncaughtException]", err);
   });
 }
 
