@@ -200,6 +200,11 @@ const disputeUpload = multer({
 app.use("/uploads", express.static(uploadDir));
 
 
+// Root route for platforms that probe "/" (avoids 404 healthcheck loops)
+app.get("/", (req, res) => {
+  res.status(200).send("TutoPay API is running");
+});
+
 // Lightweight health endpoint (Railway/uptime checks)
 app.get("/health", async (req, res) => {
   try {
