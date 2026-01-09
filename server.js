@@ -1932,11 +1932,33 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Server error' });
 });
 
+
+// ---- Graceful shutdown (prevents scary npm SIGTERM spam on Railway scale-down) ----
+function setupGracefulShutdown(server) {
+  const shutdown = (signal) => {
+    try {
+      console.log(`[SYS] ${signal} received — shutting down gracefully...`);
+      server.close(() => {
+        console.log("[SYS] HTTP server closed.");
+        process.exit(0);
+      });
+
+      // Force-exit if close hangs
+      setTimeout(() => process.exit(0), 5000).unref?.();
+    } catch (e) {
+      process.exit(0);
+    }
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}
 async function startServer() {
   await dbInit();
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`TutoPay API running on port ${PORT}`);
   });
+  setupGracefulShutdown(server);
 }
 
 startServer().catch((err) => {
