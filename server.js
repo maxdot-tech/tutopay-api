@@ -14,12 +14,38 @@ const PORT = process.env.PORT || 4000;
 
 
 
+
+let dbReady = false;
+let dbInitError = null;
 // ===== Railway / uptime health endpoints =====
 // Railway health checks cannot send custom headers, so these MUST stay public.
 // (They do not expose any sensitive data.)
 app.get("/", (req, res) => res.status(200).send("ok"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
+// --- Railway/production startup gate ---
+// Start listening immediately so Railway healthchecks can reach /health,
+// then finish DB init in the background.
+app.use((req, res, next) => {
+  // Always allow liveness endpoints + root + preflight while DB is coming up
+  if (req.method === 'OPTIONS') return next();
+  const p = req.path || '';
+  if (p === '/' || p === '/health' || p === '/ready') return next();
+  if (dbReady) return next();
+  // If DB init already failed, surface it (helps debugging)
+  const msg = dbInitError ? 'DB init failed' : 'Server starting';
+  return res.status(503).json({ ok: false, status: msg });
+});
+
+app.all('/health', (req, res) => {
+  // Liveness: always 200 if the HTTP server is up.
+  // Includes DB readiness info for humans (Railway healthcheck should point here).
+  res.status(200).json({
+    ok: true,
+    dbReady,
+    dbError: dbInitError ? (dbInitError.message || String(dbInitError)) : null,
+    time: new Date().toISOString(),
+  });
+});
 // ===== Payments mode =====
 // demo: no external calls (instant success)
 // mtn_sandbox / airtel_sandbox: prepared hooks (requires env vars + Node 18+ fetch)
@@ -1932,36 +1958,32 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Server error' });
 });
 
+/**
+ * Boot order matters on Railway:
+ * - Start HTTP listener immediately so Railway can hit /health.
+ * - Initialize DB in the background; API routes are gated until dbReady=true.
+ */
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`TutoPay API running on port ${PORT}`);
+});
 
-// ---- Graceful shutdown (prevents scary npm SIGTERM spam on Railway scale-down) ----
-function setupGracefulShutdown(server) {
-  const shutdown = (signal) => {
-    try {
-      console.log(`[SYS] ${signal} received — shutting down gracefully...`);
-      server.close(() => {
-        console.log("[SYS] HTTP server closed.");
-        process.exit(0);
-      });
-
-      // Force-exit if close hangs
-      setTimeout(() => process.exit(0), 5000).unref?.();
-    } catch (e) {
-      process.exit(0);
-    }
-  };
-
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
-}
-async function startServer() {
-  await dbInit();
-  const server = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`TutoPay API running on port ${PORT}`);
+// Run DB init in background (does NOT prevent the server from starting)
+dbInit()
+  .then(() => {
+    dbReady = true;
+    console.log('[DB] Ready.');
+  })
+  .catch((err) => {
+    dbInitError = err;
+    console.error('[DB] Init failed:', err);
   });
-  setupGracefulShutdown(server);
-}
 
-startServer().catch((err) => {
-  console.error("Failed to start server:", err);
-  process.exit(1);
+// Nice shutdown (Railway sends SIGTERM on deploy/stop)
+process.on('SIGTERM', () => {
+  console.log('[SYS] SIGTERM received, closing server...');
+  server.close(() => process.exit(0));
+});
+process.on('SIGINT', () => {
+  console.log('[SYS] SIGINT received, closing server...');
+  server.close(() => process.exit(0));
 });
