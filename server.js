@@ -208,6 +208,99 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 // Serve the frontend and uploaded dispute docs
 app.use(express.static("public"));
 
+// ===== MTN MoMo Sandbox helpers (Collections + Disbursement) =====
+const MOMO_BASE_URL = process.env.MOMO_BASE_URL || "https://sandbox.momodeveloper.mtn.com";
+const MOMO_CURRENCY = process.env.MOMO_CURRENCY || "ZMW";
+const PUBLIC_API_BASE = process.env.PUBLIC_API_BASE || process.env.API_PUBLIC_BASE || "https://api.tutopay.online";
+const MOMO_CALLBACK_URL = process.env.MOMO_CALLBACK_URL || `${PUBLIC_API_BASE}/momo/callback`;
+
+// Expect these env vars on Railway (Settings -> Variables):
+// MTN_COLLECTION_SUB_KEY, MTN_COLLECTION_APIUSER, MTN_COLLECTION_APIKEY
+// MTN_DISBURSEMENT_SUB_KEY, MTN_DISBURSEMENT_APIUSER, MTN_DISBURSEMENT_APIKEY
+function momoAssertEnv(keys) {
+  const missing = keys.filter((k) => !process.env[k]);
+  if (missing.length) {
+    const err = new Error(`Missing env vars: ${missing.join(", ")}`);
+    err.statusCode = 500;
+    throw err;
+  }
+}
+function momoBasicAuth(apiUser, apiKey) {
+  const token = Buffer.from(`${apiUser}:${apiKey}`).toString("base64");
+  return `Basic ${token}`;
+}
+
+async function momoGetToken(product) {
+  // product: "collection" | "disbursement"
+  if (product === "collection") {
+    momoAssertEnv(["MTN_COLLECTION_SUB_KEY", "MTN_COLLECTION_APIUSER", "MTN_COLLECTION_APIKEY"]);
+    const auth = momoBasicAuth(process.env.MTN_COLLECTION_APIUSER, process.env.MTN_COLLECTION_APIKEY);
+    const r = await axios.post(
+      `${MOMO_BASE_URL}/collection/token/`,
+      null,
+      { headers: { Authorization: auth, "Ocp-Apim-Subscription-Key": process.env.MTN_COLLECTION_SUB_KEY } }
+    );
+    return r?.data?.access_token;
+  }
+  momoAssertEnv(["MTN_DISBURSEMENT_SUB_KEY", "MTN_DISBURSEMENT_APIUSER", "MTN_DISBURSEMENT_APIKEY"]);
+  const auth = momoBasicAuth(process.env.MTN_DISBURSEMENT_APIUSER, process.env.MTN_DISBURSEMENT_APIKEY);
+  const r = await axios.post(
+    `${MOMO_BASE_URL}/disbursement/token/`,
+    null,
+    { headers: { Authorization: auth, "Ocp-Apim-Subscription-Key": process.env.MTN_DISBURSEMENT_SUB_KEY } }
+  );
+  return r?.data?.access_token;
+}
+
+async function momoRequestToPay({ amount, msisdn, externalId, payerMessage, payeeNote, callbackUrl }) {
+  const accessToken = await momoGetToken("collection");
+  if (!accessToken) throw new Error("Failed to get MoMo access token (collection)");
+
+  const referenceId = uuidv4(); // X-Reference-Id for MoMo
+  const body = {
+    amount: String(amount),
+    currency: MOMO_CURRENCY,
+    externalId: String(externalId || referenceId),
+    payer: { partyIdType: "MSISDN", partyId: String(msisdn) },
+    payerMessage: payerMessage || "TutoPay escrow deposit",
+    payeeNote: payeeNote || "Escrow deposit",
+  };
+
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    "X-Reference-Id": referenceId,
+    "X-Target-Environment": "sandbox",
+    "Ocp-Apim-Subscription-Key": process.env.MTN_COLLECTION_SUB_KEY,
+    "Content-Type": "application/json",
+  };
+  if (callbackUrl) headers["X-Callback-Url"] = callbackUrl;
+
+  await axios.post(`${MOMO_BASE_URL}/collection/v1_0/requesttopay`, body, { headers });
+  return { referenceId };
+}
+
+async function momoGetRequestToPayStatus(referenceId) {
+  const accessToken = await momoGetToken("collection");
+  if (!accessToken) throw new Error("Failed to get MoMo access token (collection)");
+
+  const r = await axios.get(`${MOMO_BASE_URL}/collection/v1_0/requesttopay/${encodeURIComponent(referenceId)}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "X-Target-Environment": "sandbox",
+      "Ocp-Apim-Subscription-Key": process.env.MTN_COLLECTION_SUB_KEY,
+    },
+  });
+  return r?.data;
+}
+
+// Simple callback receiver (MoMo will call this if you set X-Callback-Url)
+app.post("/momo/callback", (req, res) => {
+  try {
+    console.log("MoMo callback:", JSON.stringify({ headers: req.headers, body: req.body }));
+  } catch {}
+  res.status(200).json({ ok: true });
+});
+
 // ===== Dispute document uploads (Multer) =====
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
@@ -1256,13 +1349,42 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
           (err && err.message ? err.message : ""),
       });
     }
-  }
+  } else if (PAYMENTS_MODE === "mtn_sandbox") {
+    // ===== MTN MoMo sandbox (Collections: RequestToPay) =====
+    try {
+      const phone = (req.body && req.body.phone) || "";
+      if (!phone) return res.status(400).json({ error: "phone is required" });
 
-  // ===== Default / other providers (placeholder) =====
-  tx.paymentProvider = PAYMENTS_MODE;
-  tx.paymentStatus = "pending";
-  tx.paymentRef = tx.paymentRef || uuid();
-  logAudit(req, "tx_pay_start", { txId: tx.id, provider: PAYMENTS_MODE, paymentRef: tx.paymentRef });
+      const { referenceId } = await momoRequestToPay({
+        amount: tx.amount,
+        msisdn: phone,
+        externalId: tx.id,
+        payerMessage: "TutoPay escrow deposit",
+        payeeNote: "Escrow deposit",
+        callbackUrl: MOMO_CALLBACK_URL,
+      });
+
+      tx.paymentProvider = "mtn_momo";
+      tx.paymentStatus = "pending_payment";
+      tx.paymentRef = referenceId;
+      logAudit(req, "tx_pay_mtn_start", { txId: tx.id, provider: "mtn_momo", paymentRef: referenceId });
+    } catch (err) {
+      console.error("MTN MoMo sandbox requesttopay failed:", err && err.response ? err.response.data : err);
+      return res.status(502).json({
+        error:
+          "MTN MoMo sandbox payment initiation failed. " +
+          (err && err.message ? err.message : ""),
+      });
+    }
+  } else {
+
+    // ===== Default / other providers (placeholder) =====
+    tx.paymentProvider = PAYMENTS_MODE;
+    tx.paymentStatus = "pending";
+    tx.paymentRef = tx.paymentRef || uuid();
+    logAudit(req, "tx_pay_start", { txId: tx.id, provider: PAYMENTS_MODE, paymentRef: tx.paymentRef });
+
+  }
 
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
   return res.json(tx);
@@ -1342,6 +1464,26 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddle
           "Airtel Money sandbox status check failed. " +
           (err && err.message ? err.message : ""),
       });
+    }
+  } else if (tx.paymentProvider === "mtn_momo") {
+    try {
+      const data = await momoGetRequestToPayStatus(tx.paymentRef);
+      const st = (data && data.status) ? String(data.status).toUpperCase() : "";
+
+      if (st === "SUCCESSFUL") {
+        tx.paymentStatus = "paid";
+        tx.status = "paid";
+        tx.paidAt = tx.paidAt || nowIso();
+        logAudit(req, "tx_pay_mtn_success", { txId: tx.id, paymentRef: tx.paymentRef });
+      } else if (st === "FAILED" || st === "REJECTED") {
+        tx.paymentStatus = "failed";
+        logAudit(req, "tx_pay_mtn_failed", { txId: tx.id, paymentRef: tx.paymentRef, status: st, data });
+      } else {
+        tx.paymentStatus = "pending_payment";
+      }
+    } catch (err) {
+      console.error("MTN MoMo status requery failed:", err && err.response ? err.response.data : err);
+      // keep existing status if requery fails
     }
   }
 
