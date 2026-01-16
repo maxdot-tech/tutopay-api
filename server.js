@@ -1352,7 +1352,7 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
   } else if (PAYMENTS_MODE === "mtn_sandbox") {
     // ===== MTN MoMo sandbox (Collections: RequestToPay) =====
     try {
-      const phone = (req.body && req.body.phone) || "";
+      const phone = (req.body && req.body.phone) || (req.user && req.user.phone) || "";
       if (!phone) return res.status(400).json({ error: "phone is required" });
 
       const { referenceId } = await momoRequestToPay({
