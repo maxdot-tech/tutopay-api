@@ -8,8 +8,6 @@ const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
 const crypto = require("crypto");
-const axios = require("axios");
-
 const app = express();
 const PORT = process.env.PORT || 4000;
 
@@ -231,67 +229,93 @@ function momoBasicAuth(apiUser, apiKey) {
   return `Basic ${token}`;
 }
 
-async function momoGetToken(product) {
-  // product: "collection" | "disbursement"
-  if (product === "collection") {
-    momoAssertEnv(["MTN_COLLECTION_SUB_KEY", "MTN_COLLECTION_APIUSER", "MTN_COLLECTION_APIKEY"]);
-    const auth = momoBasicAuth(process.env.MTN_COLLECTION_APIUSER, process.env.MTN_COLLECTION_APIKEY);
-    const r = await axios.post(
-      `${MOMO_BASE_URL}/collection/token/`,
-      null,
-      { headers: { Authorization: auth, "Ocp-Apim-Subscription-Key": process.env.MTN_COLLECTION_SUB_KEY } }
-    );
-    return r?.data?.access_token;
+async function momoFetchJson(url, { method = "GET", headers = {}, body } = {}) {
+  // No axios dependency: use built-in fetch (Node 18+).
+  const opts = { method, headers: { ...headers } };
+  if (body !== undefined) opts.body = body;
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) {
+    const msg = (typeof data === "string" && data) ? data : JSON.stringify(data);
+    const err = new Error("MoMo HTTP " + res.status + ": " + msg);
+    err.status = res.status;
+    err.body = data;
+    throw err;
   }
-  momoAssertEnv(["MTN_DISBURSEMENT_SUB_KEY", "MTN_DISBURSEMENT_APIUSER", "MTN_DISBURSEMENT_APIKEY"]);
-  const auth = momoBasicAuth(process.env.MTN_DISBURSEMENT_APIUSER, process.env.MTN_DISBURSEMENT_APIKEY);
-  const r = await axios.post(
-    `${MOMO_BASE_URL}/disbursement/token/`,
-    null,
-    { headers: { Authorization: auth, "Ocp-Apim-Subscription-Key": process.env.MTN_DISBURSEMENT_SUB_KEY } }
-  );
-  return r?.data?.access_token;
+  return data;
 }
 
-async function momoRequestToPay({ amount, msisdn, externalId, payerMessage, payeeNote, callbackUrl }) {
-  const accessToken = await momoGetToken("collection");
-  if (!accessToken) throw new Error("Failed to get MoMo access token (collection)");
+async function momoGetToken(product) {
+  // product: "collection" | "disbursement"
+  const isCollection = product === "collection";
+  if (isCollection) {
+    momoAssertEnv(["MTN_COLLECTION_SUB_KEY", "MTN_COLLECTION_APIUSER", "MTN_COLLECTION_APIKEY", "MOMO_BASE_URL"]);
+  } else {
+    momoAssertEnv(["MTN_DISBURSEMENT_SUB_KEY", "MTN_DISBURSEMENT_APIUSER", "MTN_DISBURSEMENT_APIKEY", "MOMO_BASE_URL"]);
+  }
 
-  const referenceId = uuidv4(); // X-Reference-Id for MoMo
-  const body = {
-    amount: String(amount),
-    currency: MOMO_CURRENCY,
-    externalId: String(externalId || referenceId),
-    payer: { partyIdType: "MSISDN", partyId: String(msisdn) },
-    payerMessage: payerMessage || "TutoPay escrow deposit",
-    payeeNote: payeeNote || "Escrow deposit",
-  };
+  const subKey = isCollection ? process.env.MTN_COLLECTION_SUB_KEY : process.env.MTN_DISBURSEMENT_SUB_KEY;
+  const apiUser = isCollection ? process.env.MTN_COLLECTION_APIUSER : process.env.MTN_DISBURSEMENT_APIUSER;
+  const apiKey = isCollection ? process.env.MTN_COLLECTION_APIKEY : process.env.MTN_DISBURSEMENT_APIKEY;
 
-  const headers = {
-    Authorization: `Bearer ${accessToken}`,
-    "X-Reference-Id": referenceId,
-    "X-Target-Environment": "sandbox",
-    "Ocp-Apim-Subscription-Key": process.env.MTN_COLLECTION_SUB_KEY,
-    "Content-Type": "application/json",
-  };
-  if (callbackUrl) headers["X-Callback-Url"] = callbackUrl;
+  const url = `${process.env.MOMO_BASE_URL}/collection/token/`;
+  // NOTE: /collection/token/ is used for both in MTN sandbox for many tenants; adjust if your disbursement docs differ.
+  const auth = Buffer.from(`${apiUser}:${apiKey}`).toString("base64");
 
-  await axios.post(`${MOMO_BASE_URL}/collection/v1_0/requesttopay`, body, { headers });
+  const data = await momoFetchJson(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Ocp-Apim-Subscription-Key": subKey,
+      "X-Target-Environment": "sandbox"
+    }
+  });
+  return data?.access_token;
+}
+
+async function momoRequestToPay({ amount, currency, payerMsisdn, externalId, payerMessage, payeeNote }) {
+  momoAssertEnv(["MOMO_BASE_URL", "MTN_COLLECTION_SUB_KEY", "MTN_COLLECTION_APIUSER", "MTN_COLLECTION_APIKEY"]);
+  const token = await momoGetToken("collection");
+  const referenceId = crypto.randomUUID();
+  const url = `${process.env.MOMO_BASE_URL}/collection/v1_0/requesttopay`;
+
+  await momoFetchJson(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "X-Reference-Id": referenceId,
+      "X-Target-Environment": "sandbox",
+      "Ocp-Apim-Subscription-Key": process.env.MTN_COLLECTION_SUB_KEY,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      amount: String(amount),
+      currency: String(currency || process.env.MOMO_CURRENCY || "ZMW"),
+      externalId: String(externalId || referenceId),
+      payer: { partyIdType: "MSISDN", partyId: String(payerMsisdn) },
+      payerMessage: String(payerMessage || "TutoPay escrow"),
+      payeeNote: String(payeeNote || "TutoPay escrow")
+    })
+  });
+
   return { referenceId };
 }
 
 async function momoGetRequestToPayStatus(referenceId) {
-  const accessToken = await momoGetToken("collection");
-  if (!accessToken) throw new Error("Failed to get MoMo access token (collection)");
-
-  const r = await axios.get(`${MOMO_BASE_URL}/collection/v1_0/requesttopay/${encodeURIComponent(referenceId)}`, {
+  momoAssertEnv(["MOMO_BASE_URL", "MTN_COLLECTION_SUB_KEY", "MTN_COLLECTION_APIUSER", "MTN_COLLECTION_APIKEY"]);
+  const token = await momoGetToken("collection");
+  const url = `${process.env.MOMO_BASE_URL}/collection/v1_0/requesttopay/${referenceId}`;
+  const data = await momoFetchJson(url, {
+    method: "GET",
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${token}`,
       "X-Target-Environment": "sandbox",
-      "Ocp-Apim-Subscription-Key": process.env.MTN_COLLECTION_SUB_KEY,
-    },
+      "Ocp-Apim-Subscription-Key": process.env.MTN_COLLECTION_SUB_KEY
+    }
   });
-  return r?.data;
+  return data;
 }
 
 // Simple callback receiver (MoMo will call this if you set X-Callback-Url)
