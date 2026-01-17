@@ -229,6 +229,18 @@ function momoBasicAuth(apiUser, apiKey) {
   return `Basic ${token}`;
 }
 
+// ---- MTN MoMo structured logs (shows up in Railway Logs) ----
+function momoLog(event, payload) {
+  payload = payload || {};
+  try {
+    const safe = Object.assign({ ts: new Date().toISOString(), event: event }, payload);
+    console.log("[MTN_MOMO]", JSON.stringify(safe));
+  } catch (e) {
+    console.log("[MTN_MOMO]", event, payload);
+  }
+}
+
+
 
 // ---- Network helper: retry transient upstream errors (502/503/504) ----
 function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -305,6 +317,9 @@ async function momoRequestToPay({ amount, currency, payerMsisdn, msisdn, externa
   momoAssertEnv(["MOMO_BASE_URL", "MTN_COLLECTION_SUB_KEY", "MTN_COLLECTION_APIUSER", "MTN_COLLECTION_APIKEY"]);
   const token = await momoGetToken("collection");
   const referenceId = crypto.randomUUID();
+  const currencyFinal = String(currency || process.env.MOMO_CURRENCY || "ZMW");
+  const payerMsisdnFinal = String(payerMsisdn || msisdn || "");
+  momoLog("requesttopay_create", { referenceId, amount: String(amount), currency: currencyFinal, payerMsisdn: payerMsisdnFinal, externalId: String(externalId || referenceId) });
   const url = `${process.env.MOMO_BASE_URL}/collection/v1_0/requesttopay`;
 
   await momoFetchJson(url, {
@@ -318,13 +333,14 @@ async function momoRequestToPay({ amount, currency, payerMsisdn, msisdn, externa
     },
     body: JSON.stringify({
       amount: String(amount),
-      currency: String(currency || process.env.MOMO_CURRENCY || "ZMW"),
+      currency: currencyFinal,
       externalId: String(externalId || referenceId),
-      payer: { partyIdType: "MSISDN", partyId: String(payerMsisdn || msisdn || "") },
+      payer: { partyIdType: "MSISDN", partyId: payerMsisdnFinal },
       payerMessage: String(payerMessage || "TutoPay escrow"),
       payeeNote: String(payeeNote || "TutoPay escrow")
     })
   });
+  momoLog("requesttopay_accepted", { referenceId });
 
   return { referenceId };
 }
@@ -1526,11 +1542,14 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddle
         tx.status = "pending"; // seller can now hold
         tx.paidAt = tx.paidAt || nowIso();
         logAudit(req, "tx_pay_mtn_success", { txId: tx.id, paymentRef: tx.paymentRef });
+        momoLog("requery_success", { txId: tx.id, paymentRef: tx.paymentRef, status: st });
       } else if (st === "FAILED" || st === "REJECTED") {
         tx.paymentStatus = "failed";
         tx.status = "pending_payment"; // allow buyer to retry
+        momoLog("requery_failed", { txId: tx.id, paymentRef: tx.paymentRef, status: st });
         logAudit(req, "tx_pay_mtn_failed", { txId: tx.id, paymentRef: tx.paymentRef, status: st, data });
       } else {
+        momoLog("requery_pending", { txId: tx.id, paymentRef: tx.paymentRef, status: st || "PENDING" });
         tx.paymentStatus = "pending";
       }
     } catch (err) {
