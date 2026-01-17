@@ -88,7 +88,7 @@ async function airtelGetAccessToken() {
   }
 
   const url = `${AIRTEL_BASE_URL}/auth/oauth2/token`;
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "*/*" },
     body: JSON.stringify({
@@ -132,7 +132,7 @@ async function airtelInitiateCollection({ msisdn, amount, transactionId, referen
     },
   };
 
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -156,7 +156,7 @@ async function airtelCheckCollectionStatus(transactionId) {
   const token = await airtelGetAccessToken();
   const url = `${AIRTEL_BASE_URL}/standard/v1/payments/${encodeURIComponent(String(transactionId))}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     method: "GET",
     headers: {
       Accept: "*/*",
@@ -229,11 +229,37 @@ function momoBasicAuth(apiUser, apiKey) {
   return `Basic ${token}`;
 }
 
+
+// ---- Network helper: retry transient upstream errors (502/503/504) ----
+function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function fetchWithRetry(url, options, { retries = 3, baseDelayMs = 800 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      // Retry only on transient upstream errors
+      if ([502, 503, 504].includes(res.status) && attempt < retries) {
+        await _sleep(baseDelayMs * attempt);
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) {
+        await _sleep(baseDelayMs * attempt);
+        continue;
+      }
+    }
+  }
+  throw lastErr || new Error('fetch failed');
+}
+
 async function momoFetchJson(url, { method = "GET", headers = {}, body } = {}) {
   // No axios dependency: use built-in fetch (Node 18+).
   const opts = { method, headers: { ...headers } };
   if (body !== undefined) opts.body = body;
-  const res = await fetch(url, opts);
+  const res = await fetchWithRetry(url, opts, { retries: 3, baseDelayMs: 800 });
   const text = await res.text();
   let data;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -275,7 +301,7 @@ async function momoGetToken(product) {
   return data?.access_token;
 }
 
-async function momoRequestToPay({ amount, currency, payerMsisdn, externalId, payerMessage, payeeNote }) {
+async function momoRequestToPay({ amount, currency, payerMsisdn, msisdn, externalId, payerMessage, payeeNote }) {
   momoAssertEnv(["MOMO_BASE_URL", "MTN_COLLECTION_SUB_KEY", "MTN_COLLECTION_APIUSER", "MTN_COLLECTION_APIKEY"]);
   const token = await momoGetToken("collection");
   const referenceId = crypto.randomUUID();
@@ -294,7 +320,7 @@ async function momoRequestToPay({ amount, currency, payerMsisdn, externalId, pay
       amount: String(amount),
       currency: String(currency || process.env.MOMO_CURRENCY || "ZMW"),
       externalId: String(externalId || referenceId),
-      payer: { partyIdType: "MSISDN", partyId: String(payerMsisdn) },
+      payer: { partyIdType: "MSISDN", partyId: String(payerMsisdn || msisdn || "") },
       payerMessage: String(payerMessage || "TutoPay escrow"),
       payeeNote: String(payeeNote || "TutoPay escrow")
     })
@@ -1394,7 +1420,7 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
       tx.paymentRef = referenceId;
       logAudit(req, "tx_pay_mtn_start", { txId: tx.id, provider: "mtn_momo", paymentRef: referenceId });
     } catch (err) {
-      console.error("MTN MoMo sandbox requesttopay failed:", err && err.response ? err.response.data : err);
+      console.error("MTN MoMo sandbox requesttopay failed:", { message: err && err.message, status: err && (err.status || err.statusCode), body: err && err.body });
       return res.status(502).json({
         error:
           "MTN MoMo sandbox payment initiation failed. " +
@@ -1507,7 +1533,7 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddle
         tx.paymentStatus = "pending_payment";
       }
     } catch (err) {
-      console.error("MTN MoMo status requery failed:", err && err.response ? err.response.data : err);
+      console.error("MTN MoMo status requery failed:", { message: err && err.message, status: err && (err.status || err.statusCode), body: err && err.body });
       // keep existing status if requery fails
     }
   }
