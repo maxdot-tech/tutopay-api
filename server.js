@@ -298,8 +298,7 @@ async function momoGetToken(product) {
   const apiUser = isCollection ? process.env.MTN_COLLECTION_APIUSER : process.env.MTN_DISBURSEMENT_APIUSER;
   const apiKey = isCollection ? process.env.MTN_COLLECTION_APIKEY : process.env.MTN_DISBURSEMENT_APIKEY;
 
-  const url = `${process.env.MOMO_BASE_URL}/collection/token/`;
-  // NOTE: /collection/token/ is used for both in MTN sandbox for many tenants; adjust if your disbursement docs differ.
+  const url = isCollection ? `${process.env.MOMO_BASE_URL}/collection/token/` : `${process.env.MOMO_BASE_URL}/disbursement/token/`;
   const auth = Buffer.from(`${apiUser}:${apiKey}`).toString("base64");
 
   const data = await momoFetchJson(url, {
@@ -359,6 +358,91 @@ async function momoGetRequestToPayStatus(referenceId) {
   });
   return data;
 }
+
+function momoNormalizeMsisdn(input) {
+  const s = String(input || "").trim();
+  return s.replace(/\D+/g, "");
+}
+
+async function momoDisburseTransfer({ amount, currency, payeeMsisdn, externalId, payerMessage, payeeNote }) {
+  momoAssertEnv([
+    "MOMO_BASE_URL",
+    "MOMO_TARGET_ENV",
+    "MTN_DISBURSEMENT_SUB_KEY",
+    "MTN_DISBURSEMENT_APIUSER",
+    "MTN_DISBURSEMENT_APIKEY",
+  ]);
+
+  const token = await momoGetToken("disbursement");
+  const referenceId = uuidv4();
+
+  const url = `${process.env.MOMO_BASE_URL}/disbursement/v1_0/transfer`;
+  const targetEnv = (process.env.MOMO_TARGET_ENV || "sandbox").trim();
+
+  const body = {
+    amount: String(amount),
+    currency: currency || process.env.MOMO_CURRENCY || "EUR",
+    externalId: externalId || referenceId,
+    payee: {
+      partyIdType: "MSISDN",
+      partyId: momoNormalizeMsisdn(payeeMsisdn),
+    },
+    payerMessage: payerMessage || "TutoPay payout",
+    payeeNote: payeeNote || "TutoPay payout",
+  };
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "X-Reference-Id": referenceId,
+    "X-Target-Environment": targetEnv,
+    "Ocp-Apim-Subscription-Key": process.env.MTN_DISBURSEMENT_SUB_KEY,
+    "Content-Type": "application/json",
+  };
+
+  // optional, only if you have a public callback endpoint
+  if (process.env.MOMO_CALLBACK_URL) {
+    headers["X-Callback-Url"] = process.env.MOMO_CALLBACK_URL;
+  }
+
+  const resp = await momoFetchJson(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  console.log(
+    `MTN DISBURSEMENT transfer initiated ref=${referenceId} amount=${body.amount} ${body.currency} payee=${body.payee.partyId}`
+  );
+
+  return { referenceId, request: body, response: resp };
+}
+
+async function momoGetTransferStatus(referenceId) {
+  momoAssertEnv([
+    "MOMO_BASE_URL",
+    "MOMO_TARGET_ENV",
+    "MTN_DISBURSEMENT_SUB_KEY",
+    "MTN_DISBURSEMENT_APIUSER",
+    "MTN_DISBURSEMENT_APIKEY",
+  ]);
+
+  const token = await momoGetToken("disbursement");
+  const url = `${process.env.MOMO_BASE_URL}/disbursement/v1_0/transfer/${referenceId}`;
+  const targetEnv = (process.env.MOMO_TARGET_ENV || "sandbox").trim();
+
+  const resp = await momoFetchJson(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "X-Target-Environment": targetEnv,
+      "Ocp-Apim-Subscription-Key": process.env.MTN_DISBURSEMENT_SUB_KEY,
+    },
+  });
+
+  console.log(`MTN DISBURSEMENT transfer status ref=${referenceId} ->`, resp.status);
+  return resp;
+}
+
 
 // Simple callback receiver (MoMo will call this if you set X-Callback-Url)
 app.post("/momo/callback", (req, res) => {
@@ -1562,6 +1646,110 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddle
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
   return res.json(tx);
 });
+
+// MTN MoMo Disbursement (payout to seller)
+app.post("/api/transactions/:id/payout", requireAuth, idempotencyMiddleware, async (req, res) => {
+  const id = String(req.params.id || "");
+  const tx = db.transactions.find((t) => String(t.id) === id);
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+
+  // Only allow seller (or admin) to request payout
+  if (req.user.role !== "admin" && req.user.phone !== tx.toPhone) {
+    return res.status(403).json({ error: "Not allowed" });
+  }
+
+  if (tx.status !== "completed") {
+    return res.status(400).json({ error: "Transaction must be completed before payout" });
+  }
+  if (tx.paymentStatus !== "paid") {
+    return res.status(400).json({ error: "Payment is not marked as paid" });
+  }
+
+  // Prevent duplicate payouts
+  if (tx.disbursement && (tx.disbursement.status === "pending" || tx.disbursement.status === "successful")) {
+    return res.status(400).json({ error: `Disbursement already ${tx.disbursement.status}` });
+  }
+
+  const amount = tx.amount;
+  const currency = tx.currency || process.env.MOMO_CURRENCY || "EUR";
+  const payeeMsisdn = tx.toPhone;
+
+  try {
+    const { referenceId } = await momoDisburseTransfer({
+      amount,
+      currency,
+      payeeMsisdn,
+      externalId: String(tx.id),
+      payerMessage: `TutoPay payout for TX ${tx.id}`,
+      payeeNote: `TutoPay payout for TX ${tx.id}`,
+    });
+
+    tx.disbursement = {
+      referenceId,
+      status: "pending",
+      startedAt: Date.now(),
+    };
+
+    logAudit("mtn_disbursement_initiated", {
+      txId: tx.id,
+      referenceId,
+      amount,
+      currency,
+      payeeMsisdn: momoNormalizeMsisdn(payeeMsisdn),
+      by: req.user.phone,
+    });
+
+    saveDb();
+
+    return res.json({ ok: true, referenceId, status: tx.disbursement.status });
+  } catch (e) {
+    console.error("MTN DISBURSEMENT failed:", e?.message || e);
+    return res.status(502).json({ error: "Disbursement failed", detail: e?.message || String(e) });
+  }
+});
+
+app.get("/api/transactions/:id/payout-status", requireAuth, async (req, res) => {
+  const id = String(req.params.id || "");
+  const tx = db.transactions.find((t) => String(t.id) === id);
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+
+  if (req.user.role !== "admin" && req.user.phone !== tx.toPhone && req.user.phone !== tx.fromPhone) {
+    return res.status(403).json({ error: "Not allowed" });
+  }
+
+  if (!tx.disbursement?.referenceId) {
+    return res.status(400).json({ error: "No disbursement started for this transaction" });
+  }
+
+  try {
+    const status = await momoGetTransferStatus(tx.disbursement.referenceId);
+
+    // Keep raw status for visibility
+    tx.disbursement.lastStatus = status;
+
+    const st = String(status?.status || "").toUpperCase();
+    if (st.includes("SUCCESS")) tx.disbursement.status = "successful";
+    else if (st.includes("FAIL") || st.includes("REJECT")) tx.disbursement.status = "failed";
+    else tx.disbursement.status = "pending";
+
+    tx.disbursement.updatedAt = Date.now();
+
+    logAudit("mtn_disbursement_status", {
+      txId: tx.id,
+      referenceId: tx.disbursement.referenceId,
+      status: tx.disbursement.status,
+      raw: status,
+    });
+
+    saveDb();
+
+    return res.json({ ok: true, referenceId: tx.disbursement.referenceId, status: tx.disbursement.status, raw: status });
+  } catch (e) {
+    console.error("MTN DISBURSEMENT status check failed:", e?.message || e);
+    return res.status(502).json({ error: "Status check failed", detail: e?.message || String(e) });
+  }
+});
+
 
 
 
