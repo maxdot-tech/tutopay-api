@@ -1416,7 +1416,7 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
       });
 
       tx.paymentProvider = "mtn_momo";
-      tx.paymentStatus = "pending_payment";
+      tx.paymentStatus = "pending";
       tx.paymentRef = referenceId;
       logAudit(req, "tx_pay_mtn_start", { txId: tx.id, provider: "mtn_momo", paymentRef: referenceId });
     } catch (err) {
@@ -1523,14 +1523,15 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddle
 
       if (st === "SUCCESSFUL") {
         tx.paymentStatus = "paid";
-        tx.status = "paid";
+        tx.status = "pending"; // seller can now hold
         tx.paidAt = tx.paidAt || nowIso();
         logAudit(req, "tx_pay_mtn_success", { txId: tx.id, paymentRef: tx.paymentRef });
       } else if (st === "FAILED" || st === "REJECTED") {
         tx.paymentStatus = "failed";
+        tx.status = "pending_payment"; // allow buyer to retry
         logAudit(req, "tx_pay_mtn_failed", { txId: tx.id, paymentRef: tx.paymentRef, status: st, data });
       } else {
-        tx.paymentStatus = "pending_payment";
+        tx.paymentStatus = "pending";
       }
     } catch (err) {
       console.error("MTN MoMo status requery failed:", { message: err && err.message, status: err && (err.status || err.statusCode), body: err && err.body });
