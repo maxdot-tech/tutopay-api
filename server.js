@@ -8,8 +8,78 @@ const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
 const crypto = require("crypto");
+const DEMO_ADMIN_PHONE = process.env.DEMO_ADMIN_PHONE || "0770100100";
+const DEMO_ADMIN_PIN = process.env.DEMO_ADMIN_PIN || "4567";
+// Optional: allow turning off public self-signup in production
+const ALLOW_PUBLIC_SIGNUP = (process.env.ALLOW_PUBLIC_SIGNUP || "true").toLowerCase() === "true";
+const DEMO_MODE = (process.env.DEMO_MODE || "true").toLowerCase() === "true";
+const DEMO_BANNER_TEXT = process.env.DEMO_BANNER_TEXT || "DEMO MODE: Test environment only. No real funds are moved.";
+
 const app = express();
 const PORT = process.env.PORT || 4000;
+
+
+/**
+ * Simple in-memory rate limiter (no extra dependencies).
+ * NOTE: Suitable for a single-node demo deployment. For multi-node, use a shared store (Redis) or a provider limiter.
+ */
+function createRateLimiter({ windowMs, max, keyFn, message }) {
+  const hits = new Map(); // key -> { count, resetAt }
+  const defaultMsg = message || "Too many requests. Please try again shortly.";
+
+  return function rateLimiter(req, res, next) {
+    try {
+      const now = Date.now();
+      const key = (keyFn ? keyFn(req) : req.ip) || req.ip || "unknown";
+      const rec = hits.get(key);
+
+      if (!rec || now > rec.resetAt) {
+        hits.set(key, { count: 1, resetAt: now + windowMs });
+        return next();
+      }
+
+      rec.count += 1;
+      if (rec.count > max) {
+        const retryAfterSec = Math.ceil((rec.resetAt - now) / 1000);
+        res.set("Retry-After", String(Math.max(1, retryAfterSec)));
+        return res.status(429).json({ error: defaultMsg });
+      }
+
+      return next();
+    } catch (e) {
+      return next(); // fail open
+    }
+  };
+}
+
+// Limiters (tuned for public demo)
+const loginLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyFn: (req) => `login:${req.ip}:${String((req.body || {}).phone || "").trim()}`,
+  message: "Too many login attempts. Please wait a minute and try again.",
+});
+
+const payLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 20,
+  keyFn: (req) => `pay:${req.ip}:${String((req.params && req.params.id) || "")}`,
+  message: "Too many payment requests. Please wait a moment and try again.",
+});
+
+const requeryLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 30,
+  keyFn: (req) => `requery:${req.ip}:${String((req.params && req.params.id) || "")}`,
+  message: "Too many payment status checks. Please wait a moment and try again.",
+});
+
+const payoutLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyFn: (req) => `payout:${req.ip}:${String((req.params && req.params.id) || "")}`,
+  message: "Too many payout requests. Please wait a moment and try again.",
+});
 
 
 
@@ -200,6 +270,24 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json({ limit: "50mb" }));  // ⬅️ change 5mb → 50mb
+
+// Demo mode headers (helps partners/regulators know this is not production)
+app.use((req, res, next) => {
+  if (DEMO_MODE) {
+    res.set("X-Demo-Mode", "true");
+    res.set("X-Demo-Banner", DEMO_BANNER_TEXT);
+  }
+  next();
+});
+
+// Lightweight config endpoint for the frontend to show a demo banner
+app.get("/api/config", (req, res) => {
+  res.json({
+    demoMode: DEMO_MODE,
+    bannerText: DEMO_BANNER_TEXT,
+    allowPublicSignup: ALLOW_PUBLIC_SIGNUP,
+  });
+});
 
 // (optional, but good for safety if you use urlencoded anywhere)
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
@@ -906,9 +994,9 @@ users.push({
 
 users.push({
   id: uuid(),
-  phone: "0977345678",
+  phone: DEMO_ADMIN_PHONE,
   role: "admin",
-  pinHash: hashPin("3333"),
+  pinHash: hashPin(DEMO_ADMIN_PIN),
   kycLevel: "admin",
 });
 
@@ -1089,7 +1177,7 @@ app.post("/api/otp/start", requireAuth, (req, res) => {
 });
 
 // -------- Auth (phone + PIN, demo only) --------
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", loginLimiter, (req, res) => {
   const { phone, pin, rolePreference } = req.body || {};
   if (!phone || !pin) {
     return res.status(400).json({ error: "Phone and PIN are required." });
@@ -1099,10 +1187,19 @@ app.post("/api/auth/login", (req, res) => {
   let user = findUserByPhone(phoneNorm);
 
   if (!user) {
-    // Demo behaviour: auto-register new user with chosen role
-    const allowedRoles = ["buyer", "seller", "admin"];
-    const role =
-      allowedRoles.includes(rolePreference) ? rolePreference : "buyer";
+    // Demo behaviour: auto-register new users as buyer/seller only (admin is never auto-created)
+    if (!ALLOW_PUBLIC_SIGNUP) {
+      logAudit(req, "auth_login_failed", { reason: "public_signup_disabled", phoneTried: phoneNorm });
+      return res.status(403).json({ error: "Sign-up is disabled on this environment." });
+    }
+
+    if (rolePreference === "admin") {
+      logAudit(req, "auth_login_failed", { reason: "admin_autoreg_blocked", phoneTried: phoneNorm });
+      return res.status(403).json({ error: "Admin accounts cannot be created from the public sign-in page." });
+    }
+
+    const allowedRoles = ["buyer", "seller"];
+    const role = allowedRoles.includes(rolePreference) ? rolePreference : "buyer";
 
     user = {
       id: uuid(),
@@ -1115,6 +1212,12 @@ app.post("/api/auth/login", (req, res) => {
     if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
     console.log("Created demo user:", user.phone, user.role);
   } else {
+    // Hardening: only allow the seeded demo admin phone to act as admin
+    if (user.role === "admin" && user.phone !== DEMO_ADMIN_PHONE) {
+      logAudit(req, "auth_login_failed", { reason: "admin_phone_mismatch", phoneTried: phoneNorm });
+      return res.status(403).json({ error: "Admin access is restricted." });
+    }
+
     if (user.pinHash !== hashPin(pin)) {
   logAudit(req, "auth_login_failed", {
     reason: "invalid_pin",
@@ -1432,7 +1535,7 @@ res.status(201).json(tx);
 });
 
 // Option B: initiate payment AFTER escrow is created
-app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async (req, res) => {
+app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddleware, async (req, res) => {
   const id = req.params.id;
   const tx = transactions.find((t) => t.id === id);
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
@@ -1541,7 +1644,7 @@ app.post("/api/transactions/:id/pay", requireAuth, idempotencyMiddleware, async 
   return res.json(tx);
 });
 
-app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddleware, async (req, res) => {
+app.post("/api/transactions/:id/payment/requery", requireAuth, requeryLimiter, idempotencyMiddleware, async (req, res) => {
   const id = req.params.id;
   const tx = transactions.find((t) => t.id === id);
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
@@ -1648,7 +1751,7 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, idempotencyMiddle
 });
 
 // MTN MoMo Disbursement (payout to seller)
-app.post("/api/transactions/:id/payout", requireAuth, idempotencyMiddleware, async (req, res) => {
+app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotencyMiddleware, async (req, res) => {
   const id = String(req.params.id || "");
   const tx = db.transactions.find((t) => String(t.id) === id);
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
