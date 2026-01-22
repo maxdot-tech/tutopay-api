@@ -963,6 +963,58 @@ function generateOtpCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+
+// -------- Profile helpers (for cross-device seller name/logo) --------
+function _isNonEmptyStr(x) { return typeof x === "string" && x.trim().length > 0; }
+
+function normalizePublicProfile(rawProfile, phone) {
+  const p = rawProfile && typeof rawProfile === "object" ? rawProfile : {};
+  const phoneStr = String(phone || "").trim();
+
+  const businessName = _isNonEmptyStr(p.businessName) ? String(p.businessName).trim() : "";
+  const displayName =
+    _isNonEmptyStr(p.displayName) ? String(p.displayName).trim()
+    : (businessName ? businessName
+    : (_isNonEmptyStr(p.firstName) ? String(p.firstName).trim()
+    : (_isNonEmptyStr(p.fullName) ? String(p.fullName).trim().split(/\s+/)[0] : phoneStr)));
+
+  // Accept either ...DataUrl or ...Url fields from frontend
+  let selfie = _isNonEmptyStr(p.selfieDataUrl) ? p.selfieDataUrl : (_isNonEmptyStr(p.selfieUrl) ? p.selfieUrl : "");
+  let logo = _isNonEmptyStr(p.logoDataUrl) ? p.logoDataUrl : (_isNonEmptyStr(p.logoUrl) ? p.logoUrl : "");
+
+  // If these are giant data URLs, save to /uploads to avoid huge DB rows (still works cross-device)
+  try {
+    if (typeof selfie === "string" && selfie.startsWith("data:") && selfie.length > 250000) {
+      selfie = saveDataUrlToUploads(selfie, "selfie");
+    }
+  } catch (e) {}
+  try {
+    if (typeof logo === "string" && logo.startsWith("data:") && logo.length > 250000) {
+      logo = saveDataUrlToUploads(logo, "logo");
+    }
+  } catch (e) {}
+
+  return {
+    displayName,
+    businessName,
+    selfieDataUrl: selfie || "",
+    logoDataUrl: logo || "",
+  };
+}
+
+function publicProfileResponseForUser(user) {
+  const phone = user && user.phone ? String(user.phone).trim() : "";
+  const prof = user && user.profile ? normalizePublicProfile(user.profile, phone) : normalizePublicProfile({}, phone);
+  const avatarUrl = prof.logoDataUrl || prof.selfieDataUrl || "";
+  return {
+    profile: prof,
+    // Convenience fields for existing frontend code (non-breaking)
+    displayName: prof.displayName,
+    businessName: prof.businessName,
+    avatarUrl,
+  };
+}
+
 // -------- Simple in-memory users & sessions (demo only) --------
 const users = []; // { id, phone, role, pinHash, kycLevel }
 const sessions = new Map(); // token -> { id, phone, role, kycLevel }
@@ -1178,7 +1230,7 @@ app.post("/api/otp/start", requireAuth, (req, res) => {
 
 // -------- Auth (phone + PIN, demo only) --------
 app.post("/api/auth/login", loginLimiter, (req, res) => {
-  const { phone, pin, rolePreference } = req.body || {};
+  const { phone, pin, rolePreference, profile } = req.body || {};
   if (!phone || !pin) {
     return res.status(400).json({ error: "Phone and PIN are required." });
   }
@@ -1235,7 +1287,18 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
     }
   }
 
-  const token = crypto.randomBytes(24).toString("hex");
+  
+// If frontend sent profile data (name/selfie/logo), store it for cross-device display
+if (profile && typeof profile === "object") {
+  try {
+    const normalized = normalizePublicProfile(profile, phoneNorm);
+    user.profile = normalized;
+    // persist user profile
+    if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
+  } catch (e) {}
+}
+
+const token = crypto.randomBytes(24).toString("hex");
   sessions.set(token, {
     id: user.id,
     phone: user.phone,
@@ -1406,6 +1469,47 @@ if (!item) {
     sellerPhone: item.sellerPhone,
   });
 });
+
+
+// Public: fetch a user's public profile for cross-device display (seller name/logo)
+app.get("/api/users/public/:phone", (req, res) => {
+  const phone = String(req.params.phone || "").trim();
+  if (!phone) return res.status(400).json({ error: "Missing phone" });
+
+  const user = findUserByPhone(phone);
+  if (!user) {
+    // Return a minimal profile so UI can still show something
+    return res.json({
+      profile: {
+        displayName: phone,
+        businessName: "",
+        selfieDataUrl: "",
+        logoDataUrl: "",
+      },
+    });
+  }
+
+  return res.json(publicProfileResponseForUser(user));
+});
+
+// Backwards-compatible alias used by some frontend builds
+app.get("/api/public/user/:phone", (req, res) => {
+  const phone = String(req.params.phone || "").trim();
+  if (!phone) return res.status(400).json({ error: "Missing phone" });
+
+  const user = findUserByPhone(phone);
+  if (!user) return res.json({ displayName: phone, businessName: "", avatarUrl: "" });
+
+  const out = publicProfileResponseForUser(user);
+  // old clients expect top-level fields
+  return res.json({
+    displayName: out.displayName,
+    businessName: out.businessName,
+    avatarUrl: out.avatarUrl,
+    profile: out.profile,
+  });
+});
+
 
 // -------- Transactions (escrow) --------
 app.post("/api/transactions", requireAuth, idempotencyMiddleware, (req, res) => {
