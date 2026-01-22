@@ -997,15 +997,18 @@ function normalizePublicProfile(rawProfile, phone) {
   return {
     displayName,
     businessName,
+    // Provide both ...DataUrl and ...Url for maximum frontend compatibility
     selfieDataUrl: selfie || "",
     logoDataUrl: logo || "",
+    selfieUrl: selfie || "",
+    logoUrl: logo || "",
   };
 }
 
 function publicProfileResponseForUser(user) {
   const phone = user && user.phone ? String(user.phone).trim() : "";
   const prof = user && user.profile ? normalizePublicProfile(user.profile, phone) : normalizePublicProfile({}, phone);
-  const avatarUrl = prof.logoDataUrl || prof.selfieDataUrl || "";
+  const avatarUrl = prof.logoDataUrl || prof.selfieDataUrl || prof.logoUrl || prof.selfieUrl || "";
   return {
     profile: prof,
     // Convenience fields for existing frontend code (non-breaking)
