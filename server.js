@@ -1023,6 +1023,36 @@ function hashPin(pin) {
   return crypto.createHash("sha256").update(String(pin)).digest("hex");
 }
 
+
+function normalizePhoneLoose(raw) {
+  const d = String(raw || "").replace(/\D+/g, "");
+  if (!d) return "";
+  if (d.startsWith("260") && d.length >= 12) return d;
+  if (d.startsWith("0") && d.length >= 10) return "260" + d.slice(1);
+  return d;
+}
+
+function findUserByPhoneLoose(phone) {
+  const raw = String(phone || "").trim();
+  if (!raw) return null;
+
+  let u = users.find((x) => x.phone === raw);
+  if (u) return u;
+
+  const norm = normalizePhoneLoose(raw);
+  if (!norm) return null;
+
+  u = users.find((x) => normalizePhoneLoose(x.phone) === norm);
+  if (u) return u;
+
+  if (norm.startsWith("260")) {
+    const local0 = "0" + norm.slice(3);
+    u = users.find((x) => String(x.phone).replace(/\s+/g, "") === local0);
+    if (u) return u;
+  }
+  return null;
+}
+
 function findUserByPhone(phone) {
   return users.find((u) => u.phone === phone);
 }
@@ -1236,7 +1266,7 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
   }
 
   const phoneNorm = String(phone).trim();
-  let user = findUserByPhone(phoneNorm);
+  let user = findUserByPhoneLoose(phoneNorm) || findUserByPhone(phoneNorm);
 
   if (!user) {
     // Demo behaviour: auto-register new users as buyer/seller only (admin is never auto-created)
@@ -1476,7 +1506,7 @@ app.get("/api/users/public/:phone", (req, res) => {
   const phone = String(req.params.phone || "").trim();
   if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-  const user = findUserByPhone(phone);
+  const user = findUserByPhoneLoose(phone) || findUserByPhone(phone);
   if (!user) {
     // Return a minimal profile so UI can still show something
     return res.json({
@@ -1497,7 +1527,7 @@ app.get("/api/public/user/:phone", (req, res) => {
   const phone = String(req.params.phone || "").trim();
   if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-  const user = findUserByPhone(phone);
+  const user = findUserByPhoneLoose(phone) || findUserByPhone(phone);
   if (!user) return res.json({ displayName: phone, businessName: "", avatarUrl: "" });
 
   const out = publicProfileResponseForUser(user);
