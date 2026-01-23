@@ -997,20 +997,21 @@ function normalizePublicProfile(rawProfile, phone) {
   return {
     displayName,
     businessName,
-    // Provide both ...DataUrl and ...Url for maximum frontend compatibility
     selfieDataUrl: selfie || "",
     logoDataUrl: logo || "",
-    selfieUrl: selfie || "",
-    logoUrl: logo || "",
   };
 }
 
 function publicProfileResponseForUser(user) {
   const phone = user && user.phone ? String(user.phone).trim() : "";
   const prof = user && user.profile ? normalizePublicProfile(user.profile, phone) : normalizePublicProfile({}, phone);
-  const avatarUrl = prof.logoDataUrl || prof.selfieDataUrl || prof.logoUrl || prof.selfieUrl || "";
+  const avatarUrl = prof.logoDataUrl || prof.selfieDataUrl || "";
   return {
-    profile: prof,
+    profile: {
+      ...prof,
+      selfieUrl: prof.selfieDataUrl || "",
+      logoUrl: prof.logoDataUrl || "",
+    },
     // Convenience fields for existing frontend code (non-breaking)
     displayName: prof.displayName,
     businessName: prof.businessName,
@@ -1507,6 +1508,14 @@ if (!item) {
 // Public: fetch a user's public profile for cross-device display (seller name/logo)
 app.get("/api/users/public/:phone", (req, res) => {
   const phone = String(req.params.phone || "").trim();
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
+  const absolutize = (u) => {
+    if (!u || typeof u !== "string") return "";
+    const s = u.trim();
+    if (s.startsWith("/uploads/")) return baseUrl + s;
+    return s;
+  };
+
   if (!phone) return res.status(400).json({ error: "Missing phone" });
 
   const user = findUserByPhoneLoose(phone) || findUserByPhone(phone);
@@ -1522,7 +1531,15 @@ app.get("/api/users/public/:phone", (req, res) => {
     });
   }
 
-  return res.json(publicProfileResponseForUser(user));
+  const payload = publicProfileResponseForUser(user);
+  if (payload && payload.profile) {
+    payload.profile.selfieDataUrl = absolutize(payload.profile.selfieDataUrl);
+    payload.profile.logoDataUrl = absolutize(payload.profile.logoDataUrl);
+    payload.profile.selfieUrl = payload.profile.selfieDataUrl;
+    payload.profile.logoUrl = payload.profile.logoDataUrl;
+    payload.avatarUrl = absolutize(payload.avatarUrl);
+  }
+  res.json(payload);
 });
 
 // Backwards-compatible alias used by some frontend builds
