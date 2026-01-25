@@ -968,38 +968,29 @@ function generateOtpCode() {
 function _isNonEmptyStr(x) { return typeof x === "string" && x.trim().length > 0; }
 
 function normalizePublicProfile(rawProfile, phone) {
-  const p = rawProfile && typeof rawProfile === "object" ? rawProfile : {};
-  const phoneStr = String(phone || "").trim();
+  const src = rawProfile || {};
+  const phoneSafe = String(phone || '').trim();
 
-  const businessName = _isNonEmptyStr(p.businessName) ? String(p.businessName).trim() : "";
-  const displayName =
-    _isNonEmptyStr(p.displayName) ? String(p.displayName).trim()
-    : (businessName ? businessName
-    : (_isNonEmptyStr(p.firstName) ? String(p.firstName).trim()
-    : (_isNonEmptyStr(p.fullName) ? String(p.fullName).trim().split(/\s+/)[0] : phoneStr)));
+  // Accept both *DataUrl and legacy *Url fields.
+  const selfieCandidate = src.selfieDataUrl || (typeof src.selfieUrl === 'string' && src.selfieUrl.startsWith('data:image') ? src.selfieUrl : '');
+  const logoCandidate = src.logoDataUrl || (typeof src.logoUrl === 'string' && src.logoUrl.startsWith('data:image') ? src.logoUrl : '');
 
-  // Accept either ...DataUrl or ...Url fields from frontend
-  let selfie = _isNonEmptyStr(p.selfieDataUrl) ? p.selfieDataUrl : (_isNonEmptyStr(p.selfieUrl) ? p.selfieUrl : "");
-  let logo = _isNonEmptyStr(p.logoDataUrl) ? p.logoDataUrl : (_isNonEmptyStr(p.logoUrl) ? p.logoUrl : "");
+  // Keep data URLs as the primary storage format for demo reliability (works across devices without relying on /uploads persistence).
+  const selfieDataUrl = typeof selfieCandidate === 'string' ? selfieCandidate : '';
+  const logoDataUrl = typeof logoCandidate === 'string' ? logoCandidate : '';
 
-  // If these are giant data URLs, save to /uploads to avoid huge DB rows (still works cross-device)
-  try {
-    if (typeof selfie === "string" && selfie.startsWith("data:") && selfie.length > 250000) {
-      selfie = saveDataUrlToUploads(selfie, "selfie");
-    }
-  } catch (e) {}
-  try {
-    if (typeof logo === "string" && logo.startsWith("data:") && logo.length > 250000) {
-      logo = saveDataUrlToUploads(logo, "logo");
-    }
-  } catch (e) {}
+  // Backward-compatible fields (some frontends look for selfieUrl/logoUrl).
+  // If they aren't true URLs, we just mirror the data URL.
+  const selfieUrl = (typeof src.selfieUrl === 'string' && src.selfieUrl && !src.selfieUrl.startsWith('data:image')) ? src.selfieUrl : selfieDataUrl;
+  const logoUrl = (typeof src.logoUrl === 'string' && src.logoUrl && !src.logoUrl.startsWith('data:image')) ? src.logoUrl : logoDataUrl;
 
-  return {
-    displayName,
-    businessName,
-    selfieDataUrl: selfie || "",
-    logoDataUrl: logo || "",
-  };
+  const displayName = String(src.displayName || '').trim();
+  const businessName = String(src.businessName || '').trim();
+
+  // Normalize older alias field names
+  // In some older clients, businessName might be stored as merchantType or similar; ignore here.
+
+  return { phone: phoneSafe, displayName, businessName, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
 }
 
 function publicProfileResponseForUser(user) {
@@ -1007,11 +998,7 @@ function publicProfileResponseForUser(user) {
   const prof = user && user.profile ? normalizePublicProfile(user.profile, phone) : normalizePublicProfile({}, phone);
   const avatarUrl = prof.logoDataUrl || prof.selfieDataUrl || "";
   return {
-    profile: {
-      ...prof,
-      selfieUrl: prof.selfieDataUrl || "",
-      logoUrl: prof.logoDataUrl || "",
-    },
+    profile: prof,
     // Convenience fields for existing frontend code (non-breaking)
     displayName: prof.displayName,
     businessName: prof.businessName,
@@ -1025,36 +1012,6 @@ const sessions = new Map(); // token -> { id, phone, role, kycLevel }
 
 function hashPin(pin) {
   return crypto.createHash("sha256").update(String(pin)).digest("hex");
-}
-
-
-function normalizePhoneLoose(raw) {
-  const d = String(raw || "").replace(/\D+/g, "");
-  if (!d) return "";
-  if (d.startsWith("260") && d.length >= 12) return d;
-  if (d.startsWith("0") && d.length >= 10) return "260" + d.slice(1);
-  return d;
-}
-
-function findUserByPhoneLoose(phone) {
-  const raw = String(phone || "").trim();
-  if (!raw) return null;
-
-  let u = users.find((x) => x.phone === raw);
-  if (u) return u;
-
-  const norm = normalizePhoneLoose(raw);
-  if (!norm) return null;
-
-  u = users.find((x) => normalizePhoneLoose(x.phone) === norm);
-  if (u) return u;
-
-  if (norm.startsWith("260")) {
-    const local0 = "0" + norm.slice(3);
-    u = users.find((x) => String(x.phone).replace(/\s+/g, "") === local0);
-    if (u) return u;
-  }
-  return null;
 }
 
 function findUserByPhone(phone) {
@@ -1270,7 +1227,7 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
   }
 
   const phoneNorm = String(phone).trim();
-  let user = findUserByPhoneLoose(phoneNorm) || findUserByPhone(phoneNorm);
+  let user = findUserByPhone(phoneNorm);
 
   if (!user) {
     // Demo behaviour: auto-register new users as buyer/seller only (admin is never auto-created)
@@ -1508,17 +1465,9 @@ if (!item) {
 // Public: fetch a user's public profile for cross-device display (seller name/logo)
 app.get("/api/users/public/:phone", (req, res) => {
   const phone = String(req.params.phone || "").trim();
-  const baseUrl = `${req.protocol}://${req.get("host")}`;
-  const absolutize = (u) => {
-    if (!u || typeof u !== "string") return "";
-    const s = u.trim();
-    if (s.startsWith("/uploads/")) return baseUrl + s;
-    return s;
-  };
-
   if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-  const user = findUserByPhoneLoose(phone) || findUserByPhone(phone);
+  const user = findUserByPhone(phone);
   if (!user) {
     // Return a minimal profile so UI can still show something
     return res.json({
@@ -1531,15 +1480,7 @@ app.get("/api/users/public/:phone", (req, res) => {
     });
   }
 
-  const payload = publicProfileResponseForUser(user);
-  if (payload && payload.profile) {
-    payload.profile.selfieDataUrl = absolutize(payload.profile.selfieDataUrl);
-    payload.profile.logoDataUrl = absolutize(payload.profile.logoDataUrl);
-    payload.profile.selfieUrl = payload.profile.selfieDataUrl;
-    payload.profile.logoUrl = payload.profile.logoDataUrl;
-    payload.avatarUrl = absolutize(payload.avatarUrl);
-  }
-  res.json(payload);
+  return res.json(publicProfileResponseForUser(user));
 });
 
 // Backwards-compatible alias used by some frontend builds
@@ -1547,7 +1488,7 @@ app.get("/api/public/user/:phone", (req, res) => {
   const phone = String(req.params.phone || "").trim();
   if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-  const user = findUserByPhoneLoose(phone) || findUserByPhone(phone);
+  const user = findUserByPhone(phone);
   if (!user) return res.json({ displayName: phone, businessName: "", avatarUrl: "" });
 
   const out = publicProfileResponseForUser(user);
