@@ -835,6 +835,9 @@ async function dbLoadIntoMemory() {
       });
     }
   } catch (e) {}
+  // Ensure demo admin exists even after DB load
+  ensureAdminUserSeed();
+
 }
 
 async function dbUpsertUser(user) {
@@ -1018,6 +1021,34 @@ function findUserByPhone(phone) {
   return users.find((u) => u.phone === phone);
 }
 
+function ensureAdminUserSeed() {
+  // Make sure the demo admin always exists (even if DB load overwrote in-memory users)
+  const adminPhone = String(DEMO_ADMIN_PHONE || "").trim();
+  if (!adminPhone) return;
+  let admin = users.find((u) => u && String(u.phone).trim() === adminPhone && u.role === "admin");
+  if (!admin) {
+    admin = {
+      id: uuid(),
+      phone: adminPhone,
+      role: "admin",
+      pinHash: hashPin(DEMO_ADMIN_PIN),
+      kycLevel: "admin",
+      disabled: false,
+    };
+    users.push(admin);
+  } else {
+    // Keep PIN in sync with env defaults (useful for demos)
+    admin.pinHash = hashPin(DEMO_ADMIN_PIN);
+    admin.kycLevel = "admin";
+    if (admin.disabled) admin.disabled = false;
+  }
+
+  // Persist if DB is enabled
+  if (dbEnabled()) {
+    dbUpsertUser(admin).catch(() => {});
+  }
+}
+
 // Seed a couple of demo users (optional)
 users.push({
   id: uuid(),
@@ -1043,6 +1074,8 @@ users.push({
   kycLevel: "admin",
 });
 
+
+ensureAdminUserSeed();
 // Auth middleware
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
@@ -1228,6 +1261,17 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
 
   const phoneNorm = String(phone).trim();
   let user = findUserByPhone(phoneNorm);
+
+  // Special-case demo admin login: allow the configured admin to sign in even if DB doesn't yet contain it
+  if ((!user) && rolePreference === "admin") {
+    const adminPhone = String(DEMO_ADMIN_PHONE || "").trim();
+    const pinOk = String(pin) === String(DEMO_ADMIN_PIN);
+    if (String(phoneNorm).trim() === adminPhone && pinOk) {
+      ensureAdminUserSeed();
+      user = findUserByPhone(adminPhone);
+    }
+  }
+
 
   if (!user) {
     // Demo behaviour: auto-register new users as buyer/seller only (admin is never auto-created)
