@@ -835,9 +835,6 @@ async function dbLoadIntoMemory() {
       });
     }
   } catch (e) {}
-  // Ensure demo admin exists even after DB load
-  ensureAdminUserSeed();
-
 }
 
 async function dbUpsertUser(user) {
@@ -1021,34 +1018,6 @@ function findUserByPhone(phone) {
   return users.find((u) => u.phone === phone);
 }
 
-function ensureAdminUserSeed() {
-  // Make sure the demo admin always exists (even if DB load overwrote in-memory users)
-  const adminPhone = String(DEMO_ADMIN_PHONE || "").trim();
-  if (!adminPhone) return;
-  let admin = users.find((u) => u && String(u.phone).trim() === adminPhone && u.role === "admin");
-  if (!admin) {
-    admin = {
-      id: uuid(),
-      phone: adminPhone,
-      role: "admin",
-      pinHash: hashPin(DEMO_ADMIN_PIN),
-      kycLevel: "admin",
-      disabled: false,
-    };
-    users.push(admin);
-  } else {
-    // Keep PIN in sync with env defaults (useful for demos)
-    admin.pinHash = hashPin(DEMO_ADMIN_PIN);
-    admin.kycLevel = "admin";
-    if (admin.disabled) admin.disabled = false;
-  }
-
-  // Persist if DB is enabled
-  if (dbEnabled()) {
-    dbUpsertUser(admin).catch(() => {});
-  }
-}
-
 // Seed a couple of demo users (optional)
 users.push({
   id: uuid(),
@@ -1074,8 +1043,6 @@ users.push({
   kycLevel: "admin",
 });
 
-
-ensureAdminUserSeed();
 // Auth middleware
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
@@ -1262,17 +1229,6 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
   const phoneNorm = String(phone).trim();
   let user = findUserByPhone(phoneNorm);
 
-  // Special-case demo admin login: allow the configured admin to sign in even if DB doesn't yet contain it
-  if ((!user) && rolePreference === "admin") {
-    const adminPhone = String(DEMO_ADMIN_PHONE || "").trim();
-    const pinOk = String(pin) === String(DEMO_ADMIN_PIN);
-    if (String(phoneNorm).trim() === adminPhone && pinOk) {
-      ensureAdminUserSeed();
-      user = findUserByPhone(adminPhone);
-    }
-  }
-
-
   if (!user) {
     // Demo behaviour: auto-register new users as buyer/seller only (admin is never auto-created)
     if (!ALLOW_PUBLIC_SIGNUP) {
@@ -1303,11 +1259,6 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
     if (user.role === "admin" && user.phone !== DEMO_ADMIN_PHONE) {
       logAudit(req, "auth_login_failed", { reason: "admin_phone_mismatch", phoneTried: phoneNorm });
       return res.status(403).json({ error: "Admin access is restricted." });
-    }
-
-    if (user.disabled) {
-      logAudit(req, "auth_login_failed", { reason: "user_disabled", phoneTried: phoneNorm });
-      return res.status(403).json({ error: "This account has been disabled. Please contact support." });
     }
 
     if (user.pinHash !== hashPin(pin)) {
@@ -2596,87 +2547,6 @@ app.get("/api/admin/audit", requireAuth, (req, res) => {
 
   res.json({ entries });
 });
-
-// -------- Admin: users + summary --------
-app.get("/api/admin/users", requireAuth, (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
-
-  const list = users.map((u) => ({
-    id: u.id,
-    phone: u.phone,
-    role: u.role,
-    kycLevel: u.kycLevel,
-    disabled: !!u.disabled,
-    // profile (optional)
-    displayName: u.profile && (u.profile.displayName || u.profile.fullName) ? (u.profile.displayName || u.profile.fullName) : undefined,
-    businessName: u.profile && u.profile.businessName ? u.profile.businessName : undefined,
-  }));
-
-  res.json({ users: list });
-});
-
-// Update a user (demo): toggle disabled via query param
-// Example: GET /api/admin/users/0977123456?disabled=1
-app.get("/api/admin/users/:phone", requireAuth, (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
-
-  const phone = normalizePhone(req.params.phone);
-  const user = findUserByPhone(phone);
-
-  if (!user) return res.status(404).json({ error: "User not found" });
-
-  // Optional update: disabled flag
-  if (typeof req.query.disabled !== "undefined") {
-    const next = String(req.query.disabled) === "1" || String(req.query.disabled).toLowerCase() === "true";
-    user.disabled = next;
-
-    logAudit(req, "admin_user_update", { phone: user.phone, disabled: next });
-
-    if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
-  }
-
-  res.json({
-    ok: true,
-    user: {
-      id: user.id,
-      phone: user.phone,
-      role: user.role,
-      kycLevel: user.kycLevel,
-      disabled: !!user.disabled,
-    },
-  });
-});
-
-app.get("/api/admin/summary", requireAuth, (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
-
-  const txs = transactions || [];
-  const disputes = txs.filter((t) => !!t.disputeActive || String(t.status).toLowerCase() === "disputed");
-
-  const active = txs.filter((t) => ["pending_payment","pending","held"].includes(String(t.status)));
-  const inTransit = txs.filter((t) => ["in_transit","delivered"].includes(String(t.status)));
-  const completed = txs.filter((t) => ["released","completed"].includes(String(t.status)));
-
-  const releasedTotal = txs.reduce((sum, t) => {
-    const amt = Number(t.amount || t.quoteAmount || 0) || 0;
-    if (String(t.status) === "released" || String(t.status) === "completed") return sum + amt;
-    return sum;
-  }, 0);
-
-  res.json({
-    totals: {
-      users: users.length,
-      transactions: txs.length,
-      disputes: disputes.length,
-      active: active.length,
-      inTransit: inTransit.length,
-      completed: completed.length,
-      releasedTotal,
-    }
-  });
-});
-
-
 
 // -------- Start server --------
 
