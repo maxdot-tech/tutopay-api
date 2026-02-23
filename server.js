@@ -1897,7 +1897,7 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, requeryLimiter, i
 // MTN MoMo Disbursement (payout to seller)
 app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotencyMiddleware, async (req, res) => {
   const id = String(req.params.id || "");
-  const tx = db.transactions.find((t) => String(t.id) === id);
+  const tx = transactions.find((t) => String(t.id) === id);
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
 
   // Only allow seller (or admin) to request payout
@@ -1918,7 +1918,7 @@ app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotency
   }
 
   const amount = tx.amount;
-  const currency = tx.currency || process.env.MOMO_CURRENCY || "EUR";
+  const currency = tx.currency || process.env.MOMO_CURRENCY || "ZMW";
   const payeeMsisdn = tx.toPhone;
 
   try {
@@ -1937,7 +1937,7 @@ app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotency
       startedAt: Date.now(),
     };
 
-    logAudit("mtn_disbursement_initiated", {
+    logAudit(req, "mtn_disbursement_initiated", {
       txId: tx.id,
       referenceId,
       amount,
@@ -1946,7 +1946,7 @@ app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotency
       by: req.user.phone,
     });
 
-    saveDb();
+    if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
 
     return res.json({ ok: true, referenceId, status: tx.disbursement.status });
   } catch (e) {
@@ -1957,7 +1957,7 @@ app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotency
 
 app.get("/api/transactions/:id/payout-status", requireAuth, async (req, res) => {
   const id = String(req.params.id || "");
-  const tx = db.transactions.find((t) => String(t.id) === id);
+  const tx = transactions.find((t) => String(t.id) === id);
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
 
   if (req.user.role !== "admin" && req.user.phone !== tx.toPhone && req.user.phone !== tx.fromPhone) {
@@ -1981,14 +1981,14 @@ app.get("/api/transactions/:id/payout-status", requireAuth, async (req, res) => 
 
     tx.disbursement.updatedAt = Date.now();
 
-    logAudit("mtn_disbursement_status", {
+    logAudit(req, "mtn_disbursement_status", {
       txId: tx.id,
       referenceId: tx.disbursement.referenceId,
       status: tx.disbursement.status,
       raw: status,
     });
 
-    saveDb();
+    if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
 
     return res.json({ ok: true, referenceId: tx.disbursement.referenceId, status: tx.disbursement.status, raw: status });
   } catch (e) {
