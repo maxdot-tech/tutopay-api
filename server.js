@@ -772,7 +772,7 @@ async function dbLoadIntoMemory() {
     const u = await _pgPool.query("SELECT data FROM tutopay_users");
     if (u.rows && u.rows.length) {
       users.length = 0;
-      for (const r of u.rows) users.push(r.data);
+      for (const r of u.rows) users.push(ensureUserKycDefaults(r.data));
     }
   } catch (e) {}
 
@@ -1010,8 +1010,8 @@ function publicProfileResponseForUser(user) {
 }
 
 // -------- Simple in-memory users & sessions (demo only) --------
-const users = []; // { id, phone, role, pinHash, kycLevel }
-const sessions = new Map(); // token -> { id, phone, role, kycLevel, expiresAt }
+const users = []; // { id, phone, role, pinHash, kycLevel, kycStatus, ... }
+const sessions = new Map(); // token -> { id, phone, role, kycLevel, kycStatus, expiresAt }
 const loginAttempts = new Map(); // phone -> { count, firstAt, lockedUntil }
 
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || (12 * 60 * 60 * 1000)); // 12h
@@ -1108,6 +1108,21 @@ setInterval(() => {
 function findUserByPhone(phone) {
   return users.find((u) => u.phone === phone);
 }
+function ensureUserKycDefaults(user) {
+  if (!user || typeof user !== "object") return user;
+  if (!user.kycLevel) user.kycLevel = (user.role === "admin" ? "admin" : "basic");
+  if (!user.kycStatus) user.kycStatus = (user.role === "admin" ? "verified" : "unsubmitted");
+  if (!user.kycHistory) user.kycHistory = [];
+  return user;
+}
+
+function getEffectiveKycLevel(user) {
+  if (!user) return "basic";
+  if (user.role === "admin") return "admin";
+  if (String(user.kycStatus || "").toLowerCase() !== "verified") return "basic";
+  return user.kycLevel || "basic";
+}
+
 
 function ensureAdminUserSeed() {
   // Make sure the demo admin always exists (even if DB load overwrote in-memory users)
@@ -1121,6 +1136,7 @@ function ensureAdminUserSeed() {
       role: "admin",
       pinHash: hashPin(DEMO_ADMIN_PIN),
       kycLevel: "admin",
+      kycStatus: "verified",
       disabled: false,
     };
     users.push(admin);
@@ -1128,6 +1144,7 @@ function ensureAdminUserSeed() {
     // Keep PIN in sync with env defaults (useful for demos)
     admin.pinHash = hashPin(DEMO_ADMIN_PIN);
     admin.kycLevel = "admin";
+    admin.kycStatus = "verified";
     if (admin.disabled) admin.disabled = false;
   }
 
@@ -1144,6 +1161,7 @@ users.push({
   role: "buyer",
   pinHash: hashPin("1111"),
   kycLevel: "basic",
+  kycStatus: "unsubmitted",
 });
 
 users.push({
@@ -1152,6 +1170,7 @@ users.push({
   role: "seller",
   pinHash: hashPin("2222"),
   kycLevel: "basic",
+  kycStatus: "unsubmitted",
 });
 
 users.push({
@@ -1160,6 +1179,7 @@ users.push({
   role: "admin",
   pinHash: hashPin(DEMO_ADMIN_PIN),
   kycLevel: "admin",
+  kycStatus: "verified",
 });
 
 
@@ -1180,8 +1200,22 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Session expired. Please sign in again." });
   }
 
+  // Refresh role/KYC flags from user record on every request (important after admin KYC reviews)
+  const currentUser = findUserByPhone(session.phone);
+  if (currentUser) {
+    ensureUserKycDefaults(currentUser);
+    session.role = currentUser.role;
+    session.kycLevel = getEffectiveKycLevel(currentUser);
+    session.kycStatus = currentUser.kycStatus;
+    session.disabled = !!currentUser.disabled;
+    if (session.disabled) {
+      sessions.delete(token);
+      return res.status(403).json({ error: "This account has been disabled. Please contact support." });
+    }
+  }
+
   req.authToken = token;
-  req.user = session; // { id, phone, role, kycLevel, expiresAt }
+  req.user = session; // { id, phone, role, kycLevel, kycStatus, expiresAt }
   next();
 }
 
@@ -1396,11 +1430,14 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
       role,
       pinHash: hashPin(pin),
       kycLevel: "basic",
+      kycStatus: "unsubmitted",
+      kycHistory: [],
     };
     users.push(user);
     if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
     console.log("Created demo user:", user.phone, user.role);
   } else {
+    ensureUserKycDefaults(user);
     // Hardening: only allow the seeded demo admin phone to act as admin
     if (user.role === "admin" && user.phone !== DEMO_ADMIN_PHONE) {
       logAudit(req, "auth_login_failed", { reason: "admin_phone_mismatch", phoneTried: phoneNorm });
@@ -1462,14 +1499,16 @@ const token = crypto.randomBytes(24).toString("hex");
     id: user.id,
     phone: user.phone,
     role: user.role,
-    kycLevel: user.kycLevel,
+    kycLevel: getEffectiveKycLevel(user),
+    kycStatus: user.kycStatus,
     expiresAt: Date.now() + SESSION_TTL_MS,
   });
 
   logAudit(req, "auth_login_success", {
   phone: user.phone,
   role: user.role,
-  kycLevel: user.kycLevel,
+  kycLevel: getEffectiveKycLevel(user),
+  kycStatus: user.kycStatus,
 });
 
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
@@ -1480,7 +1519,8 @@ const token = crypto.randomBytes(24).toString("hex");
       id: user.id,
       phone: user.phone,
       role: user.role,
-      kycLevel: user.kycLevel,
+      kycLevel: getEffectiveKycLevel(user),
+      kycStatus: user.kycStatus,
     },
   });
 });
@@ -1492,6 +1532,162 @@ app.post("/api/auth/logout", requireAuth, (req, res) => {
     logAudit(req, "auth_logout", { phone: req.user && req.user.phone, role: req.user && req.user.role });
   } catch (e) {}
   return res.json({ ok: true });
+});
+
+// -------- KYC (BoZ trial prep) --------
+app.get("/api/kyc/me", requireAuth, (req, res) => {
+  const user = ensureUserKycDefaults(findUserByPhone(req.user.phone));
+  if (!user) return res.status(404).json({ error: "User not found" });
+  return res.json({
+    phone: user.phone,
+    role: user.role,
+    kycStatus: user.kycStatus,
+    kycLevel: getEffectiveKycLevel(user),
+    requestedKycLevel: user.kycLevel || "basic",
+    kycSubmittedAt: user.kycSubmittedAt || null,
+    kycReviewedAt: user.kycReviewedAt || null,
+    kycReviewedBy: user.kycReviewedBy || null,
+    kycRejectionReason: user.kycRejectionReason || null,
+    kycProfile: user.kycProfile || {},
+    kycHistory: Array.isArray(user.kycHistory) ? user.kycHistory : [],
+  });
+});
+
+app.post("/api/kyc/submit", requireAuth, (req, res) => {
+  if (req.user.role === "admin") return res.status(403).json({ error: "Admin accounts do not require KYC submission." });
+  const user = ensureUserKycDefaults(findUserByPhone(req.user.phone));
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const body = req.body || {};
+  const requestedKycLevel = ["basic","enhanced","full"].includes(body.requestedKycLevel) ? body.requestedKycLevel : (user.kycLevel || "basic");
+  const idType = String(body.idType || "").trim();
+  const idNumber = String(body.idNumber || body.nrcNumber || "").trim();
+  const fullName = String(body.fullName || (user.profile && (user.profile.displayName || user.profile.fullName)) || "").trim();
+  if (!idType || !idNumber || !fullName) {
+    return res.status(400).json({ error: "fullName, idType, and idNumber are required for KYC submission." });
+  }
+
+  user.kycProfile = {
+    fullName,
+    idType,
+    idNumber,
+    dob: body.dob ? String(body.dob) : undefined,
+    address: body.address ? String(body.address).trim() : undefined,
+    businessName: body.businessName ? String(body.businessName).trim() : undefined,
+    sellerType: body.sellerType ? String(body.sellerType).trim() : undefined,
+    selfieProvided: !!(user.profile && user.profile.selfieDataUrl),
+    logoProvided: !!(user.profile && user.profile.logoDataUrl),
+    submittedFields: Object.keys(body || {}).sort(),
+  };
+  user.kycStatus = "pending";
+  user.kycSubmittedAt = nowIso();
+  user.kycRejectionReason = null;
+  user.kycLevel = requestedKycLevel; // requested target level; effective level stays basic until verified
+  user.kycHistory = Array.isArray(user.kycHistory) ? user.kycHistory : [];
+  user.kycHistory.push({
+    at: user.kycSubmittedAt,
+    action: "submitted",
+    by: req.user.phone,
+    requestedKycLevel,
+  });
+
+  if (dbEnabled()) dbUpsertUser(user).catch(() => {});
+  logAudit(req, "kyc_submit", { phone: user.phone, requestedKycLevel, idType });
+  return res.json({
+    ok: true,
+    message: "KYC submitted for review.",
+    kycStatus: user.kycStatus,
+    requestedKycLevel: user.kycLevel,
+    effectiveKycLevel: getEffectiveKycLevel(user),
+    kycSubmittedAt: user.kycSubmittedAt,
+  });
+});
+
+app.get("/api/admin/kyc/pending", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  const pending = users
+    .map(u => ensureUserKycDefaults(u))
+    .filter(u => u.role !== "admin" && (u.kycStatus === "pending" || u.kycStatus === "under_review"))
+    .map(u => ({
+      phone: u.phone,
+      role: u.role,
+      kycStatus: u.kycStatus,
+      requestedKycLevel: u.kycLevel || "basic",
+      effectiveKycLevel: getEffectiveKycLevel(u),
+      kycSubmittedAt: u.kycSubmittedAt || null,
+      displayName: u.profile && (u.profile.displayName || u.profile.fullName),
+      businessName: u.profile && u.profile.businessName,
+      kycProfile: u.kycProfile || {},
+    }));
+  return res.json(pending);
+});
+
+app.post("/api/admin/kyc/:phone/review", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  const phone = String(req.params.phone || "").trim();
+  const user = ensureUserKycDefaults(findUserByPhone(phone));
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.role === "admin") return res.status(400).json({ error: "Cannot review admin KYC." });
+
+  const body = req.body || {};
+  const decision = String(body.decision || "").toLowerCase(); // approve/reject/request_more
+  const level = ["basic","enhanced","full"].includes(body.kycLevel) ? body.kycLevel : (user.kycLevel || "basic");
+  const reason = String(body.reason || "").trim();
+
+  if (!["approve","approved","verify","verified","reject","rejected","request_more","needs_more_info"].includes(decision)) {
+    return res.status(400).json({ error: "decision must be approve, reject, or request_more" });
+  }
+
+  const at = nowIso();
+  if (["approve","approved","verify","verified"].includes(decision)) {
+    user.kycStatus = "verified";
+    user.kycLevel = level;
+    user.kycReviewedAt = at;
+    user.kycReviewedBy = req.user.phone;
+    user.kycRejectionReason = null;
+  } else if (["reject","rejected"].includes(decision)) {
+    user.kycStatus = "rejected";
+    user.kycReviewedAt = at;
+    user.kycReviewedBy = req.user.phone;
+    user.kycRejectionReason = reason || "KYC review rejected";
+  } else {
+    user.kycStatus = "needs_more_info";
+    user.kycReviewedAt = at;
+    user.kycReviewedBy = req.user.phone;
+    user.kycRejectionReason = reason || "Additional KYC information required";
+  }
+
+  user.kycHistory = Array.isArray(user.kycHistory) ? user.kycHistory : [];
+  user.kycHistory.push({
+    at,
+    action: "reviewed",
+    decision: user.kycStatus,
+    by: req.user.phone,
+    kycLevel: user.kycLevel,
+    reason: user.kycRejectionReason || null,
+  });
+
+  if (dbEnabled()) dbUpsertUser(user).catch(() => {});
+  logAudit(req, "kyc_review", { targetPhone: user.phone, decision: user.kycStatus, kycLevel: user.kycLevel });
+
+  // Refresh any active sessions for that user
+  for (const sess of sessions.values()) {
+    if (sess && sess.phone === user.phone) {
+      sess.kycStatus = user.kycStatus;
+      sess.kycLevel = getEffectiveKycLevel(user);
+    }
+  }
+
+  return res.json({
+    ok: true,
+    phone: user.phone,
+    kycStatus: user.kycStatus,
+    kycLevel: getEffectiveKycLevel(user),
+    requestedKycLevel: user.kycLevel,
+    kycReviewedAt: user.kycReviewedAt,
+    kycReviewedBy: user.kycReviewedBy,
+    reason: user.kycRejectionReason || null,
+  });
 });
 
 // -------- Items --------
@@ -1718,7 +1914,9 @@ const priceNum = Number(amount);
   }
 
   // 🔹🔹 KYC ENFORCEMENT GOES HERE 🔹🔹
-  const kycLevel = req.user.kycLevel || "basic";
+  const buyerUser = findUserByPhone(req.user.phone) || { kycLevel: req.user.kycLevel, kycStatus: req.user.kycStatus };
+  ensureUserKycDefaults(buyerUser);
+  const kycLevel = getEffectiveKycLevel(buyerUser);
   const limits = KYC_LIMITS[kycLevel] || KYC_LIMITS.basic;
 
   // 1) Per-transaction limit
@@ -2736,7 +2934,11 @@ app.get("/api/admin/users", requireAuth, (req, res) => {
     id: u.id,
     phone: u.phone,
     role: u.role,
-    kycLevel: u.kycLevel,
+    kycLevel: getEffectiveKycLevel(ensureUserKycDefaults(u)),
+    requestedKycLevel: (u.kycLevel || "basic"),
+    kycStatus: (u.kycStatus || "unsubmitted"),
+    kycSubmittedAt: u.kycSubmittedAt || null,
+    kycReviewedAt: u.kycReviewedAt || null,
     disabled: !!u.disabled,
     // profile (optional)
     displayName: u.profile && (u.profile.displayName || u.profile.fullName) ? (u.profile.displayName || u.profile.fullName) : undefined,
