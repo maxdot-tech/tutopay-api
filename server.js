@@ -1011,11 +1011,99 @@ function publicProfileResponseForUser(user) {
 
 // -------- Simple in-memory users & sessions (demo only) --------
 const users = []; // { id, phone, role, pinHash, kycLevel }
-const sessions = new Map(); // token -> { id, phone, role, kycLevel }
+const sessions = new Map(); // token -> { id, phone, role, kycLevel, expiresAt }
+const loginAttempts = new Map(); // phone -> { count, firstAt, lockedUntil }
 
-function hashPin(pin) {
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || (12 * 60 * 60 * 1000)); // 12h
+const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || (15 * 60 * 1000)); // 15m
+const LOGIN_LOCK_MS = Number(process.env.LOGIN_LOCK_MS || (15 * 60 * 1000)); // 15m
+const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 5);
+
+function legacyHashPin(pin) {
   return crypto.createHash("sha256").update(String(pin)).digest("hex");
 }
+
+function hashPin(pin) {
+  // Stronger PIN hashing using scrypt with per-user random salt.
+  const salt = crypto.randomBytes(16);
+  const derived = crypto.scryptSync(String(pin), salt, 32);
+  return `s2$${salt.toString("hex")}$${derived.toString("hex")}`;
+}
+
+function verifyPin(pin, storedHash) {
+  if (!storedHash) return false;
+  const val = String(storedHash);
+  // Backward compatibility for old SHA-256 demo hashes
+  if (!val.startsWith("s2$")) return legacyHashPin(pin) === val;
+
+  const parts = val.split("$");
+  if (parts.length !== 3) return false;
+  const saltHex = parts[1];
+  const hashHex = parts[2];
+  const salt = Buffer.from(saltHex, "hex");
+  const expected = Buffer.from(hashHex, "hex");
+  const derived = crypto.scryptSync(String(pin), salt, expected.length);
+  if (derived.length !== expected.length) return false;
+  return crypto.timingSafeEqual(derived, expected);
+}
+
+function pinHashNeedsUpgrade(storedHash) {
+  return !String(storedHash || "").startsWith("s2$");
+}
+
+function getLoginAttemptState(phone) {
+  const key = String(phone || "").trim();
+  if (!key) return null;
+  const now = Date.now();
+  let state = loginAttempts.get(key);
+  if (!state) return null;
+  if (state.lockedUntil && now >= state.lockedUntil) {
+    loginAttempts.delete(key);
+    return null;
+  }
+  if (state.firstAt && now - state.firstAt > LOGIN_WINDOW_MS && !state.lockedUntil) {
+    loginAttempts.delete(key);
+    return null;
+  }
+  return state;
+}
+
+function recordLoginFailure(phone) {
+  const key = String(phone || "").trim();
+  if (!key) return null;
+  const now = Date.now();
+  let state = getLoginAttemptState(key);
+  if (!state) state = { count: 0, firstAt: now, lockedUntil: 0 };
+  if (!state.firstAt || now - state.firstAt > LOGIN_WINDOW_MS) {
+    state.count = 0;
+    state.firstAt = now;
+    state.lockedUntil = 0;
+  }
+  state.count += 1;
+  if (state.count >= LOGIN_MAX_ATTEMPTS) {
+    state.lockedUntil = now + LOGIN_LOCK_MS;
+  }
+  loginAttempts.set(key, state);
+  return state;
+}
+
+function clearLoginFailures(phone) {
+  const key = String(phone || "").trim();
+  if (key) loginAttempts.delete(key);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [tok, sess] of sessions.entries()) {
+    if (!sess || (sess.expiresAt && now > sess.expiresAt)) sessions.delete(tok);
+  }
+  for (const [phone, state] of loginAttempts.entries()) {
+    if (!state) { loginAttempts.delete(phone); continue; }
+    if (state.lockedUntil && now >= state.lockedUntil) { loginAttempts.delete(phone); continue; }
+    if ((!state.lockedUntil) && state.firstAt && (now - state.firstAt > LOGIN_WINDOW_MS)) loginAttempts.delete(phone);
+  }
+}, 60 * 1000).unref?.();
+
 
 function findUserByPhone(phone) {
   return users.find((u) => u.phone === phone);
@@ -1086,7 +1174,14 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Not authenticated" });
   }
 
-  req.user = sessions.get(token); // { id, phone, role, kycLevel }
+  const session = sessions.get(token);
+  if (!session || (session.expiresAt && Date.now() > session.expiresAt)) {
+    if (token) sessions.delete(token);
+    return res.status(401).json({ error: "Session expired. Please sign in again." });
+  }
+
+  req.authToken = token;
+  req.user = session; // { id, phone, role, kycLevel, expiresAt }
   next();
 }
 
@@ -1260,6 +1355,13 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
   }
 
   const phoneNorm = String(phone).trim();
+  const lockState = getLoginAttemptState(phoneNorm);
+  if (lockState && lockState.lockedUntil && Date.now() < lockState.lockedUntil) {
+    const retryAfterSec = Math.max(1, Math.ceil((lockState.lockedUntil - Date.now()) / 1000));
+    logAudit(req, "auth_login_blocked", { phoneTried: phoneNorm, retryAfterSec });
+    return res.status(429).json({ error: "Too many failed PIN attempts. Try again later.", retryAfterSec });
+  }
+
   let user = findUserByPhone(phoneNorm);
 
   // Special-case demo admin login: allow the configured admin to sign in even if DB doesn't yet contain it
@@ -1310,13 +1412,28 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
       return res.status(403).json({ error: "This account has been disabled. Please contact support." });
     }
 
-    if (user.pinHash !== hashPin(pin)) {
-  logAudit(req, "auth_login_failed", {
-    reason: "invalid_pin",
-    phoneTried: phoneNorm,
-  });
-  return res.status(401).json({ error: "Invalid PIN." });
-}
+    if (!verifyPin(pin, user.pinHash)) {
+      const state = recordLoginFailure(phoneNorm);
+      logAudit(req, "auth_login_failed", {
+        reason: "invalid_pin",
+        phoneTried: phoneNorm,
+        failedAttempts: state ? state.count : 1,
+        lockedUntil: state && state.lockedUntil ? new Date(state.lockedUntil).toISOString() : null,
+      });
+      const payload = { error: "Invalid PIN." };
+      if (state && state.lockedUntil && Date.now() < state.lockedUntil) {
+        payload.error = "Too many failed PIN attempts. Try again later.";
+        payload.retryAfterSec = Math.max(1, Math.ceil((state.lockedUntil - Date.now()) / 1000));
+        return res.status(429).json(payload);
+      }
+      return res.status(401).json(payload);
+    }
+
+    // Transparently upgrade legacy SHA-256 PIN hashes after a successful login
+    if (pinHashNeedsUpgrade(user.pinHash)) {
+      user.pinHash = hashPin(pin);
+      if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
+    }
     if (rolePreference && rolePreference !== user.role) {
       console.log(
         "Role preference",
@@ -1338,12 +1455,15 @@ if (profile && typeof profile === "object") {
   } catch (e) {}
 }
 
+clearLoginFailures(phoneNorm);
+
 const token = crypto.randomBytes(24).toString("hex");
   sessions.set(token, {
     id: user.id,
     phone: user.phone,
     role: user.role,
     kycLevel: user.kycLevel,
+    expiresAt: Date.now() + SESSION_TTL_MS,
   });
 
   logAudit(req, "auth_login_success", {
@@ -1352,8 +1472,10 @@ const token = crypto.randomBytes(24).toString("hex");
   kycLevel: user.kycLevel,
 });
 
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
   return res.json({
     token,
+    expiresAt,
     user: {
       id: user.id,
       phone: user.phone,
@@ -1361,6 +1483,15 @@ const token = crypto.randomBytes(24).toString("hex");
       kycLevel: user.kycLevel,
     },
   });
+});
+
+
+app.post("/api/auth/logout", requireAuth, (req, res) => {
+  try {
+    if (req.authToken) sessions.delete(req.authToken);
+    logAudit(req, "auth_logout", { phone: req.user && req.user.phone, role: req.user && req.user.role });
+  } catch (e) {}
+  return res.json({ ok: true });
 });
 
 // -------- Items --------
