@@ -299,7 +299,102 @@ app.use(express.static("public"));
 const MOMO_BASE_URL = process.env.MOMO_BASE_URL || "https://sandbox.momodeveloper.mtn.com";
 const MOMO_CURRENCY = process.env.MOMO_CURRENCY || "ZMW";
 const PUBLIC_API_BASE = process.env.PUBLIC_API_BASE || process.env.API_PUBLIC_BASE || "https://api.tutopay.online";
-const MOMO_CALLBACK_URL = process.env.MOMO_CALLBACK_URL || `${PUBLIC_API_BASE}/momo/callback`;
+const MOMO_CALLBACK_URL = process.env.MOMO_CALLBACK_URL || `${PUBLIC_API_BASE}/api/callbacks/mtn/collection`;
+
+const MTN_CALLBACK_SECRET = String(process.env.MTN_CALLBACK_SECRET || process.env.CALLBACK_SHARED_SECRET || "").trim();
+const AIRTEL_CALLBACK_SECRET = String(process.env.AIRTEL_CALLBACK_SECRET || process.env.CALLBACK_SHARED_SECRET || "").trim();
+
+function safeEq(a, b) {
+  const aa = Buffer.from(String(a || ""));
+  const bb = Buffer.from(String(b || ""));
+  if (aa.length !== bb.length) return false;
+  try { return crypto.timingSafeEqual(aa, bb); } catch { return false; }
+}
+
+function verifyProviderCallback(req, provider) {
+  const expected = provider === "airtel" ? AIRTEL_CALLBACK_SECRET : MTN_CALLBACK_SECRET;
+  if (!expected) return { ok: true, skipped: true };
+  const got =
+    req.headers["x-callback-secret"] ||
+    req.headers["x-webhook-secret"] ||
+    req.headers["x-momo-callback-secret"] ||
+    req.headers["x-airtel-callback-secret"] ||
+    req.headers["authorization"] ||
+    (req.query && (req.query.secret || req.query.token)) ||
+    "";
+  const cleaned = String(got).replace(/^Bearer\s+/i, "").trim();
+  if (!safeEq(cleaned, expected)) return { ok: false };
+  return { ok: true };
+}
+
+const callbackSeen = new Map(); // key -> expiresAtMs
+function callbackAlreadyProcessed(key, ttlMs = 24*60*60*1000) {
+  const now = Date.now();
+  for (const [k, exp] of callbackSeen) if (exp <= now) callbackSeen.delete(k);
+  if (callbackSeen.has(key)) return true;
+  callbackSeen.set(key, now + ttlMs);
+  return false;
+}
+
+function findTxByAnyReference(ref) {
+  const sref = String(ref || "").trim();
+  if (!sref) return null;
+  return transactions.find((t) =>
+    String(t.paymentRef || "") === sref ||
+    String((t.disbursement && t.disbursement.referenceId) || "") === sref ||
+    String(t.id || "") === sref
+  ) || null;
+}
+
+function normalizeCallbackStatus(raw, provider) {
+  const s = String(raw || "").toUpperCase();
+  if (provider === "airtel") {
+    if (["TS","SUCCESS","SUCCESSFUL","PAID"].includes(s)) return "SUCCESSFUL";
+    if (["TF","FAILED","FAIL","REJECTED"].includes(s)) return "FAILED";
+    return "PENDING";
+  }
+  if (["SUCCESSFUL","SUCCESS","COMPLETED"].includes(s)) return "SUCCESSFUL";
+  if (["FAILED","FAIL","REJECTED"].includes(s)) return "FAILED";
+  return "PENDING";
+}
+
+function applyCollectionCallbackUpdate(tx, provider, normStatus, reference, rawBody) {
+  tx.paymentProvider = provider === "airtel" ? "airtel_sandbox" : "mtn_momo";
+  tx.paymentStatus = normStatus === "SUCCESSFUL" ? "paid" : (normStatus === "FAILED" ? "failed" : "pending");
+  tx.paymentMeta = tx.paymentMeta || {};
+  tx.paymentMeta.callbacks = tx.paymentMeta.callbacks || [];
+  tx.paymentMeta.callbacks.push({ at: nowIso(), provider, status: normStatus, reference, body: rawBody });
+  if (tx.paymentMeta.callbacks.length > 20) tx.paymentMeta.callbacks.shift();
+
+  if (normStatus === "SUCCESSFUL") {
+    tx.paidAt = tx.paidAt || nowIso();
+    tx.status = "pending";
+    tx.collectionReconciled = false;
+    recordLedger(null, tx, "deposit_confirmed", { reference, provider: tx.paymentProvider, actorPhone: "system", actorRole: "system", notes: "Callback confirmed collection" });
+  } else if (normStatus === "FAILED") {
+    tx.status = "pending_payment";
+  }
+}
+
+function applyPayoutCallbackUpdate(tx, normStatus, reference, rawBody) {
+  tx.disbursement = tx.disbursement || {};
+  tx.disbursement.referenceId = tx.disbursement.referenceId || reference;
+  tx.disbursement.lastCallbackAt = nowIso();
+  tx.disbursement.lastCallbackBody = rawBody;
+
+  if (normStatus === "SUCCESSFUL") {
+    tx.disbursement.status = "successful";
+    tx.disbursement.completedAt = Date.now();
+    tx.payoutReconciled = false;
+    recordLedger(null, tx, "payout_completed", { reference, provider: "mtn_momo_disbursement", actorPhone: "system", actorRole: "system", notes: "Callback confirmed payout" });
+  } else if (normStatus === "FAILED") {
+    tx.disbursement.status = "failed";
+    tx.payoutReconciled = false;
+    recordLedger(null, tx, "payout_failed", { reference, provider: "mtn_momo_disbursement", actorPhone: "system", actorRole: "system", notes: "Callback reported payout failure" });
+  } else {
+    tx.disbursement.status = tx.disbursement.status || "pending";
+  }
+}
 
 // Expect these env vars on Railway (Settings -> Variables):
 // MTN_COLLECTION_SUB_KEY, MTN_COLLECTION_APIUSER, MTN_COLLECTION_APIKEY
@@ -532,13 +627,75 @@ async function momoGetTransferStatus(referenceId) {
 }
 
 
-// Simple callback receiver (MoMo will call this if you set X-Callback-Url)
+// Provider callback handlers (MTN / Airtel) with shared-secret verification and idempotent processing
+function extractMtnCallbackFields(body) {
+  const b = body || {};
+  const ref = b.referenceId || b.financialTransactionId || b.externalId || (b.data && (b.data.referenceId || b.data.financialTransactionId || b.data.externalId));
+  const status = b.status || (b.data && b.data.status) || b.reason || (b.data && b.data.reason) || "";
+  return { reference: ref, status, raw: b };
+}
+
+function extractAirtelCallbackFields(body) {
+  const b = body || {};
+  const txn = b.transaction || b.data || b;
+  const ref = txn.airtelMoneyId || txn.txnId || txn.reference || txn.id || b.reference || b.transactionId || b.externalId;
+  const status = txn.status || txn.txnStatus || b.status || b.code || "";
+  return { reference: ref, status, raw: b };
+}
+
+function processProviderCallback(req, res, provider, kind) {
+  const v = verifyProviderCallback(req, provider);
+  if (!v.ok) {
+    logAudit(req, "callback_rejected", { provider, kind, reason: "secret_mismatch" });
+    return res.status(401).json({ error: "Invalid callback secret" });
+  }
+
+  const info = provider === "airtel" ? extractAirtelCallbackFields(req.body) : extractMtnCallbackFields(req.body);
+  const reference = String(info.reference || "").trim();
+  const normStatus = normalizeCallbackStatus(info.status, provider);
+
+  if (!reference) {
+    logAudit(req, "callback_invalid", { provider, kind, reason: "missing_reference", body: req.body });
+    return res.status(400).json({ error: "Missing callback reference" });
+  }
+
+  const dedupeKey = [provider, kind, reference, normStatus].join(":");
+  if (callbackAlreadyProcessed(dedupeKey)) {
+    logAudit(req, "callback_duplicate", { provider, kind, reference, status: normStatus });
+    return res.status(200).json({ ok: true, duplicate: true });
+  }
+
+  const tx = findTxByAnyReference(reference);
+  if (!tx) {
+    logAudit(req, "callback_unmatched", { provider, kind, reference, status: normStatus });
+    return res.status(202).json({ ok: true, unmatched: true });
+  }
+
+  ensureTxReconDefaults(tx);
+
+  if (kind === "collection") {
+    applyCollectionCallbackUpdate(tx, provider, normStatus, reference, info.raw);
+    logAudit(req, "callback_collection_processed", { provider, txId: tx.id, reference, status: normStatus });
+  } else {
+    applyPayoutCallbackUpdate(tx, normStatus, reference, info.raw);
+    logAudit(req, "callback_payout_processed", { provider, txId: tx.id, reference, status: normStatus });
+  }
+
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+
+  return res.status(200).json({ ok: true, txId: tx.id, reference, status: normStatus });
+}
+
+// Legacy MTN callback path (kept for compatibility)
 app.post("/momo/callback", (req, res) => {
-  try {
-    console.log("MoMo callback:", JSON.stringify({ headers: req.headers, body: req.body }));
-  } catch {}
-  res.status(200).json({ ok: true });
+  try { console.log("MoMo callback:", JSON.stringify({ headers: req.headers, body: req.body })); } catch {}
+  return processProviderCallback(req, res, "mtn", "collection");
 });
+
+// Preferred provider-specific callback routes
+app.post("/api/callbacks/mtn/collection", (req, res) => processProviderCallback(req, res, "mtn", "collection"));
+app.post("/api/callbacks/mtn/payout", (req, res) => processProviderCallback(req, res, "mtn", "payout"));
+app.post("/api/callbacks/airtel/collection", (req, res) => processProviderCallback(req, res, "airtel", "collection"));
 
 // ===== Dispute document uploads (Multer) =====
 const uploadDir = path.join(__dirname, "uploads");
@@ -3132,6 +3289,21 @@ app.get("/api/admin/ledger", requireAuth, (req, res) => {
   entries = entries.slice(-limit).reverse();
 
   res.json({ entries });
+});
+
+
+app.get("/api/admin/callback-config", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  return res.json({
+    ok: true,
+    callbacks: {
+      mtnCollectionPath: "/api/callbacks/mtn/collection",
+      mtnPayoutPath: "/api/callbacks/mtn/payout",
+      airtelCollectionPath: "/api/callbacks/airtel/collection",
+      mtnSecretConfigured: !!MTN_CALLBACK_SECRET,
+      airtelSecretConfigured: !!AIRTEL_CALLBACK_SECRET,
+    }
+  });
 });
 
 app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
