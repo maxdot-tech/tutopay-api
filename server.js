@@ -674,6 +674,7 @@ const requests = [];
 // -------- Audit log (in-memory) --------
 // Each entry: { id, timestamp, ip, userPhone, userRole, eventType, details }
 const auditLog = [];
+const ledgerEntries = []; // immutable-ish append-only ledger for money events
 
 // ===== PostgreSQL persistence (Railway) =====
 // If DATABASE_URL exists and pg is installed, we persist users/items/transactions/requests/audit logs.
@@ -750,6 +751,13 @@ async function dbEnsureSchema() {
       ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       data JSONB NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS tutopay_ledger (
+      id TEXT PRIMARY KEY,
+      ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      tx_id TEXT,
+      event_type TEXT,
+      data JSONB NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS tutopay_idempotency (
       key TEXT PRIMARY KEY,
       request_hash TEXT,
@@ -760,8 +768,19 @@ async function dbEnsureSchema() {
     );
     CREATE INDEX IF NOT EXISTS tutopay_items_code_idx ON tutopay_items(code);
     CREATE INDEX IF NOT EXISTS tutopay_audit_ts_idx ON tutopay_audit(ts);
+    CREATE INDEX IF NOT EXISTS tutopay_ledger_ts_idx ON tutopay_ledger(ts);
+    CREATE INDEX IF NOT EXISTS tutopay_ledger_tx_idx ON tutopay_ledger(tx_id);
     CREATE INDEX IF NOT EXISTS tutopay_idem_expires_idx ON tutopay_idempotency(expires_at);
   `);
+}
+
+function ensureTxReconDefaults(tx) {
+  if (!tx || typeof tx !== "object") return tx;
+  if (typeof tx.collectionReconciled !== "boolean") tx.collectionReconciled = false;
+  if (typeof tx.payoutReconciled !== "boolean") tx.payoutReconciled = false;
+  if (!Array.isArray(tx.reconNotes)) tx.reconNotes = [];
+  if (!tx.reconUpdatedAt) tx.reconUpdatedAt = null;
+  return tx;
 }
 
 async function dbLoadIntoMemory() {
@@ -800,7 +819,7 @@ async function dbLoadIntoMemory() {
     const tx = await _pgPool.query("SELECT data FROM tutopay_transactions ORDER BY updated_at ASC");
     if (tx.rows && tx.rows.length) {
       transactions.length = 0;
-      for (const r of tx.rows) transactions.push(r.data);
+      for (const r of tx.rows) transactions.push(ensureTxReconDefaults(r.data));
     }
   } catch (e) {}
 
@@ -819,6 +838,15 @@ async function dbLoadIntoMemory() {
     if (a.rows && a.rows.length) {
       auditLog.length = 0;
       for (const r of a.rows.reverse()) auditLog.push(r.data);
+    }
+  } catch (e) {}
+
+  // Ledger (keep last 5000 for memory)
+  try {
+    const l = await _pgPool.query("SELECT data FROM tutopay_ledger ORDER BY ts DESC LIMIT 5000");
+    if (l.rows && l.rows.length) {
+      ledgerEntries.length = 0;
+      for (const r of l.rows.reverse()) ledgerEntries.push(r.data);
     }
   } catch (e) {}
 
@@ -905,6 +933,18 @@ async function dbInsertAudit(entry) {
   );
 }
 
+async function dbInsertLedger(entry) {
+  if (!dbEnabled()) return;
+  const id = String(entry.id || uuid()).trim();
+  const ts = entry.timestamp ? new Date(entry.timestamp) : new Date();
+  await _pgPool.query(
+    `INSERT INTO tutopay_ledger(id, ts, tx_id, event_type, data)
+     VALUES ($1, $2, $3, $4, $5::jsonb)
+     ON CONFLICT (id) DO NOTHING`,
+    [id, ts, entry.txId ? String(entry.txId) : null, entry.eventType || null, JSON.stringify(entry)]
+  );
+}
+
 async function dbIdemGet(key) {
   if (!dbEnabled()) return null;
   const r = await _pgPool.query("SELECT request_hash, status_code, response FROM tutopay_idempotency WHERE key=$1 AND expires_at > NOW()", [key]);
@@ -923,6 +963,50 @@ async function dbIdemSet(key, requestHash, statusCode, response, ttlMs) {
 }
 
 
+
+function hasLedgerEvent(txId, eventType, reference) {
+  return ledgerEntries.some((e) =>
+    String(e.txId || "") === String(txId || "") &&
+    String(e.eventType || "") === String(eventType || "") &&
+    (reference == null || String(e.reference || "") === String(reference || ""))
+  );
+}
+
+function recordLedger(req, tx, eventType, opts = {}) {
+  if (!tx || !tx.id) return null;
+  ensureTxReconDefaults(tx);
+  const ref = opts.reference || opts.paymentRef || opts.referenceId || null;
+  if (opts.dedupe !== false && hasLedgerEvent(tx.id, eventType, ref)) return null;
+
+  const entry = {
+    id: uuid(),
+    timestamp: nowIso(),
+    txId: tx.id,
+    eventType,
+    amount: Number(opts.amount != null ? opts.amount : tx.amount || 0) || 0,
+    currency: String(opts.currency || tx.currency || process.env.MOMO_CURRENCY || "ZMW"),
+    actorPhone: (req && req.user && req.user.phone) || opts.actorPhone || "system",
+    actorRole: (req && req.user && req.user.role) || opts.actorRole || "system",
+    fromPhone: tx.fromPhone || null,
+    toPhone: tx.toPhone || null,
+    statusSnapshot: {
+      txStatus: tx.status || null,
+      paymentStatus: tx.paymentStatus || null,
+      disputeActive: !!tx.disputeActive,
+    },
+    reference: ref,
+    provider: opts.provider || tx.paymentProvider || null,
+    notes: opts.notes || null,
+    meta: opts.meta || {},
+  };
+
+  ledgerEntries.push(entry);
+  if (ledgerEntries.length > 10000) ledgerEntries.splice(0, ledgerEntries.length - 10000);
+
+  tx.reconUpdatedAt = nowIso();
+  if (dbEnabled()) { dbInsertLedger(entry).catch(() => {}); }
+  return entry;
+}
 
 function logAudit(req, eventType, details = {}) {
   const entry = {
@@ -1992,6 +2076,7 @@ const tx = {
         }
       : null,
   };
+  ensureTxReconDefaults(tx);
 
   transactions.push(tx);
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
@@ -2028,8 +2113,10 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
     tx.paymentProvider = "demo";
     tx.paymentStatus = "paid";
     tx.paymentRef = tx.paymentRef || ("demo_" + uuid());
+    tx.collectionReconciled = false;
     tx.paidAt = nowIso();
     tx.status = "pending"; // now seller can hold
+    recordLedger(req, tx, "deposit_confirmed", { reference: tx.paymentRef, provider: "demo", notes: "Demo payment confirmed" });
     logAudit(req, "tx_pay_demo", { txId: tx.id, paymentRef: tx.paymentRef });
     if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
     return res.json(tx);
@@ -2058,6 +2145,7 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
         response: resp,
       };
 
+      recordLedger(req, tx, "deposit_initiated", { reference: tx.paymentRef, provider: "airtel_sandbox", notes: "Airtel collection initiated" });
       logAudit(req, "tx_pay_airtel_start", {
         txId: tx.id,
         paymentRef: tx.paymentRef,
@@ -2094,6 +2182,7 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
       tx.paymentProvider = "mtn_momo";
       tx.paymentStatus = "pending";
       tx.paymentRef = referenceId;
+      recordLedger(req, tx, "deposit_initiated", { reference: referenceId, provider: "mtn_momo", notes: "MTN collection initiated" });
       logAudit(req, "tx_pay_mtn_start", { txId: tx.id, provider: "mtn_momo", paymentRef: referenceId });
     } catch (err) {
       console.error("MTN MoMo sandbox requesttopay failed:", { message: err && err.message, status: err && (err.status || err.statusCode), body: err && err.body });
@@ -2109,6 +2198,7 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
     tx.paymentProvider = PAYMENTS_MODE;
     tx.paymentStatus = "pending";
     tx.paymentRef = tx.paymentRef || uuid();
+    recordLedger(req, tx, "deposit_initiated", { reference: tx.paymentRef, provider: PAYMENTS_MODE, notes: "Payment initiated" });
     logAudit(req, "tx_pay_start", { txId: tx.id, provider: PAYMENTS_MODE, paymentRef: tx.paymentRef });
 
   }
@@ -2168,7 +2258,9 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, requeryLimiter, i
         tx.paymentProvider = "airtel_sandbox";
         tx.paymentStatus = "paid";
         tx.paidAt = nowIso();
+        tx.collectionReconciled = false;
         tx.status = "pending"; // seller can now hold
+        recordLedger(req, tx, "deposit_confirmed", { reference: tx.paymentRef, provider: "airtel_sandbox" });
         logAudit(req, "tx_pay_airtel_paid", { txId: tx.id, paymentRef: tx.paymentRef });
       } else if (status === "TF") {
         tx.paymentProvider = "airtel_sandbox";
@@ -2201,6 +2293,8 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, requeryLimiter, i
         tx.paymentStatus = "paid";
         tx.status = "pending"; // seller can now hold
         tx.paidAt = tx.paidAt || nowIso();
+        tx.collectionReconciled = false;
+        recordLedger(req, tx, "deposit_confirmed", { reference: tx.paymentRef, provider: "mtn_momo" });
         logAudit(req, "tx_pay_mtn_success", { txId: tx.id, paymentRef: tx.paymentRef });
         momoLog("requery_success", { txId: tx.id, paymentRef: tx.paymentRef, status: st });
       } else if (st === "FAILED" || st === "REJECTED") {
@@ -2265,6 +2359,7 @@ app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotency
       status: "pending",
       startedAt: Date.now(),
     };
+    recordLedger(req, tx, "payout_initiated", { reference: referenceId, provider: "mtn_momo_disbursement", amount, currency, notes: "Seller payout initiated" });
 
     logAudit(req, "mtn_disbursement_initiated", {
       txId: tx.id,
@@ -2308,6 +2403,13 @@ app.get("/api/transactions/:id/payout-status", requireAuth, async (req, res) => 
     else if (st.includes("FAIL") || st.includes("REJECT")) tx.disbursement.status = "failed";
     else tx.disbursement.status = "pending";
 
+    if (tx.disbursement.status === "successful") {
+      tx.payoutReconciled = false;
+      recordLedger(req, tx, "payout_completed", { reference: tx.disbursement.referenceId, provider: "mtn_momo_disbursement", notes: "Seller payout successful" });
+    } else if (tx.disbursement.status === "failed") {
+      recordLedger(req, tx, "payout_failed", { reference: tx.disbursement.referenceId, provider: "mtn_momo_disbursement", notes: "Seller payout failed" });
+    }
+
     tx.disbursement.updatedAt = Date.now();
 
     logAudit(req, "mtn_disbursement_status", {
@@ -2344,6 +2446,8 @@ function maybeAutoResolveDispute(tx) {
       tx.dispute.resolvedAt = nowIso();
       tx.disputeActive = false;
       tx.status = "refunded";
+      tx.payoutReconciled = true;
+      recordLedger(null, tx, "refund_completed", { actorPhone: "system", actorRole: "system", notes: "Auto-refund after seller timeout" });
     }
   }
 }
@@ -2422,6 +2526,7 @@ app.post("/api/transactions/:id/action", requireAuth, idempotencyMiddleware, (re
 tx.holdStartedAt = now;
 const hrs = Number(tx.holdDurationHours || 24);
 tx.holdExpiresAt = new Date(Date.now() + hrs * 60 * 60 * 1000).toISOString();
+recordLedger(req, tx, "escrow_held", { notes: "Seller confirmed item held" });
 break;
     }
 
@@ -2457,6 +2562,8 @@ break;
       }
       tx.status = "completed";
       tx.completedAt = now;
+      tx.payoutReconciled = false;
+      recordLedger(req, tx, "escrow_completed", { notes: "Buyer confirmed collection" });
       break;
     }
 
@@ -2471,6 +2578,8 @@ break;
       }
       tx.status = "completed";
       tx.completedAt = now;
+      tx.payoutReconciled = false;
+      recordLedger(req, tx, "escrow_completed", { notes: "Buyer confirmed delivery received" });
       break;
     }
 
@@ -2665,6 +2774,8 @@ app.post("/api/transactions/:id/dispute/decision", requireAuth, (req, res) => {
     tx.dispute.resolvedAt = now;
     tx.disputeActive = false;
     tx.status = "refunded";
+    tx.payoutReconciled = true;
+    recordLedger(req, tx, "refund_completed", { notes: "Seller agreed refund via dispute flow" });
   } else {
     tx.dispute.status = "seller_disagreed";
   }
@@ -3006,6 +3117,110 @@ app.get("/api/admin/summary", requireAuth, (req, res) => {
       completed: completed.length,
       releasedTotal,
     }
+  });
+});
+
+
+// -------- Admin: ledger + reconciliation --------
+app.get("/api/admin/ledger", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const txId = req.query.txId ? String(req.query.txId) : null;
+  const limit = Math.min(Number(req.query.limit) || 200, 2000);
+  let entries = ledgerEntries;
+  if (txId) entries = entries.filter((e) => String(e.txId) === txId);
+  entries = entries.slice(-limit).reverse();
+
+  res.json({ entries });
+});
+
+app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const txs = transactions.map(ensureTxReconDefaults);
+  const pendingCollection = txs.filter((t) => t.paymentStatus === "paid" && !t.collectionReconciled).length;
+  const pendingPayout = txs.filter((t) => (t.status === "completed" || (t.disbursement && t.disbursement.status === "successful")) && !t.payoutReconciled).length;
+
+  const money = txs.reduce((acc, t) => {
+    const amt = Number(t.amount || 0) || 0;
+    if (t.paymentStatus === "paid") acc.collectionsPaid += amt;
+    if (t.disbursement && t.disbursement.status === "successful") acc.payoutsSuccessful += amt;
+    if (t.status === "refunded") acc.refunded += amt;
+    return acc;
+  }, { collectionsPaid: 0, payoutsSuccessful: 0, refunded: 0 });
+
+  res.json({
+    totals: {
+      ledgerEntries: ledgerEntries.length,
+      transactions: txs.length,
+      pendingCollectionReconciliation: pendingCollection,
+      pendingPayoutReconciliation: pendingPayout,
+      ...money,
+    },
+    recentUnreconciled: txs
+      .filter((t) => !t.collectionReconciled || !t.payoutReconciled)
+      .slice(-30)
+      .reverse()
+      .map((t) => ({
+        id: t.id,
+        status: t.status,
+        paymentStatus: t.paymentStatus,
+        amount: t.amount,
+        fromPhone: t.fromPhone,
+        toPhone: t.toPhone,
+        collectionReconciled: !!t.collectionReconciled,
+        payoutReconciled: !!t.payoutReconciled,
+        reconUpdatedAt: t.reconUpdatedAt || null,
+      })),
+  });
+});
+
+app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const tx = transactions.find((t) => String(t.id) === String(req.params.txId || ""));
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+  ensureTxReconDefaults(tx);
+
+  const body = req.body || {};
+  const target = String(body.target || "").toLowerCase(); // collection | payout | both
+  const status = String(body.status || "reconciled").toLowerCase(); // reconciled | unreconciled
+  const note = body.note ? String(body.note) : "";
+
+  const val = status === "reconciled";
+
+  if (!["collection","payout","both"].includes(target)) {
+    return res.status(400).json({ error: "target must be collection, payout, or both" });
+  }
+  if (!["reconciled","unreconciled"].includes(status)) {
+    return res.status(400).json({ error: "status must be reconciled or unreconciled" });
+  }
+
+  if (target === "collection" || target === "both") tx.collectionReconciled = val;
+  if (target === "payout" || target === "both") tx.payoutReconciled = val;
+  tx.reconUpdatedAt = nowIso();
+  if (note) tx.reconNotes.push({ at: tx.reconUpdatedAt, by: req.user.phone, target, status, note });
+
+  recordLedger(req, tx, "reconciliation_marked", {
+    dedupe: false,
+    notes: note || `Marked ${target} as ${status}`,
+    meta: { target, status }
+  });
+
+  logAudit(req, "reconciliation_marked", {
+    txId: tx.id, target, status, note,
+    collectionReconciled: tx.collectionReconciled,
+    payoutReconciled: tx.payoutReconciled,
+  });
+
+  if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+  return res.json({
+    ok: true,
+    txId: tx.id,
+    collectionReconciled: tx.collectionReconciled,
+    payoutReconciled: tx.payoutReconciled,
+    reconUpdatedAt: tx.reconUpdatedAt,
+    reconNotes: tx.reconNotes,
   });
 });
 
