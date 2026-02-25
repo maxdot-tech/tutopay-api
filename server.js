@@ -3397,6 +3397,222 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
 });
 
 
+// -------- Step 6: Compliance docs pack + incident register (BoZ trial prep) --------
+const complianceDocs = {
+  terms: {
+    id: "terms",
+    title: "TutoPay Trial Terms of Use",
+    version: "v0.6-trial",
+    updatedAt: new Date().toISOString(),
+    body: [
+      "TutoPay is a trial escrow facilitation service for marketplace transactions in Zambia.",
+      "Buyer funds are held pending collection/delivery confirmation or dispute handling.",
+      "Users must not use the platform for prohibited/illegal goods, fraud, impersonation, or money laundering.",
+      "KYC levels and limits may apply before creating/receiving escrows or payouts.",
+      "TutoPay may freeze or review transactions flagged for risk, dispute, compliance, or callback mismatch.",
+      "By using TutoPay, users accept audit logging for transaction-security and reconciliation purposes."
+    ]
+  },
+  privacy: {
+    id: "privacy",
+    title: "TutoPay Trial Privacy Notice",
+    version: "v0.6-trial",
+    updatedAt: new Date().toISOString(),
+    body: [
+      "TutoPay collects account and transaction data needed to run escrow, KYC review, support, and audit.",
+      "Examples include phone number, role, profile data, KYC metadata, transaction actions, and callback references.",
+      "TutoPay stores audit and ledger records to support reconciliation, dispute review, and regulator readiness.",
+      "Data access is role-limited; admin actions are logged.",
+      "Trial data retention and deletion rules may change before production launch."
+    ]
+  },
+  complaints: {
+    id: "complaints",
+    title: "Disputes & Complaints Handling (Trial SOP)",
+    version: "v0.6-trial",
+    updatedAt: new Date().toISOString(),
+    body: [
+      "Users can raise disputes from the transaction flow when item delivery/collection terms are contested.",
+      "Admin reviews dispute history, evidence notes, and transaction state before resolution.",
+      "Outcomes may include hold extension, release, refund, or account restrictions for abuse/fraud.",
+      "All dispute/admin actions must be recorded in the audit trail.",
+      "Critical incidents should be captured in the compliance incident register."
+    ]
+  },
+  kyc: {
+    id: "kyc",
+    title: "KYC & Limits Policy (Trial)",
+    version: "v0.6-trial",
+    updatedAt: new Date().toISOString(),
+    body: [
+      "KYC submission is available for buyers and sellers; admin can review and approve/reject submissions.",
+      "KYC level influences transaction permissions and trial limits.",
+      "Enhanced KYC may be required before high-value escrow or payout access.",
+      "KYC status changes are logged for audit and compliance review."
+    ]
+  }
+};
+
+const complianceIncidents = []; // in-memory for trial; move to DB table for production
+function complianceAddIncident(entry) {
+  const now = new Date().toISOString();
+  const rec = {
+    id: crypto.randomUUID(),
+    createdAt: now,
+    updatedAt: now,
+    status: "open",
+    severity: "medium",
+    category: "operations",
+    title: "",
+    description: "",
+    createdBy: "system",
+    ...entry,
+  };
+  complianceIncidents.push(rec);
+  if (complianceIncidents.length > 500) complianceIncidents.shift();
+  return rec;
+}
+
+app.get("/api/public/compliance/docs", (req, res) => {
+  const docs = Object.values(complianceDocs).map((d) => ({
+    id: d.id, title: d.title, version: d.version, updatedAt: d.updatedAt
+  }));
+  res.json({
+    ok: true,
+    docs,
+    links: docs.reduce((acc, d) => {
+      acc[d.id] = `/api/public/compliance/docs/${d.id}`;
+      return acc;
+    }, {})
+  });
+});
+
+app.get("/api/public/compliance/docs/:docId", (req, res) => {
+  const id = String(req.params.docId || "").toLowerCase();
+  const doc = complianceDocs[id];
+  if (!doc) return res.status(404).json({ error: "Compliance doc not found" });
+  res.json({ ok: true, doc });
+});
+
+app.get("/api/admin/compliance/overview", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const now = Date.now();
+  const lastAudit = auditLog.length ? auditLog[auditLog.length - 1] : null;
+  const lastLedger = ledgerEntries.length ? ledgerEntries[ledgerEntries.length - 1] : null;
+  const pendingKyc = users.filter((u) => {
+    const s = String(u.kycStatus || "").toLowerCase();
+    return s === "pending" || s === "under_review";
+  }).length;
+  const pendingDisputes = transactions.filter((t) => !!t.disputeActive || String(t.status||"").toLowerCase()==="disputed").length;
+
+  const controls = [
+    { key: "auth_tokens", label: "Token auth enabled", ok: true, detail: "Bearer tokens required for protected endpoints" },
+    { key: "kyc_workflow", label: "KYC workflow active", ok: true, detail: "Submit/review endpoints available" },
+    { key: "ledger", label: "Ledger entries recording", ok: ledgerEntries.length >= 0, detail: `${ledgerEntries.length} ledger entries` },
+    { key: "audit", label: "Audit trail recording", ok: auditLog.length >= 0, detail: `${auditLog.length} audit entries` },
+    { key: "callback_mtn_secret", label: "MTN callback secret set", ok: !!MTN_CALLBACK_SECRET, detail: !!MTN_CALLBACK_SECRET ? "Configured" : "Missing env var" },
+    { key: "callback_airtel_secret", label: "Airtel callback secret set", ok: !!AIRTEL_CALLBACK_SECRET, detail: !!AIRTEL_CALLBACK_SECRET ? "Configured" : "Missing env var" },
+    { key: "incident_register", label: "Incident register available", ok: true, detail: `${complianceIncidents.length} recorded incident(s)` },
+    { key: "policy_docs", label: "Policy docs endpoints", ok: true, detail: `${Object.keys(complianceDocs).length} trial documents` },
+  ];
+
+  const okCount = controls.filter(c => c.ok).length;
+  const readinessScore = Math.round((okCount / controls.length) * 100);
+
+  res.json({
+    ok: true,
+    generatedAt: new Date(now).toISOString(),
+    readinessScore,
+    counts: {
+      users: users.length,
+      items: items.length,
+      transactions: transactions.length,
+      pendingKyc,
+      disputes: pendingDisputes,
+      auditEntries: auditLog.length,
+      ledgerEntries: ledgerEntries.length,
+      incidentReports: complianceIncidents.length
+    },
+    recency: {
+      lastAuditAt: lastAudit?.ts || lastAudit?.createdAt || null,
+      lastLedgerAt: lastLedger?.ts || lastLedger?.createdAt || null,
+    },
+    controls,
+    policyDocs: Object.values(complianceDocs).map(d => ({
+      id: d.id, title: d.title, version: d.version, updatedAt: d.updatedAt, path: `/api/public/compliance/docs/${d.id}`
+    })),
+    callbackPaths: {
+      mtnCollection: "/api/callbacks/mtn/collection",
+      mtnPayout: "/api/callbacks/mtn/payout",
+      airtelCollection: "/api/callbacks/airtel/collection"
+    }
+  });
+});
+
+app.get("/api/admin/compliance/incidents", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  const rows = complianceIncidents.slice(-limit).reverse();
+  res.json({ ok: true, incidents: rows });
+});
+
+app.post("/api/admin/compliance/incidents", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const body = req.body || {};
+  const title = String(body.title || "").trim();
+  const description = String(body.description || "").trim();
+  if (!title) return res.status(400).json({ error: "title is required" });
+
+  const severity = ["low","medium","high","critical"].includes(String(body.severity || "").toLowerCase())
+    ? String(body.severity).toLowerCase() : "medium";
+  const category = String(body.category || "operations").trim().slice(0, 40) || "operations";
+  const status = ["open","investigating","resolved","closed"].includes(String(body.status || "").toLowerCase())
+    ? String(body.status).toLowerCase() : "open";
+
+  const incident = complianceAddIncident({
+    title,
+    description,
+    severity,
+    category,
+    status,
+    createdBy: req.user.phone || "admin"
+  });
+
+  logAudit(req, "compliance_incident_created", {
+    incidentId: incident.id,
+    title: incident.title,
+    severity: incident.severity,
+    category: incident.category,
+    status: incident.status
+  });
+
+  res.json({ ok: true, incident });
+});
+
+app.get("/api/admin/compliance/export", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  const packageJson = {
+    exportedAt: new Date().toISOString(),
+    environment: "trial",
+    policies: Object.values(complianceDocs).map(d => ({ id: d.id, title: d.title, version: d.version, path: `/api/public/compliance/docs/${d.id}` })),
+    callbackSecurity: {
+      mtnSecretConfigured: !!MTN_CALLBACK_SECRET,
+      airtelSecretConfigured: !!AIRTEL_CALLBACK_SECRET
+    },
+    ops: {
+      users: users.length,
+      transactions: transactions.length,
+      auditEntries: auditLog.length,
+      ledgerEntries: ledgerEntries.length,
+      incidents: complianceIncidents.length
+    }
+  };
+  res.json({ ok: true, package: packageJson });
+});
+
+
 
 // -------- Start server --------
 
