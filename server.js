@@ -3636,7 +3636,7 @@ const server =
 
   function issueCaseList() {
     const out = [];
-    for (const tx of txs) {
+    for (const tx of transactions) {
       if (!tx || !(tx.disputeActive || tx.dispute)) continue;
       const c = ensureIssueCaseForTx(tx);
       if (c) out.push(c);
@@ -3649,7 +3649,7 @@ const server =
     const cid = String(caseId||'').trim();
     if (!cid) return { err:'Invalid caseId' };
     const txId = cid.startsWith('CASE-') ? cid.slice(5) : cid;
-    const tx = txs.find(t => String(t.id) === String(txId));
+    const tx = transactions.find(t => String(t.id) === String(txId));
     if (!tx || !tx.dispute) return { err:'Case not found' };
     const c = ensureIssueCaseForTx(tx);
     return { tx, c, state: issueCaseStore.get(c.caseId) };
