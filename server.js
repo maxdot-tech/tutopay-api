@@ -869,6 +869,7 @@ async function dbInit() {
     await _pgPool.query("SELECT 1 as ok");
     await dbEnsureSchema();
     await dbLoadIntoMemory();
+    await dbLoadOpsIntoMemory();
     _dbReady = true;
     console.log("[DB] Connected + schema ready.");
   } catch (e) {
@@ -928,6 +929,31 @@ async function dbEnsureSchema() {
     CREATE INDEX IF NOT EXISTS tutopay_ledger_ts_idx ON tutopay_ledger(ts);
     CREATE INDEX IF NOT EXISTS tutopay_ledger_tx_idx ON tutopay_ledger(tx_id);
     CREATE INDEX IF NOT EXISTS tutopay_idem_expires_idx ON tutopay_idempotency(expires_at);
+
+CREATE TABLE IF NOT EXISTS tutopay_issue_cases (
+  case_id TEXT PRIMARY KEY,
+  tx_id TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  data JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tutopay_issue_actions (
+  id TEXT PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  case_id TEXT,
+  tx_id TEXT,
+  action_type TEXT,
+  policy_code TEXT,
+  data JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tutopay_incidents (
+  id TEXT PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  data JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tutopay_issue_cases_tx_idx ON tutopay_issue_cases(tx_id);
+CREATE INDEX IF NOT EXISTS tutopay_issue_actions_ts_idx ON tutopay_issue_actions(ts);
+CREATE INDEX IF NOT EXISTS tutopay_issue_actions_case_idx ON tutopay_issue_actions(case_id);
+CREATE INDEX IF NOT EXISTS tutopay_incidents_ts_idx ON tutopay_incidents(ts);
   `);
 }
 
@@ -1101,6 +1127,80 @@ async function dbInsertLedger(entry) {
     [id, ts, entry.txId ? String(entry.txId) : null, entry.eventType || null, JSON.stringify(entry)]
   );
 }
+
+
+async function dbUpsertIssueCase(caseObj) {
+  if (!dbEnabled()) return;
+  const caseId = String(caseObj.caseId || caseObj.case_id || "").trim();
+  if (!caseId) return;
+  const txId = caseObj.txId ? String(caseObj.txId) : (caseObj.tx_id ? String(caseObj.tx_id) : null);
+  await _pgPool.query(
+    `INSERT INTO tutopay_issue_cases(case_id, tx_id, data, updated_at)
+     VALUES ($1, $2, $3::jsonb, NOW())
+     ON CONFLICT (case_id) DO UPDATE SET tx_id=EXCLUDED.tx_id, data=EXCLUDED.data, updated_at=NOW()`,
+    [caseId, txId, JSON.stringify(caseObj)]
+  );
+}
+
+async function dbInsertIssueAction(actionObj) {
+  if (!dbEnabled()) return;
+  const id = String(actionObj.id || uuid()).trim();
+  const ts = actionObj.timestamp ? new Date(actionObj.timestamp) : new Date();
+  const caseId = actionObj.caseId ? String(actionObj.caseId) : null;
+  const txId = actionObj.txId ? String(actionObj.txId) : null;
+  await _pgPool.query(
+    `INSERT INTO tutopay_issue_actions(id, ts, case_id, tx_id, action_type, policy_code, data)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+     ON CONFLICT (id) DO NOTHING`,
+    [id, ts, caseId, txId, actionObj.actionType || null, actionObj.policyCode || null, JSON.stringify(actionObj)]
+  );
+}
+
+async function dbInsertIncident(incidentObj) {
+  if (!dbEnabled()) return;
+  const id = String(incidentObj.id || uuid()).trim();
+  const ts = incidentObj.createdAt ? new Date(incidentObj.createdAt) : new Date();
+  await _pgPool.query(
+    `INSERT INTO tutopay_incidents(id, ts, data) VALUES ($1, $2, $3::jsonb)
+     ON CONFLICT (id) DO NOTHING`,
+    [id, ts, JSON.stringify(incidentObj)]
+  );
+}
+
+async function dbLoadOpsIntoMemory() {
+  if (!dbEnabled()) return;
+  // Ensure globals exist (created by Step6/7 IIFE)
+  const caseStore = globalThis.__tpIssueCaseStore;
+  const actionsArr = globalThis.__tpIssueActions;
+  const incidentsArr = globalThis.__tpComplianceIncidents;
+
+  try {
+    const ic = await _pgPool.query("SELECT data FROM tutopay_issue_cases ORDER BY updated_at DESC LIMIT 5000");
+    if (caseStore && typeof caseStore.set === 'function') {
+      for (const r of (ic.rows || [])) {
+        const d = r.data;
+        if (d && (d.caseId || d.case_id)) caseStore.set(String(d.caseId || d.case_id), d);
+      }
+    }
+  } catch(e){}
+
+  try {
+    const ia = await _pgPool.query("SELECT data FROM tutopay_issue_actions ORDER BY ts DESC LIMIT 10000");
+    if (Array.isArray(actionsArr)) {
+      actionsArr.length = 0;
+      for (const r of (ia.rows || [])) actionsArr.push(r.data);
+    }
+  } catch(e){}
+
+  try {
+    const inc = await _pgPool.query("SELECT data FROM tutopay_incidents ORDER BY ts DESC LIMIT 5000");
+    if (Array.isArray(incidentsArr)) {
+      incidentsArr.length = 0;
+      for (const r of (inc.rows || [])) incidentsArr.push(r.data);
+    }
+  } catch(e){}
+}
+
 
 async function dbIdemGet(key) {
   if (!dbEnabled()) return null;
@@ -3252,13 +3352,13 @@ app.get("/api/admin/summary", requireAuth, (req, res) => {
   if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
 
   const txs = transactions || [];
-  const disputes = txs.filter((t) => !!t.disputeActive || String(t.status).toLowerCase() === "disputed");
+  const disputes = issuesTxs().filter((t) => !!t.disputeActive || String(t.status).toLowerCase() === "disputed");
 
-  const active = txs.filter((t) => ["pending_payment","pending","held"].includes(String(t.status)));
-  const inTransit = txs.filter((t) => ["in_transit","delivered"].includes(String(t.status)));
-  const completed = txs.filter((t) => ["released","completed"].includes(String(t.status)));
+  const active = issuesTxs().filter((t) => ["pending_payment","pending","held"].includes(String(t.status)));
+  const inTransit = issuesTxs().filter((t) => ["in_transit","delivered"].includes(String(t.status)));
+  const completed = issuesTxs().filter((t) => ["released","completed"].includes(String(t.status)));
 
-  const releasedTotal = txs.reduce((sum, t) => {
+  const releasedTotal = issuesTxs().reduce((sum, t) => {
     const amt = Number(t.amount || t.quoteAmount || 0) || 0;
     if (String(t.status) === "released" || String(t.status) === "completed") return sum + amt;
     return sum;
@@ -3267,7 +3367,7 @@ app.get("/api/admin/summary", requireAuth, (req, res) => {
   res.json({
     totals: {
       users: users.length,
-      transactions: txs.length,
+      transactions: issuesTxs().length,
       disputes: disputes.length,
       active: active.length,
       inTransit: inTransit.length,
@@ -3310,10 +3410,10 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
   if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
 
   const txs = transactions.map(ensureTxReconDefaults);
-  const pendingCollection = txs.filter((t) => t.paymentStatus === "paid" && !t.collectionReconciled).length;
-  const pendingPayout = txs.filter((t) => (t.status === "completed" || (t.disbursement && t.disbursement.status === "successful")) && !t.payoutReconciled).length;
+  const pendingCollection = issuesTxs().filter((t) => t.paymentStatus === "paid" && !t.collectionReconciled).length;
+  const pendingPayout = issuesTxs().filter((t) => (t.status === "completed" || (t.disbursement && t.disbursement.status === "successful")) && !t.payoutReconciled).length;
 
-  const money = txs.reduce((acc, t) => {
+  const money = issuesTxs().reduce((acc, t) => {
     const amt = Number(t.amount || 0) || 0;
     if (t.paymentStatus === "paid") acc.collectionsPaid += amt;
     if (t.disbursement && t.disbursement.status === "successful") acc.payoutsSuccessful += amt;
@@ -3324,7 +3424,7 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
   res.json({
     totals: {
       ledgerEntries: ledgerEntries.length,
-      transactions: txs.length,
+      transactions: issuesTxs().length,
       pendingCollectionReconciliation: pendingCollection,
       pendingPayoutReconciliation: pendingPayout,
       ...money,
@@ -3451,14 +3551,14 @@ const server =
       body: 'Trial account limits are applied by KYC level. Unverified users may face lower limits and restricted features. TutoPay may request additional documentation, place holds, or prevent payouts when account behavior triggers risk review.'
     }
   ];
-  const complianceIncidents = [];
+  const complianceIncidents = globalThis.__tpComplianceIncidents || (globalThis.__tpComplianceIncidents = []);
 
   function _complianceCounts() {
     const pendingKyc = users.filter(u => u && u.role !== 'admin' && (u.kycStatus === 'pending' || u.kycStatus === 'under_review')).length;
-    const disputes = txs.filter(t => !!t.disputeActive || String(t.status||'').toLowerCase()==='disputed').length;
+    const disputes = issuesTxs().filter(t => !!t.disputeActive || String(t.status||'').toLowerCase()==='disputed').length;
     return {
       users: users.length,
-      transactions: txs.length,
+      transactions: issuesTxs().length,
       disputes,
       pendingKyc,
       ledgerEntries: ledgerEntries.length,
@@ -3508,7 +3608,7 @@ const server =
     const limit = Math.max(1, Math.min(500, Number(req.query.limit)||100));
     res.json({ ok:true, incidents: complianceIncidents.slice(-limit).reverse() });
   });
-  app.post('/api/admin/compliance/incidents', requireAuth, (req,res)=> {
+  app.post('/api/admin/compliance/incidents', requireAuth, async (req,res)=> {
     if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
     const title = String((req.body||{}).title || '').trim();
     if (!title) return res.status(400).json({ error:'title is required' });
@@ -3525,9 +3625,48 @@ const server =
     };
     complianceIncidents.push(entry);
     if (complianceIncidents.length > 1000) complianceIncidents.splice(0, complianceIncidents.length - 1000);
+    try { await dbInsertIncident(entry); } catch(e){}
     logAudit(req, 'compliance_incident_create', { incidentId: entry.id, title: entry.title, severity: entry.severity });
     res.json({ ok:true, incident: entry });
   });
+
+// ---- Step 8A exports (CSV) ----
+app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).send('Admin only');
+  const rows = issueCaseList();
+  const header = ['caseId','txId','status','priority','assignedTo','assignedAt','slaDeadlineAt','createdAt','updatedAt','buyerPhone','sellerPhone','amount','currency','reasonCode','docsCount'].join(',');
+  const csv = [header].concat(rows.map(r => [
+    r.caseId, r.txId, r.status, r.priority, r.assignedTo||'', r.assignedAt||'', r.slaDeadlineAt||'', r.createdAt||'', r.updatedAt||'',
+    r.buyerPhone||'', r.sellerPhone||'', r.amount||0, r.currency||'', (r.reasonCode||'').replace(/,/g,' '), r.docsCount||0
+  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues.csv"');
+  res.send(csv);
+});
+
+app.get('/api/admin/export/issues-actions.csv', requireAuth, requireIssuesDesk, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).send('Admin only');
+  const header = ['id','caseId','txId','timestamp','actionType','policyCode','nextStatus','actorPhone','actorRole','note'].join(',');
+  const csv = [header].concat((issueActions||[]).slice().reverse().map(a => [
+    a.id||'', a.caseId||'', a.txId||'', a.timestamp||'', a.actionType||'', a.policyCode||'', a.nextStatus||'',
+    a.actorPhone||'', a.actorRole||'', (a.note||'').replace(/\r?\n/g,' ')
+  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues-actions.csv"');
+  res.send(csv);
+});
+
+app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
+  if (req.user.role !== 'admin') return res.status(403).send('Admin only');
+  const header = ['id','createdAt','severity','category','status','createdBy','title','description'].join(',');
+  const csv = [header].concat((complianceIncidents||[]).slice().reverse().map(i => [
+    i.id||'', i.createdAt||'', i.severity||'', i.category||'', i.status||'', i.createdBy||'', (i.title||'').replace(/,/g,' '), (i.description||'').replace(/\r?\n/g,' ')
+  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="tutopay-incidents.csv"');
+  res.send(csv);
+});
+
   app.get('/api/admin/compliance/export', requireAuth, (req,res)=> {
     if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
     const pkg = {
@@ -3550,8 +3689,10 @@ const server =
     { code:'RISK-05', label:'Escalate to Supervisor', actionType:'escalate_supervisor', nextStatus:'escalated', template:'Case escalated due to severity, repeat pattern, or policy trigger.' },
     { code:'RISK-06', label:'Close Case', actionType:'close_case', nextStatus:'resolved', template:'Issue is resolved and case can be closed with final notes recorded.' }
   ];
-  const issueCaseStore = new Map(); // caseId -> state/meta
-  const issueActions = []; // append-only action log
+  const issueCaseStore = globalThis.__tpIssueCaseStore || (globalThis.__tpIssueCaseStore = new Map()); // caseId -> state/meta
+  const issueActions = globalThis.__tpIssueActions || (globalThis.__tpIssueActions = []); // append-only action log
+
+  function issuesTxs(){ return (typeof transactions !== 'undefined' && Array.isArray(transactions)) ? transactions : (globalThis.transactions||[]); }
 
   function isIssuesDeskRole(role) {
     const r = String(role || '').toLowerCase();
@@ -3636,7 +3777,7 @@ const server =
 
   function issueCaseList() {
     const out = [];
-    for (const tx of transactions) {
+    for (const tx of issuesTxs()) {
       if (!tx || !(tx.disputeActive || tx.dispute)) continue;
       const c = ensureIssueCaseForTx(tx);
       if (c) out.push(c);
@@ -3649,7 +3790,7 @@ const server =
     const cid = String(caseId||'').trim();
     if (!cid) return { err:'Invalid caseId' };
     const txId = cid.startsWith('CASE-') ? cid.slice(5) : cid;
-    const tx = transactions.find(t => String(t.id) === String(txId));
+    const tx = issuesTxs().find(t => String(t.id) === String(txId));
     if (!tx || !tx.dispute) return { err:'Case not found' };
     const c = ensureIssueCaseForTx(tx);
     return { tx, c, state: issueCaseStore.get(c.caseId) };
@@ -3782,7 +3923,7 @@ const server =
     res.json({ ok:true, caseId: got.c.caseId, txId: got.tx.id, timeline: rows });
   });
 
-  app.post('/api/issues/cases/:caseId/assign', requireAuth, requireIssuesDesk, (req,res)=>{
+  app.post('/api/issues/cases/:caseId/assign', requireAuth, requireIssuesDesk, async (req,res)=>{
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
     const st = issueCaseStore.get(got.c.caseId);
@@ -3790,11 +3931,12 @@ const server =
     st.assignedTo = toPhone;
     st.assignedAt = nowIso();
     st.updatedAt = nowIso();
+    try { await dbUpsertIssueCase(st); } catch(e){}
     logAudit(req, 'issues_case_assign', { caseId: got.c.caseId, txId: got.tx.id, assignedTo: toPhone });
     res.json({ ok:true, case: ensureIssueCaseForTx(got.tx) });
   });
 
-  app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, (req,res)=>{
+  app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, async (req,res)=>{
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
     const body = req.body || {};
@@ -3823,6 +3965,8 @@ const server =
     };
     issueActions.push(entry);
     if (issueActions.length > 10000) issueActions.splice(0, issueActions.length - 10000);
+    try { await dbInsertIssueAction(entry); } catch(e){}
+    try { await dbUpsertIssueCase(st); } catch(e){}
     st.status = nextStatus;
     st.updatedAt = entry.timestamp;
     if (actionType === 'freeze_transaction') {
