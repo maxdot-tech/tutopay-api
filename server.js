@@ -3397,6 +3397,222 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
 });
 
 
+// -------- Step 6: Compliance docs pack + incident register (BoZ trial prep) --------
+const complianceDocs = {
+  terms: {
+    id: "terms",
+    title: "TutoPay Trial Terms of Use",
+    version: "v0.6-trial",
+    updatedAt: new Date().toISOString(),
+    body: [
+      "TutoPay is a trial escrow facilitation service for marketplace transactions in Zambia.",
+      "Buyer funds are held pending collection/delivery confirmation or dispute handling.",
+      "Users must not use the platform for prohibited/illegal goods, fraud, impersonation, or money laundering.",
+      "KYC levels and limits may apply before creating/receiving escrows or payouts.",
+      "TutoPay may freeze or review transactions flagged for risk, dispute, compliance, or callback mismatch.",
+      "By using TutoPay, users accept audit logging for transaction-security and reconciliation purposes."
+    ]
+  },
+  privacy: {
+    id: "privacy",
+    title: "TutoPay Trial Privacy Notice",
+    version: "v0.6-trial",
+    updatedAt: new Date().toISOString(),
+    body: [
+      "TutoPay collects account and transaction data needed to run escrow, KYC review, support, and audit.",
+      "Examples include phone number, role, profile data, KYC metadata, transaction actions, and callback references.",
+      "TutoPay stores audit and ledger records to support reconciliation, dispute review, and regulator readiness.",
+      "Data access is role-limited; admin actions are logged.",
+      "Trial data retention and deletion rules may change before production launch."
+    ]
+  },
+  complaints: {
+    id: "complaints",
+    title: "Disputes & Complaints Handling (Trial SOP)",
+    version: "v0.6-trial",
+    updatedAt: new Date().toISOString(),
+    body: [
+      "Users can raise disputes from the transaction flow when item delivery/collection terms are contested.",
+      "Admin reviews dispute history, evidence notes, and transaction state before resolution.",
+      "Outcomes may include hold extension, release, refund, or account restrictions for abuse/fraud.",
+      "All dispute/admin actions must be recorded in the audit trail.",
+      "Critical incidents should be captured in the compliance incident register."
+    ]
+  },
+  kyc: {
+    id: "kyc",
+    title: "KYC & Limits Policy (Trial)",
+    version: "v0.6-trial",
+    updatedAt: new Date().toISOString(),
+    body: [
+      "KYC submission is available for buyers and sellers; admin can review and approve/reject submissions.",
+      "KYC level influences transaction permissions and trial limits.",
+      "Enhanced KYC may be required before high-value escrow or payout access.",
+      "KYC status changes are logged for audit and compliance review."
+    ]
+  }
+};
+
+const complianceIncidents = []; // in-memory for trial; move to DB table for production
+function complianceAddIncident(entry) {
+  const now = new Date().toISOString();
+  const rec = {
+    id: crypto.randomUUID(),
+    createdAt: now,
+    updatedAt: now,
+    status: "open",
+    severity: "medium",
+    category: "operations",
+    title: "",
+    description: "",
+    createdBy: "system",
+    ...entry,
+  };
+  complianceIncidents.push(rec);
+  if (complianceIncidents.length > 500) complianceIncidents.shift();
+  return rec;
+}
+
+app.get("/api/public/compliance/docs", (req, res) => {
+  const docs = Object.values(complianceDocs).map((d) => ({
+    id: d.id, title: d.title, version: d.version, updatedAt: d.updatedAt
+  }));
+  res.json({
+    ok: true,
+    docs,
+    links: docs.reduce((acc, d) => {
+      acc[d.id] = `/api/public/compliance/docs/${d.id}`;
+      return acc;
+    }, {})
+  });
+});
+
+app.get("/api/public/compliance/docs/:docId", (req, res) => {
+  const id = String(req.params.docId || "").toLowerCase();
+  const doc = complianceDocs[id];
+  if (!doc) return res.status(404).json({ error: "Compliance doc not found" });
+  res.json({ ok: true, doc });
+});
+
+app.get("/api/admin/compliance/overview", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const now = Date.now();
+  const lastAudit = auditLog.length ? auditLog[auditLog.length - 1] : null;
+  const lastLedger = ledgerEntries.length ? ledgerEntries[ledgerEntries.length - 1] : null;
+  const pendingKyc = users.filter((u) => {
+    const s = String(u.kycStatus || "").toLowerCase();
+    return s === "pending" || s === "under_review";
+  }).length;
+  const pendingDisputes = transactions.filter((t) => !!t.disputeActive || String(t.status||"").toLowerCase()==="disputed").length;
+
+  const controls = [
+    { key: "auth_tokens", label: "Token auth enabled", ok: true, detail: "Bearer tokens required for protected endpoints" },
+    { key: "kyc_workflow", label: "KYC workflow active", ok: true, detail: "Submit/review endpoints available" },
+    { key: "ledger", label: "Ledger entries recording", ok: ledgerEntries.length >= 0, detail: `${ledgerEntries.length} ledger entries` },
+    { key: "audit", label: "Audit trail recording", ok: auditLog.length >= 0, detail: `${auditLog.length} audit entries` },
+    { key: "callback_mtn_secret", label: "MTN callback secret set", ok: !!MTN_CALLBACK_SECRET, detail: !!MTN_CALLBACK_SECRET ? "Configured" : "Missing env var" },
+    { key: "callback_airtel_secret", label: "Airtel callback secret set", ok: !!AIRTEL_CALLBACK_SECRET, detail: !!AIRTEL_CALLBACK_SECRET ? "Configured" : "Missing env var" },
+    { key: "incident_register", label: "Incident register available", ok: true, detail: `${complianceIncidents.length} recorded incident(s)` },
+    { key: "policy_docs", label: "Policy docs endpoints", ok: true, detail: `${Object.keys(complianceDocs).length} trial documents` },
+  ];
+
+  const okCount = controls.filter(c => c.ok).length;
+  const readinessScore = Math.round((okCount / controls.length) * 100);
+
+  res.json({
+    ok: true,
+    generatedAt: new Date(now).toISOString(),
+    readinessScore,
+    counts: {
+      users: users.length,
+      items: items.length,
+      transactions: transactions.length,
+      pendingKyc,
+      disputes: pendingDisputes,
+      auditEntries: auditLog.length,
+      ledgerEntries: ledgerEntries.length,
+      incidentReports: complianceIncidents.length
+    },
+    recency: {
+      lastAuditAt: lastAudit?.ts || lastAudit?.createdAt || null,
+      lastLedgerAt: lastLedger?.ts || lastLedger?.createdAt || null,
+    },
+    controls,
+    policyDocs: Object.values(complianceDocs).map(d => ({
+      id: d.id, title: d.title, version: d.version, updatedAt: d.updatedAt, path: `/api/public/compliance/docs/${d.id}`
+    })),
+    callbackPaths: {
+      mtnCollection: "/api/callbacks/mtn/collection",
+      mtnPayout: "/api/callbacks/mtn/payout",
+      airtelCollection: "/api/callbacks/airtel/collection"
+    }
+  });
+});
+
+app.get("/api/admin/compliance/incidents", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  const rows = complianceIncidents.slice(-limit).reverse();
+  res.json({ ok: true, incidents: rows });
+});
+
+app.post("/api/admin/compliance/incidents", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const body = req.body || {};
+  const title = String(body.title || "").trim();
+  const description = String(body.description || "").trim();
+  if (!title) return res.status(400).json({ error: "title is required" });
+
+  const severity = ["low","medium","high","critical"].includes(String(body.severity || "").toLowerCase())
+    ? String(body.severity).toLowerCase() : "medium";
+  const category = String(body.category || "operations").trim().slice(0, 40) || "operations";
+  const status = ["open","investigating","resolved","closed"].includes(String(body.status || "").toLowerCase())
+    ? String(body.status).toLowerCase() : "open";
+
+  const incident = complianceAddIncident({
+    title,
+    description,
+    severity,
+    category,
+    status,
+    createdBy: req.user.phone || "admin"
+  });
+
+  logAudit(req, "compliance_incident_created", {
+    incidentId: incident.id,
+    title: incident.title,
+    severity: incident.severity,
+    category: incident.category,
+    status: incident.status
+  });
+
+  res.json({ ok: true, incident });
+});
+
+app.get("/api/admin/compliance/export", requireAuth, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  const packageJson = {
+    exportedAt: new Date().toISOString(),
+    environment: "trial",
+    policies: Object.values(complianceDocs).map(d => ({ id: d.id, title: d.title, version: d.version, path: `/api/public/compliance/docs/${d.id}` })),
+    callbackSecurity: {
+      mtnSecretConfigured: !!MTN_CALLBACK_SECRET,
+      airtelSecretConfigured: !!AIRTEL_CALLBACK_SECRET
+    },
+    ops: {
+      users: users.length,
+      transactions: transactions.length,
+      auditEntries: auditLog.length,
+      ledgerEntries: ledgerEntries.length,
+      incidents: complianceIncidents.length
+    }
+  };
+  res.json({ ok: true, package: packageJson });
+});
+
+
 
 // -------- Start server --------
 
@@ -3412,433 +3628,7 @@ app.use((err, req, res, next) => {
  * - Start HTTP listener immediately so Railway can hit /health.
  * - Initialize DB in the background; API routes are gated until dbReady=true.
  */
-const server = 
-
-/* ===== Step 6+7: Compliance pack + Issues Desk foundation (BoZ trial ops) ===== */
-(function(){
-  // ---- Compliance docs + incidents (Step 6, included here so this file is self-contained) ----
-  const complianceDocs = [
-    {
-      id: 'terms',
-      title: 'TutoPay Terms of Use',
-      version: '0.1-trial',
-      updatedAt: '2026-02-25T00:00:00.000Z',
-      path: '/api/public/compliance/docs/terms',
-      body: 'TutoPay provides an escrow-style transaction workflow for trial use. Users agree to provide accurate details, avoid prohibited goods, and cooperate with dispute and KYC checks. TutoPay may pause, limit, or refuse transactions for risk, fraud, compliance, or operational reasons.'
-    },
-    {
-      id: 'privacy',
-      title: 'TutoPay Privacy Notice',
-      version: '0.1-trial',
-      updatedAt: '2026-02-25T00:00:00.000Z',
-      path: '/api/public/compliance/docs/privacy',
-      body: 'TutoPay collects account, transaction, KYC, and dispute information to operate escrow, prevent fraud, support investigations, and meet legal obligations. Trial data may be reviewed by authorized staff for support, risk monitoring, and reconciliation purposes.'
-    },
-    {
-      id: 'disputes',
-      title: 'Disputes & Complaints SOP',
-      version: '0.1-trial',
-      updatedAt: '2026-02-25T00:00:00.000Z',
-      path: '/api/public/compliance/docs/disputes',
-      body: 'Complaints are logged against transactions and routed to the Issues Desk for review. Investigators review timeline events, uploaded evidence, and policy codes before recommending or taking actions. High-risk or repeated patterns are escalated and recorded in audit logs.'
-    },
-    {
-      id: 'kyc-limits',
-      title: 'KYC & Transaction Limits Policy',
-      version: '0.1-trial',
-      updatedAt: '2026-02-25T00:00:00.000Z',
-      path: '/api/public/compliance/docs/kyc-limits',
-      body: 'Trial account limits are applied by KYC level. Unverified users may face lower limits and restricted features. TutoPay may request additional documentation, place holds, or prevent payouts when account behavior triggers risk review.'
-    }
-  ];
-  const complianceIncidents = [];
-
-  function _complianceCounts() {
-    const pendingKyc = users.filter(u => u && u.role !== 'admin' && (u.kycStatus === 'pending' || u.kycStatus === 'under_review')).length;
-    const disputes = txs.filter(t => !!t.disputeActive || String(t.status||'').toLowerCase()==='disputed').length;
-    return {
-      users: users.length,
-      transactions: txs.length,
-      disputes,
-      pendingKyc,
-      ledgerEntries: ledgerEntries.length,
-      incidentReports: complianceIncidents.length,
-      auditEntries: auditLog.length
-    };
-  }
-
-  function _complianceOverview() {
-    const counts = _complianceCounts();
-    const controls = [
-      { key:'auth', label:'Auth sessions & role guard', ok:true, detail:'Token-based sessions and role checks active' },
-      { key:'kyc', label:'KYC workflow', ok: true, detail:'KYC submission/review endpoints enabled' },
-      { key:'ledger', label:'Ledger & reconciliation', ok: ledgerEntries.length >= 0, detail: `${ledgerEntries.length} ledger events tracked` },
-      { key:'audit', label:'Audit logging', ok: auditLog.length >= 0, detail: `${auditLog.length} audit events retained` },
-      { key:'callbacks', label:'Provider callback secret', ok: !!(process.env.MTN_CALLBACK_SECRET || process.env.CALLBACK_SHARED_SECRET || process.env.AIRTEL_CALLBACK_SECRET), detail: 'Secrets configured for callback verification' },
-      { key:'issues', label:'Issues Desk operations', ok: true, detail: 'Risk/fraud investigation panel and APIs enabled' },
-    ];
-    const score = Math.round((controls.filter(c=>c.ok).length / controls.length) * 100);
-    return {
-      readinessScore: score,
-      generatedAt: nowIso(),
-      counts,
-      controls,
-      policyDocs: complianceDocs.map(d => ({ id:d.id, title:d.title, version:d.version, path:d.path, updatedAt:d.updatedAt })),
-      recency: {
-        lastAuditAt: auditLog.length ? auditLog[auditLog.length-1].timestamp : null,
-        lastLedgerAt: ledgerEntries.length ? ledgerEntries[ledgerEntries.length-1].timestamp : null,
-      }
-    };
-  }
-
-  app.get('/api/public/compliance/docs', (req,res)=> {
-    res.json({ ok:true, docs: complianceDocs.map(d => ({ id:d.id, title:d.title, version:d.version, path:d.path, updatedAt:d.updatedAt })) });
-  });
-  app.get('/api/public/compliance/docs/:docId', (req,res)=> {
-    const doc = complianceDocs.find(d => d.id === String(req.params.docId||'').trim());
-    if (!doc) return res.status(404).json({ error:'Doc not found' });
-    res.json({ ok:true, doc });
-  });
-  app.get('/api/admin/compliance/overview', requireAuth, (req,res)=> {
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
-    res.json(_complianceOverview());
-  });
-  app.get('/api/admin/compliance/incidents', requireAuth, (req,res)=> {
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
-    const limit = Math.max(1, Math.min(500, Number(req.query.limit)||100));
-    res.json({ ok:true, incidents: complianceIncidents.slice(-limit).reverse() });
-  });
-  app.post('/api/admin/compliance/incidents', requireAuth, (req,res)=> {
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
-    const title = String((req.body||{}).title || '').trim();
-    if (!title) return res.status(400).json({ error:'title is required' });
-    const entry = {
-      id: uuid(),
-      title,
-      category: String((req.body||{}).category || 'operations').trim() || 'operations',
-      severity: String((req.body||{}).severity || 'medium').trim().toLowerCase(),
-      description: String((req.body||{}).description || '').trim(),
-      status: 'open',
-      createdAt: nowIso(),
-      createdBy: req.user.phone,
-      createdRole: req.user.role,
-    };
-    complianceIncidents.push(entry);
-    if (complianceIncidents.length > 1000) complianceIncidents.splice(0, complianceIncidents.length - 1000);
-    logAudit(req, 'compliance_incident_create', { incidentId: entry.id, title: entry.title, severity: entry.severity });
-    res.json({ ok:true, incident: entry });
-  });
-  app.get('/api/admin/compliance/export', requireAuth, (req,res)=> {
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
-    const pkg = {
-      exportedAt: nowIso(),
-      by: req.user.phone,
-      overview: _complianceOverview(),
-      incidents: complianceIncidents.slice(-500),
-      docs: complianceDocs,
-      notes: 'Trial compliance export package (JSON)'
-    };
-    res.json({ ok:true, package: pkg });
-  });
-
-  // ---- Issues Desk foundation (Step 7A) ----
-  const ISSUE_POLICIES = [
-    { code:'RISK-01', label:'Request More Evidence', actionType:'request_more_evidence', nextStatus:'awaiting_customer', template:'Please upload clearer proof (photos, chats, receipts, delivery evidence) within the requested timeframe.' },
-    { code:'RISK-02', label:'Freeze & Investigate', actionType:'freeze_transaction', nextStatus:'in_review', template:'Transaction held pending fraud/risk checks. Parties are notified while review is in progress.' },
-    { code:'RISK-03', label:'Refund Recommended', actionType:'recommend_refund', nextStatus:'awaiting_admin_approval', template:'Evidence supports refund recommendation. Escalate for authorization and payout reversal handling.' },
-    { code:'RISK-04', label:'Reject Complaint Recommended', actionType:'recommend_reject', nextStatus:'awaiting_admin_approval', template:'Evidence does not support complaint claim. Prepare a structured rejection response.' },
-    { code:'RISK-05', label:'Escalate to Supervisor', actionType:'escalate_supervisor', nextStatus:'escalated', template:'Case escalated due to severity, repeat pattern, or policy trigger.' },
-    { code:'RISK-06', label:'Close Case', actionType:'close_case', nextStatus:'resolved', template:'Issue is resolved and case can be closed with final notes recorded.' }
-  ];
-  const issueCaseStore = new Map(); // caseId -> state/meta
-  const issueActions = []; // append-only action log
-
-  function isIssuesDeskRole(role) {
-    const r = String(role || '').toLowerCase();
-    return r === 'admin' || r === 'risk_agent' || r === 'fraud_agent';
-  }
-  function requireIssuesDesk(req,res,next){
-    if (!req.user || !isIssuesDeskRole(req.user.role)) return res.status(403).json({ error:'Issues Desk only' });
-    return next();
-  }
-
-  function safeDate(x){
-    if (!x) return null;
-    const t = Date.parse(x);
-    return Number.isFinite(t) ? new Date(t).toISOString() : null;
-  }
-  function humanDisputeStatus(tx){
-    const raw = (tx && tx.dispute && tx.dispute.status) || (tx && tx.status) || 'new';
-    return String(raw).toLowerCase();
-  }
-  function calcPriority(tx){
-    let score = 0;
-    const amt = Number(tx && tx.amount || 0);
-    if (amt >= 5000) score += 3; else if (amt >= 1000) score += 2; else score += 1;
-    if ((tx && tx.disputeDocs && tx.disputeDocs.length) === 0) score += 1;
-    if (String(tx?.dispute?.reasonCode||'').toLowerCase().includes('fraud')) score += 2;
-    if (score >= 6) return 'critical';
-    if (score >= 4) return 'high';
-    if (score >= 3) return 'medium';
-    return 'low';
-  }
-  function ensureIssueCaseForTx(tx){
-    if (!tx || !tx.id || !tx.dispute) return null;
-    const caseId = `CASE-${tx.id}`;
-    let st = issueCaseStore.get(caseId);
-    if (!st) {
-      const openedAt = safeDate(tx.dispute.openedAt) || safeDate(tx.dispute.createdAt) || safeDate(tx.updatedAt) || safeDate(tx.createdAt) || nowIso();
-      const createdTs = Date.parse(openedAt) || Date.now();
-      st = {
-        caseId,
-        createdAt: openedAt,
-        updatedAt: openedAt,
-        status: 'new',
-        priority: calcPriority(tx),
-        assignedTo: null,
-        assignedAt: null,
-        slaDeadlineAt: new Date(createdTs + 24*60*60*1000).toISOString(),
-        tags: [],
-        sourceType: 'dispute',
-        sourceRef: tx.id,
-      };
-      issueCaseStore.set(caseId, st);
-    }
-    const latestAction = [...issueActions].reverse().find(a => a.caseId === caseId);
-    const disputeStatus = humanDisputeStatus(tx);
-    return {
-      caseId,
-      txId: tx.id,
-      sourceType: st.sourceType,
-      sourceRef: st.sourceRef,
-      status: latestAction?.nextStatus || st.status || 'new',
-      priority: st.priority || calcPriority(tx),
-      assignedTo: st.assignedTo || null,
-      assignedAt: st.assignedAt || null,
-      slaDeadlineAt: st.slaDeadlineAt || null,
-      createdAt: st.createdAt,
-      updatedAt: latestAction?.timestamp || st.updatedAt || st.createdAt,
-      complaintOpenedAt: st.createdAt,
-      disputeStatus,
-      amount: Number(tx.amount || 0),
-      currency: tx.currency || process.env.MOMO_CURRENCY || 'ZMW',
-      buyerPhone: tx.fromPhone || null,
-      sellerPhone: tx.toPhone || null,
-      txStatus: tx.status || null,
-      paymentStatus: tx.paymentStatus || null,
-      reasonCode: tx.dispute.reasonCode || null,
-      reasonText: tx.dispute.reasonText || null,
-      docsCount: Array.isArray(tx.disputeDocs) ? tx.disputeDocs.length : 0,
-      tags: Array.isArray(st.tags) ? st.tags : [],
-      phaseDurations: buildIssuePhaseDurations(tx),
-    };
-  }
-
-  function issueCaseList() {
-    const out = [];
-    for (const tx of txs) {
-      if (!tx || !(tx.disputeActive || tx.dispute)) continue;
-      const c = ensureIssueCaseForTx(tx);
-      if (c) out.push(c);
-    }
-    out.sort((a,b)=> (Date.parse(b.updatedAt||0)||0) - (Date.parse(a.updatedAt||0)||0));
-    return out;
-  }
-
-  function getIssueCaseAndTx(caseId){
-    const cid = String(caseId||'').trim();
-    if (!cid) return { err:'Invalid caseId' };
-    const txId = cid.startsWith('CASE-') ? cid.slice(5) : cid;
-    const tx = txs.find(t => String(t.id) === String(txId));
-    if (!tx || !tx.dispute) return { err:'Case not found' };
-    const c = ensureIssueCaseForTx(tx);
-    return { tx, c, state: issueCaseStore.get(c.caseId) };
-  }
-
-  function buildIssueTimeline(tx, caseId){
-    const rows = [];
-    const push = (ts, phase, source, detail, extra={}) => {
-      const iso = safeDate(ts);
-      if (!iso) return;
-      rows.push({ id: uuid(), timestamp: iso, phase, source, detail, ...extra });
-    };
-
-    push(tx.createdAt, 'transaction_created', 'transaction', 'Escrow created');
-    if (tx.paymentRequestedAt) push(tx.paymentRequestedAt, 'payment_initiated', 'transaction', 'Payment initiated');
-    if (tx.paymentConfirmedAt || tx.paidAt) push(tx.paymentConfirmedAt || tx.paidAt, 'payment_confirmed', 'transaction', 'Payment confirmed');
-    if (tx.sellerHeldAt || tx.heldAt) push(tx.sellerHeldAt || tx.heldAt, 'seller_hold', 'transaction', 'Seller placed hold / acknowledged');
-    if (tx.inTransitAt) push(tx.inTransitAt, 'in_transit', 'transaction', 'Marked in transit');
-    if (tx.deliveredAt) push(tx.deliveredAt, 'delivered', 'transaction', 'Marked delivered');
-    if (tx.completedAt) push(tx.completedAt, 'completed', 'transaction', 'Buyer completed transaction');
-    if (tx.dispute && (tx.dispute.openedAt || tx.dispute.createdAt)) {
-      push(tx.dispute.openedAt || tx.dispute.createdAt, 'complaint_opened', 'dispute', `Complaint opened (${tx.dispute.reasonCode || 'general'})`);
-    }
-    if (Array.isArray(tx.disputeDocs)) {
-      for (const d of tx.disputeDocs) {
-        push(d.uploadedAt || d.createdAt, 'evidence_uploaded', 'evidence', d.name || d.filename || 'Evidence file', { by: d.uploadedByPhone || d.byPhone || d.by || null, fileType: d.mimetype || null, url: d.url || null });
-      }
-    }
-    for (const a of issueActions) {
-      if (a.caseId !== caseId) continue;
-      push(a.timestamp, a.actionType || 'case_action', 'issues_desk', a.note || a.policyLabel || a.policyCode || 'Case action', { actorPhone: a.actorPhone, actorRole: a.actorRole, policyCode: a.policyCode, nextStatus: a.nextStatus });
-    }
-    // Also include ledger/audit events tied to tx for richer timeline
-    for (const l of ledgerEntries) {
-      if (String(l.txId||'') !== String(tx.id)) continue;
-      push(l.timestamp, `ledger:${l.eventType||'event'}`, 'ledger', `${l.eventType || 'Ledger'} (${l.amount || 0} ${l.currency||''})`, { actorPhone:l.actorPhone, actorRole:l.actorRole, reference:l.reference || null });
-    }
-    for (const a of auditLog) {
-      const d = a.details || {};
-      const linked = String(d.txId||d.id||'') === String(tx.id) || String(d.transactionId||'') === String(tx.id);
-      if (!linked) continue;
-      push(a.timestamp, `audit:${a.eventType||'event'}`, 'audit', a.eventType || 'Audit event', { actorPhone:a.userPhone, actorRole:a.userRole });
-    }
-
-    rows.sort((x,y)=> (Date.parse(x.timestamp)||0) - (Date.parse(y.timestamp)||0));
-    // Add relative durations
-    let prev = null;
-    for (const r of rows) {
-      if (prev) r.minutesSincePrev = Math.max(0, Math.round((Date.parse(r.timestamp)-Date.parse(prev.timestamp))/60000));
-      prev = r;
-    }
-    return rows;
-  }
-
-  function buildIssuePhaseDurations(tx){
-    const created = Date.parse(tx.createdAt || '') || null;
-    const complaint = Date.parse(tx?.dispute?.openedAt || tx?.dispute?.createdAt || '') || null;
-    const paid = Date.parse(tx.paymentConfirmedAt || tx.paidAt || '') || null;
-    const held = Date.parse(tx.sellerHeldAt || tx.heldAt || '') || null;
-    return {
-      createdToPaidMin: created && paid ? Math.round((paid-created)/60000) : null,
-      paidToHoldMin: paid && held ? Math.round((held-paid)/60000) : null,
-      createdToComplaintMin: created && complaint ? Math.round((complaint-created)/60000) : null,
-      paidToComplaintMin: paid && complaint ? Math.round((complaint-paid)/60000) : null,
-    };
-  }
-
-  // Optional: internal endpoint to create risk agents (admin only)
-  app.post('/api/admin/risk-agents', requireAuth, (req,res)=>{
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
-    const phone = String((req.body||{}).phone || '').trim();
-    const pin = String((req.body||{}).pin || '').trim();
-    if (!/^\d{4,8}$/.test(pin)) return res.status(400).json({ error:'PIN must be 4-8 digits' });
-    if (!/^\d{9,15}$/.test(phone.replace(/\D/g,''))) return res.status(400).json({ error:'Valid phone required' });
-    const normalizedPhone = phone.replace(/\D/g,'');
-    let user = users.find(u => String(u.phone) === normalizedPhone);
-    if (user) return res.status(400).json({ error:'User already exists with this phone' });
-    user = {
-      id: uuid(), phone: normalizedPhone, role:'risk_agent', pinHash: hashPin(pin),
-      createdAt: nowIso(), createdBy: req.user.phone,
-      kycLevel:'staff', kycStatus:'verified'
-    };
-    users.push(user);
-    logAudit(req, 'risk_agent_create', { phone: normalizedPhone, role: 'risk_agent' });
-    res.json({ ok:true, user: { id:user.id, phone:user.phone, role:user.role } });
-  });
-
-  app.get('/api/issues/policies', requireAuth, requireIssuesDesk, (req,res)=>{
-    res.json({ ok:true, policies: ISSUE_POLICIES });
-  });
-
-  app.get('/api/issues/cases', requireAuth, requireIssuesDesk, (req,res)=>{
-    const status = String(req.query.status || '').trim().toLowerCase();
-    const priority = String(req.query.priority || '').trim().toLowerCase();
-    const q = String(req.query.q || '').trim().toLowerCase();
-    let rows = issueCaseList();
-    if (status) rows = rows.filter(r => String(r.status||'').toLowerCase() === status);
-    if (priority) rows = rows.filter(r => String(r.priority||'').toLowerCase() === priority);
-    if (q) rows = rows.filter(r => [r.caseId, r.txId, r.buyerPhone, r.sellerPhone, r.reasonCode, r.reasonText].some(v => String(v||'').toLowerCase().includes(q)));
-    const summary = {
-      total: rows.length,
-      byStatus: rows.reduce((a,r)=>{ const k=r.status||'unknown'; a[k]=(a[k]||0)+1; return a; }, {}),
-      byPriority: rows.reduce((a,r)=>{ const k=r.priority||'unknown'; a[k]=(a[k]||0)+1; return a; }, {}),
-      overdue: rows.filter(r => r.slaDeadlineAt && Date.parse(r.slaDeadlineAt) < Date.now() && !['resolved','closed'].includes(String(r.status||''))).length,
-    };
-    res.json({ ok:true, summary, cases: rows.slice(0, 500) });
-  });
-
-  app.get('/api/issues/cases/:caseId', requireAuth, requireIssuesDesk, (req,res)=>{
-    const got = getIssueCaseAndTx(req.params.caseId);
-    if (got.err) return res.status(404).json({ error: got.err });
-    const { tx, c } = got;
-    const actions = issueActions.filter(a => a.caseId === c.caseId).slice(-200).reverse();
-    const evidence = Array.isArray(tx.disputeDocs) ? tx.disputeDocs.map((d, idx) => ({
-      id: d.id || `${c.caseId}-doc-${idx+1}`,
-      name: d.name || d.filename || `evidence-${idx+1}`,
-      url: d.url || null,
-      uploadedAt: d.uploadedAt || d.createdAt || null,
-      uploadedBy: d.uploadedByPhone || d.byPhone || d.by || null,
-      mimeType: d.mimetype || null,
-      size: d.size || null,
-    })) : [];
-    res.json({ ok:true, case: c, transaction: tx, evidence, actions, policies: ISSUE_POLICIES });
-  });
-
-  app.get('/api/issues/cases/:caseId/timeline', requireAuth, requireIssuesDesk, (req,res)=>{
-    const got = getIssueCaseAndTx(req.params.caseId);
-    if (got.err) return res.status(404).json({ error: got.err });
-    const rows = buildIssueTimeline(got.tx, got.c.caseId);
-    res.json({ ok:true, caseId: got.c.caseId, txId: got.tx.id, timeline: rows });
-  });
-
-  app.post('/api/issues/cases/:caseId/assign', requireAuth, requireIssuesDesk, (req,res)=>{
-    const got = getIssueCaseAndTx(req.params.caseId);
-    if (got.err) return res.status(404).json({ error: got.err });
-    const st = issueCaseStore.get(got.c.caseId);
-    const toPhone = String((req.body||{}).toPhone || req.user.phone).trim();
-    st.assignedTo = toPhone;
-    st.assignedAt = nowIso();
-    st.updatedAt = nowIso();
-    logAudit(req, 'issues_case_assign', { caseId: got.c.caseId, txId: got.tx.id, assignedTo: toPhone });
-    res.json({ ok:true, case: ensureIssueCaseForTx(got.tx) });
-  });
-
-  app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, (req,res)=>{
-    const got = getIssueCaseAndTx(req.params.caseId);
-    if (got.err) return res.status(404).json({ error: got.err });
-    const body = req.body || {};
-    const actionType = String(body.actionType || '').trim();
-    const policyCode = String(body.policyCode || '').trim().toUpperCase();
-    const note = String(body.note || '').trim();
-    const policy = ISSUE_POLICIES.find(p => p.code === policyCode);
-    if (!actionType) return res.status(400).json({ error:'actionType is required' });
-    if (!policy) return res.status(400).json({ error:'Valid policyCode is required' });
-    const allowed = new Set(ISSUE_POLICIES.map(p=>p.actionType));
-    if (!allowed.has(actionType)) return res.status(400).json({ error:'Unsupported actionType' });
-    const st = issueCaseStore.get(got.c.caseId);
-    const nextStatus = String(body.nextStatus || policy.nextStatus || st.status || 'in_review').trim().toLowerCase();
-    const entry = {
-      id: uuid(),
-      caseId: got.c.caseId,
-      txId: got.tx.id,
-      actionType,
-      policyCode,
-      policyLabel: policy.label,
-      note: note || policy.template,
-      actorPhone: req.user.phone,
-      actorRole: req.user.role,
-      timestamp: nowIso(),
-      nextStatus,
-    };
-    issueActions.push(entry);
-    if (issueActions.length > 10000) issueActions.splice(0, issueActions.length - 10000);
-    st.status = nextStatus;
-    st.updatedAt = entry.timestamp;
-    if (actionType === 'freeze_transaction') {
-      got.tx.riskHold = true;
-      got.tx.riskHoldAt = entry.timestamp;
-    }
-    if (actionType === 'close_case') {
-      st.closedAt = entry.timestamp;
-      if (got.tx.dispute && !got.tx.dispute.resolvedAt) got.tx.dispute.resolvedAt = entry.timestamp;
-    }
-    logAudit(req, 'issues_case_action', { caseId: got.c.caseId, txId: got.tx.id, actionType, policyCode, nextStatus });
-    res.json({ ok:true, action: entry, case: ensureIssueCaseForTx(got.tx) });
-  });
-})();
-
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`TutoPay API running on port ${PORT}`);
 });
 
