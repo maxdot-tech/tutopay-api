@@ -1529,7 +1529,13 @@ ensureAdminUserSeed();
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const parts = auth.split(" ");
-  const token = parts.length === 2 && parts[0] === "Bearer" ? parts[1] : null;
+  let token = parts.length === 2 && parts[0] === "Bearer" ? parts[1] : null;
+  // Some browser download flows cannot attach Authorization headers reliably.
+  // For CSV exports we also allow token via query string: ?export_token=...
+  if (!token) {
+    const q = req.query || {};
+    token = (q.export_token || q.token || null);
+  }
 
   if (!token || !sessions.has(token)) {
     return res.status(401).json({ error: "Not authenticated" });
@@ -1559,45 +1565,6 @@ function requireAuth(req, res, next) {
   req.user = session; // { id, phone, role, kycLevel, kycStatus, expiresAt }
   next();
 }
-
-// Export downloads sometimes don't carry Authorization headers reliably.
-// Allow token via query string: ?export_token=<token>
-function requireExportAuth(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const parts = auth.split(" ");
-  const bearer = parts.length === 2 && parts[0] === "Bearer" ? parts[1] : null;
-  const queryTok = (req.query && (req.query.export_token || req.query.token)) ? String(req.query.export_token || req.query.token) : null;
-  const token = bearer || queryTok;
-
-  if (!token || !sessions.has(token)) {
-    return res.status(401).json({ error: "Not authenticated" });
-  }
-
-  const session = sessions.get(token);
-  if (!session || (session.expiresAt && Date.now() > session.expiresAt)) {
-    if (token) sessions.delete(token);
-    return res.status(401).json({ error: "Session expired. Please sign in again." });
-  }
-
-  // Refresh role/KYC flags from user record on every request (important after admin KYC reviews)
-  const currentUser = findUserByPhone(session.phone);
-  if (currentUser) {
-    ensureUserKycDefaults(currentUser);
-    session.role = currentUser.role;
-    session.kycLevel = getEffectiveKycLevel(currentUser);
-    session.kycStatus = currentUser.kycStatus;
-    session.disabled = !!currentUser.disabled;
-    if (session.disabled) {
-      sessions.delete(token);
-      return res.status(403).json({ error: "This account has been disabled. Please contact support." });
-    }
-  }
-
-  req.authToken = token;
-  req.user = session; // { id, phone, role, kycLevel, kycStatus, expiresAt }
-  next();
-}
-
 
 // ===== Idempotency middleware (prevents duplicates on retries/double-taps) =====
 const IDEM_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -3670,7 +3637,7 @@ const server =
   });
 
 // ---- Step 8A exports (CSV) ----
-app.get('/api/admin/export/issues.csv', requireExportAuth, requireIssuesDesk, (req, res) => {
+app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
   const rows = issueCaseList();
   const header = ['caseId','txId','status','priority','assignedTo','assignedAt','slaDeadlineAt','createdAt','updatedAt','buyerPhone','sellerPhone','amount','currency','reasonCode','docsCount'].join(',');
@@ -3683,7 +3650,7 @@ app.get('/api/admin/export/issues.csv', requireExportAuth, requireIssuesDesk, (r
   res.send(csv);
 });
 
-app.get('/api/admin/export/issues-actions.csv', requireExportAuth, requireIssuesDesk, (req, res) => {
+app.get('/api/admin/export/issues-actions.csv', requireAuth, requireIssuesDesk, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
   const header = ['id','caseId','txId','timestamp','actionType','policyCode','nextStatus','actorPhone','actorRole','note'].join(',');
   const csv = [header].concat((issueActions||[]).slice().reverse().map(a => [
@@ -3695,7 +3662,7 @@ app.get('/api/admin/export/issues-actions.csv', requireExportAuth, requireIssues
   res.send(csv);
 });
 
-app.get('/api/admin/export/incidents.csv', requireExportAuth, (req,res) => {
+app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
   const header = ['id','createdAt','severity','category','status','createdBy','title','description'].join(',');
   const csv = [header].concat((complianceIncidents||[]).slice().reverse().map(i => [
@@ -4004,10 +3971,13 @@ app.get('/api/admin/export/incidents.csv', requireExportAuth, (req,res) => {
     };
     issueActions.push(entry);
     if (issueActions.length > 10000) issueActions.splice(0, issueActions.length - 10000);
-    try { await dbInsertIssueAction(entry); } catch(e){}
-    try { await dbUpsertIssueCase(st); } catch(e){}
+
+    // Apply state transition before persisting
     st.status = nextStatus;
     st.updatedAt = entry.timestamp;
+
+    try { await dbInsertIssueAction(entry); } catch(e){}
+    try { await dbUpsertIssueCase(st); } catch(e){}
     if (actionType === 'freeze_transaction') {
       got.tx.riskHold = true;
       got.tx.riskHoldAt = entry.timestamp;
