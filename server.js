@@ -1,3 +1,10 @@
+
+
+/* === Accounting roles (global) === */
+function isAccountingRole(role) {
+  const r = String(role || "").toLowerCase();
+  return r === "admin" || r === "accounts_agent" || r === "accounts" || r === "finance_agent";
+}
 // server.js
 // TutoPay demo backend — escrow logic + catalogue + buyer→seller requests with replies + live GPS
 
