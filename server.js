@@ -3694,7 +3694,9 @@ app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
     { code:'RISK-04', label:'Reject Complaint Recommended', actionType:'recommend_reject', nextStatus:'awaiting_admin_approval', template:'Evidence does not support complaint claim. Prepare a structured rejection response.' },
     { code:'RISK-05', label:'Escalate to Supervisor', actionType:'escalate_supervisor', nextStatus:'escalated', template:'Case escalated due to severity, repeat pattern, or policy trigger.' },
     { code:'RISK-06', label:'Close Case', actionType:'close_case', nextStatus:'resolved', template:'Issue is resolved and case can be closed with final notes recorded.' }
-  ];
+    ,{ code:'ADM-01', label:'ADMIN: Approve Refund (Execute)', actionType:'admin_execute_refund', nextStatus:'resolved', template:'Admin approval: execute refund outcome (money-moving). Records authorization + closes case.' }
+    ,{ code:'ADM-02', label:'ADMIN: Approve Reject (Close)', actionType:'admin_execute_reject', nextStatus:'resolved', template:'Admin approval: reject complaint outcome (money-moving decision) + close case.' }
+    ];
   const issueCaseStore = globalThis.__tpIssueCaseStore || (globalThis.__tpIssueCaseStore = new Map()); // caseId -> state/meta
   const issueActions = globalThis.__tpIssueActions || (globalThis.__tpIssueActions = []); // append-only action log
 
@@ -3942,7 +3944,37 @@ app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
     res.json({ ok:true, case: ensureIssueCaseForTx(got.tx) });
   });
 
-  app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, async (req,res)=>{
+  
+  function applyAdminIssueOutcome(req, tx, outcome, note) {
+    const now = nowIso();
+    tx.dispute = tx.dispute || {};
+    tx.dispute.adminDecision = {
+      outcome,
+      note: note || '',
+      decidedAt: now,
+      byPhone: req.user.phone,
+    };
+    // Freeze lifted once decision executed
+    tx.riskHold = false;
+    tx.riskHoldAt = tx.riskHoldAt || null;
+
+    if (outcome === 'refund') {
+      tx.dispute.status = 'admin_approved_refund';
+      tx.dispute.resolvedAt = now;
+      tx.disputeActive = false;
+      tx.status = 'refunded';
+      tx.payoutReconciled = true;
+      recordLedger(req, tx, 'refund_completed', { notes: 'Admin executed refund via Issues Desk' });
+    } else if (outcome === 'reject') {
+      tx.dispute.status = 'admin_rejected_complaint';
+      tx.dispute.resolvedAt = now;
+      tx.disputeActive = false;
+      // Keep tx.status unchanged; complaint closed
+      recordLedger(req, tx, 'dispute_rejected', { notes: 'Admin rejected complaint via Issues Desk' });
+    }
+  }
+
+app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, async (req,res)=>{
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
     const body = req.body || {};
@@ -3952,6 +3984,11 @@ app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
     const policy = ISSUE_POLICIES.find(p => p.code === policyCode);
     if (!actionType) return res.status(400).json({ error:'actionType is required' });
     if (!policy) return res.status(400).json({ error:'Valid policyCode is required' });
+    // Separation of duties: only admin can execute money-moving outcomes
+    if (String(actionType).startsWith('admin_execute_') && String(req.user.role) !== 'admin') {
+      return res.status(403).json({ error:'Only admin can execute approvals.' });
+    }
+
     const allowed = new Set(ISSUE_POLICIES.map(p=>p.actionType));
     if (!allowed.has(actionType)) return res.status(400).json({ error:'Unsupported actionType' });
     const st = issueCaseStore.get(got.c.caseId);
@@ -3976,9 +4013,34 @@ app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
     st.status = nextStatus;
     st.updatedAt = entry.timestamp;
 
+    // Store recommendation/approval metadata for governance
+    if (actionType === 'recommend_refund') {
+      st.pendingAdminApproval = true;
+      st.recommendation = { outcome:'refund', policyCode, note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
+    } else if (actionType === 'recommend_reject') {
+      st.pendingAdminApproval = true;
+      st.recommendation = { outcome:'reject', policyCode, note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
+    }
+    if (String(actionType).startsWith('admin_execute_')) {
+      st.pendingAdminApproval = false;
+      st.approval = { actionType, policyCode, note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
+    }
+
     try { await dbInsertIssueAction(entry); } catch(e){}
     try { await dbUpsertIssueCase(st); } catch(e){}
-    if (actionType === 'freeze_transaction') {
+
+    if (String(actionType).startsWith('admin_execute_')) {
+      const outcome = actionType === 'admin_execute_refund' ? 'refund' : (actionType === 'admin_execute_reject' ? 'reject' : null);
+      if (outcome) {
+        applyAdminIssueOutcome(req, got.tx, outcome, entry.note);
+        st.executedOutcome = outcome;
+        st.executedAt = entry.timestamp;
+        st.closedAt = entry.timestamp;
+        st.status = 'resolved';
+      }
+    }
+
+        if (actionType === 'freeze_transaction') {
       got.tx.riskHold = true;
       got.tx.riskHoldAt = entry.timestamp;
     }
@@ -3986,6 +4048,8 @@ app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
       st.closedAt = entry.timestamp;
       if (got.tx.dispute && !got.tx.dispute.resolvedAt) got.tx.dispute.resolvedAt = entry.timestamp;
     }
+    if (dbEnabled()) { dbUpsertTransaction(got.tx).catch(()=>{}); }
+
     logAudit(req, 'issues_case_action', { caseId: got.c.caseId, txId: got.tx.id, actionType, policyCode, nextStatus });
     res.json({ ok:true, action: entry, case: ensureIssueCaseForTx(got.tx) });
   });
