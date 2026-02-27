@@ -3386,7 +3386,7 @@ app.get("/api/admin/summary", requireAuth, (req, res) => {
 
 // -------- Admin: ledger + reconciliation --------
 app.get("/api/admin/ledger", requireAuth, (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  if (!isAccountingRole(req.user.role)) return res.status(403).json({ error: "Accounting only" });
 
   const txId = req.query.txId ? String(req.query.txId) : null;
   const limit = Math.min(Number(req.query.limit) || 200, 2000);
@@ -3413,7 +3413,7 @@ app.get("/api/admin/callback-config", requireAuth, (req, res) => {
 });
 
 app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  if (!isAccountingRole(req.user.role)) return res.status(403).json({ error: "Accounting only" });
 
   const txs = transactions.map(ensureTxReconDefaults);
   const pendingCollection = issuesTxs().filter((t) => t.paymentStatus === "paid" && !t.collectionReconciled).length;
@@ -3706,7 +3706,17 @@ app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
     const r = String(role || '').toLowerCase();
     return r === 'admin' || r === 'risk_agent' || r === 'fraud_agent';
   }
-  function requireIssuesDesk(req,res,next){
+  
+  function isAccountingRole(role) {
+    const r = String(role || '').toLowerCase();
+    return r === 'admin' || r === 'accounts_agent' || r === 'accounts' || r === 'finance_agent';
+  }
+  function requireAccounting(req,res,next){
+    if (!req.user || !isAccountingRole(req.user.role)) return res.status(403).json({ error:'Accounting only' });
+    return next();
+  }
+
+function requireIssuesDesk(req,res,next){
     if (!req.user || !isIssuesDeskRole(req.user.role)) return res.status(403).json({ error:'Issues Desk only' });
     return next();
   }
@@ -4057,6 +4067,43 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`TutoPay API running on port ${PORT}`);
+});
+
+
+
+app.post("/api/admin/staff-accounts", requireAuth, (req, res) => {
+  if (!req.user || req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const { phone, pin, role } = req.body || {};
+  const normalizedPhone = String(phone || "").trim();
+  const pinVal = String(pin || "").trim();
+  const roleNorm = String(role || "").trim().toLowerCase();
+
+  if (!normalizedPhone || !pinVal) return res.status(400).json({ error: "Phone and PIN are required." });
+
+  const allowed = ["risk_agent", "accounts_agent"];
+  if (!allowed.includes(roleNorm)) return res.status(400).json({ error: "Invalid staff role." });
+
+  let user = findUserByPhone(normalizedPhone);
+  if (user) return res.status(400).json({ error: "User already exists with this phone" });
+
+  user = {
+    id: uuid(),
+    phone: normalizedPhone,
+    role: roleNorm,
+    pinHash: hashPin(pinVal),
+    createdAt: nowIso(),
+    createdBy: req.user.phone,
+    kycLevel: "staff",
+    kycStatus: "verified",
+    kycHistory: [],
+  };
+
+  users.push(user);
+  if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
+
+  logAudit(req, "staff_account_create", { phone: normalizedPhone, role: roleNorm });
+  return res.json({ ok: true, user: { id: user.id, phone: user.phone, role: user.role } });
 });
 
 // Run DB init in background (does NOT prevent the server from starting)
