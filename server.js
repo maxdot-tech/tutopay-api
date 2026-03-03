@@ -1,5 +1,4 @@
 
-
 /* === Accounting roles (global) === */
 function isAccountingRole(role) {
   const r = String(role || "").toLowerCase();
