@@ -3093,13 +3093,19 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
       tx.disputeDocs = [];
     }
 
+    const urlPath = `/uploads/${req.file.filename}`;
     const doc = {
+      id: uuid(),
       filename: req.file.filename,
       originalname: req.file.originalname,
+      name: req.file.originalname,
       mimetype: req.file.mimetype,
       size: req.file.size,
       uploadedAt: nowIso(),
-      url: `/uploads/${req.file.filename}`,
+      uploadedByPhone: (req.user && req.user.phone) ? String(req.user.phone) : null,
+      urlPath,
+      // Absolute URL so evidence links work from tutopay.online (frontend) to api.tutopay.online (backend)
+      url: `${PUBLIC_API_BASE}${urlPath}`,
     };
 
     tx.disputeDocs.push(doc);
@@ -3929,15 +3935,29 @@ function requireIssuesDesk(req,res,next){
     if (got.err) return res.status(404).json({ error: got.err });
     const { tx, c } = got;
     const actions = issueActions.filter(a => a.caseId === c.caseId).slice(-200).reverse();
-    const evidence = Array.isArray(tx.disputeDocs) ? tx.disputeDocs.map((d, idx) => ({
-      id: d.id || `${c.caseId}-doc-${idx+1}`,
-      name: d.name || d.filename || `evidence-${idx+1}`,
-      url: d.url || null,
-      uploadedAt: d.uploadedAt || d.createdAt || null,
-      uploadedBy: d.uploadedByPhone || d.byPhone || d.by || null,
-      mimeType: d.mimetype || null,
-      size: d.size || null,
-    })) : [];
+    const evidence = Array.isArray(tx.disputeDocs) ? tx.disputeDocs.map((d, idx) => {
+      const docId = d.id || `${c.caseId}-doc-${idx+1}`;
+      const urlPath = d.urlPath || (d.url && String(d.url).startsWith('/uploads/') ? d.url : null) || null;
+      const directUrl = d.url
+        ? (String(d.url).startsWith('http') ? String(d.url) : `${PUBLIC_API_BASE}${String(d.url)}`)
+        : (urlPath ? `${PUBLIC_API_BASE}${urlPath}` : null);
+
+      // Future-proof: authenticated streaming endpoint (UI can use fetch + Authorization if desired)
+      const apiUrl = `${PUBLIC_API_BASE}/api/issues/cases/${encodeURIComponent(String(c.caseId))}/evidence/${encodeURIComponent(String(docId))}`;
+
+      return {
+        id: docId,
+        name: d.name || d.originalname || d.filename || `evidence-${idx+1}`,
+        // Keep 'url' as direct URL so clicking "Open file" works in a new tab (no auth headers)
+        url: directUrl,
+        directUrl,
+        apiUrl,
+        uploadedAt: d.uploadedAt || d.createdAt || null,
+        uploadedBy: d.uploadedByPhone || d.uploadedBy || d.byPhone || d.by || null,
+        mimeType: d.mimetype || d.mimeType || null,
+        size: d.size || null,
+      };
+    }) : [];
     res.json({ ok:true, case: c, transaction: tx, evidence, actions, policies: ISSUE_POLICIES });
   });
 
@@ -4070,6 +4090,125 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     logAudit(req, 'issues_case_action', { caseId: got.c.caseId, txId: got.tx.id, actionType, policyCode, nextStatus });
     res.json({ ok:true, action: entry, case: ensureIssueCaseForTx(got.tx) });
   });
+
+  // --- Evidence streaming endpoint (optional, safer than public /uploads) ---
+  // NOTE: Frontend currently uses directUrl in evidence.url, but this endpoint allows future auth-based viewing.
+  app.get('/api/issues/cases/:caseId/evidence/:docId', requireAuth, requireIssuesDesk, (req,res)=>{
+    const got = getIssueCaseAndTx(req.params.caseId);
+    if (got.err) return res.status(404).json({ error: got.err });
+    const tx = got.tx;
+    const docId = String(req.params.docId || '').trim();
+    const docs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
+    const doc = docs.find((d, idx) => String(d.id || `${got.c.caseId}-doc-${idx+1}`) === docId) || null;
+    if (!doc) return res.status(404).json({ error: 'Evidence file not found' });
+
+    const filename = String(doc.filename || '').trim();
+    if (!filename) return res.status(404).json({ error: 'Evidence filename missing' });
+
+    const fp = path.join(uploadDir, filename);
+    if (!fs.existsSync(fp)) return res.status(404).json({ error: 'Evidence file missing on server' });
+
+    res.setHeader('Content-Type', doc.mimetype || 'application/octet-stream');
+    // Inline view for images/pdf; download for others
+    const disp = (String(doc.mimetype||'').startsWith('image/') || String(doc.mimetype||'').includes('pdf')) ? 'inline' : 'attachment';
+    res.setHeader('Content-Disposition', `${disp}; filename="${(doc.originalname||doc.name||filename).replace(/"/g,'')}"`);
+    return res.sendFile(fp);
+  });
+
+  // --- Admin approval helpers (so the UI can show explicit Approve/Reject buttons) ---
+  function requireAdmin(req,res,next){
+    if (!req.user || String(req.user.role) !== 'admin') return res.status(403).json({ error:'Admin only' });
+    return next();
+  }
+
+  // List pending admin approvals
+  app.get('/api/issues/approvals', requireAuth, requireAdmin, (req,res)=>{
+    const rows = issueCaseList().filter(r => !!r.pendingAdminApproval || String(r.status||'') === 'awaiting_admin_approval');
+    res.json({ ok:true, total: rows.length, cases: rows.slice(0, 500) });
+  });
+
+  // Approve the RA recommendation and execute outcome (refund/reject)
+  app.post('/api/issues/cases/:caseId/admin/approve', requireAuth, requireAdmin, async (req,res)=>{
+    const got = getIssueCaseAndTx(req.params.caseId);
+    if (got.err) return res.status(404).json({ error: got.err });
+    const st = issueCaseStore.get(got.c.caseId) || got.c;
+    const note = String((req.body||{}).note || '').trim();
+
+    const rec = st && st.recommendation ? st.recommendation : null;
+    if (!rec || !rec.outcome) return res.status(400).json({ error:'No recommendation found to approve' });
+
+    const outcome = String(rec.outcome).toLowerCase();
+    const actionType = outcome === 'refund' ? 'admin_execute_refund' : (outcome === 'reject' ? 'admin_execute_reject' : '');
+    const policyCode = outcome === 'refund' ? 'ADM-01' : (outcome === 'reject' ? 'ADM-02' : '');
+    if (!actionType) return res.status(400).json({ error:'Unsupported recommendation outcome' });
+
+    // Reuse the same internal action recorder logic by simulating an action entry
+    const entry = {
+      id: uuid(),
+      timestamp: nowIso(),
+      caseId: got.c.caseId,
+      txId: got.tx.id,
+      actionType,
+      policyCode,
+      nextStatus: 'resolved',
+      note: note || `Admin approved RA recommendation: ${outcome}`,
+      byPhone: req.user.phone,
+      byRole: req.user.role,
+    };
+    issueActions.push(entry);
+
+    st.pendingAdminApproval = false;
+    st.approval = { actionType, policyCode, note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
+    st.executedOutcome = outcome;
+    st.executedAt = entry.timestamp;
+    st.closedAt = entry.timestamp;
+    st.status = 'resolved';
+    st.updatedAt = entry.timestamp;
+
+    applyAdminIssueOutcome(req, got.tx, outcome, entry.note);
+
+    try { await dbInsertIssueAction(entry); } catch(e){}
+    try { await dbUpsertIssueCase(st); } catch(e){}
+    if (dbEnabled()) { dbUpsertTransaction(got.tx).catch(()=>{}); }
+
+    logAudit(req, 'issues_admin_approved', { caseId: got.c.caseId, txId: got.tx.id, outcome });
+    return res.json({ ok:true, action: entry, case: ensureIssueCaseForTx(got.tx) });
+  });
+
+  // Reject the RA recommendation (send back to RA review)
+  app.post('/api/issues/cases/:caseId/admin/reject', requireAuth, requireAdmin, async (req,res)=>{
+    const got = getIssueCaseAndTx(req.params.caseId);
+    if (got.err) return res.status(404).json({ error: got.err });
+    const st = issueCaseStore.get(got.c.caseId) || got.c;
+    const note = String((req.body||{}).note || '').trim();
+
+    const entry = {
+      id: uuid(),
+      timestamp: nowIso(),
+      caseId: got.c.caseId,
+      txId: got.tx.id,
+      actionType: 'admin_reject_recommendation',
+      policyCode: 'ADM-00',
+      nextStatus: 'in_review',
+      note: note || 'Admin rejected recommendation; return to RA for further review.',
+      byPhone: req.user.phone,
+      byRole: req.user.role,
+    };
+    issueActions.push(entry);
+
+    st.pendingAdminApproval = false;
+    st.approvalRejected = { note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
+    st.status = 'in_review';
+    st.updatedAt = entry.timestamp;
+
+    try { await dbInsertIssueAction(entry); } catch(e){}
+    try { await dbUpsertIssueCase(st); } catch(e){}
+
+    logAudit(req, 'issues_admin_rejected', { caseId: got.c.caseId, txId: got.tx.id });
+    return res.json({ ok:true, action: entry, case: ensureIssueCaseForTx(got.tx) });
+  });
+
+
 })();
 
 app.listen(PORT, '0.0.0.0', () => {
