@@ -1,4 +1,5 @@
 
+
 /* === Accounting roles (global) === */
 function isAccountingRole(role) {
   const r = String(role || "").toLowerCase();
@@ -3651,39 +3652,196 @@ const server =
 // ---- Step 8A exports (CSV) ----
 app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
-  const rows = issueCaseList();
-  const header = ['caseId','txId','status','priority','assignedTo','assignedAt','slaDeadlineAt','createdAt','updatedAt','buyerPhone','sellerPhone','amount','currency','reasonCode','docsCount'].join(',');
-  const csv = [header].concat(rows.map(r => [
-    r.caseId, r.txId, r.status, r.priority, r.assignedTo||'', r.assignedAt||'', r.slaDeadlineAt||'', r.createdAt||'', r.updatedAt||'',
-    r.buyerPhone||'', r.sellerPhone||'', r.amount||0, r.currency||'', (r.reasonCode||'').replace(/,/g,' '), r.docsCount||0
-  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+
+  const q = req.query || {};
+  const from = q.from ? Date.parse(String(q.from)) : null;
+  const to = q.to ? Date.parse(String(q.to)) : null;
+  const status = q.status ? String(q.status).trim().toLowerCase() : null;
+  const assignedTo = q.assignedTo ? String(q.assignedTo).trim() : null;
+  const outcome = q.outcome ? String(q.outcome).trim().toLowerCase() : null;
+  const priority = q.priority ? String(q.priority).trim().toLowerCase() : null;
+
+  let rows = issueCaseList();
+
+  rows = rows.filter(r => {
+    const createdMs = r.createdAt ? Date.parse(String(r.createdAt)) : NaN;
+    const updatedMs = r.updatedAt ? Date.parse(String(r.updatedAt)) : NaN;
+    const t = isNaN(updatedMs) ? createdMs : updatedMs;
+
+    if (from && !isNaN(t) && t < from) return false;
+    if (to && !isNaN(t) && t > to) return false;
+
+    if (status && String(r.status||'').toLowerCase() !== status) return false;
+    if (priority && String(r.priority||'').toLowerCase() !== priority) return false;
+
+    if (assignedTo && String(r.assignedTo||'') !== assignedTo) return false;
+
+    if (outcome) {
+      const recOut = r.recommendation && r.recommendation.outcome ? String(r.recommendation.outcome).toLowerCase() : '';
+      const apprAct = r.approval && r.approval.actionType ? String(r.approval.actionType).toLowerCase() : '';
+      const finalOut =
+        apprAct.includes('refund') ? 'refund' :
+        apprAct.includes('reject') ? 'reject' :
+        recOut || '';
+      if (finalOut !== outcome) return false;
+    }
+
+    return true;
+  });
+
+  const header = [
+    'caseId','txId','status','priority','assignedTo','assignedAt','slaDeadlineAt','createdAt','updatedAt',
+    'buyerPhone','sellerPhone','amount','currency','reasonCode','docsCount',
+    'recOutcome','recBy','recAt',
+    'adminDecision','adminBy','adminAt'
+  ].join(',');
+
+  const csv = [header].concat(rows.map(r => {
+    const recOutcome = r.recommendation && r.recommendation.outcome ? r.recommendation.outcome : '';
+    const recBy = r.recommendation && (r.recommendation.byPhone || r.recommendation.by) ? (r.recommendation.byPhone || r.recommendation.by) : '';
+    const recAt = r.recommendation && (r.recommendation.at || r.recommendation.createdAt) ? (r.recommendation.at || r.recommendation.createdAt) : '';
+    const adminDecision = r.approval && r.approval.actionType ? r.approval.actionType : '';
+    const adminBy = r.approval && r.approval.byPhone ? r.approval.byPhone : '';
+    const adminAt = r.approval && r.approval.at ? r.approval.at : '';
+
+    return [
+      r.caseId, r.txId, r.status, r.priority, r.assignedTo||'', r.assignedAt||'', r.slaDeadlineAt||'', r.createdAt||'', r.updatedAt||'',
+      r.buyerPhone||'', r.sellerPhone||'', r.amount||0, r.currency||'', (r.reasonCode||'').replace(/,/g,' '), r.docsCount||0,
+      (recOutcome||'').replace(/,/g,' '), recBy||'', recAt||'',
+      (adminDecision||'').replace(/,/g,' '), adminBy||'', adminAt||''
+    ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(',');
+  })).join('\n');
+
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues.csv"');
   res.send(csv);
 });
 
+
 app.get('/api/admin/export/issues-actions.csv', requireAuth, requireIssuesDesk, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
+
+  const q = req.query || {};
+  const from = q.from ? Date.parse(String(q.from)) : null;
+  const to = q.to ? Date.parse(String(q.to)) : null;
+  const caseId = q.caseId ? String(q.caseId).trim() : null;
+  const txId = q.txId ? String(q.txId).trim() : null;
+  const actionType = q.actionType ? String(q.actionType).trim().toLowerCase() : null;
+  const actorPhone = q.actorPhone ? String(q.actorPhone).trim() : null;
+
+  let rows = (issueActions||[]).slice().reverse();
+
+  rows = rows.filter(a => {
+    const t = a.timestamp ? Date.parse(String(a.timestamp)) : NaN;
+    if (from && !isNaN(t) && t < from) return false;
+    if (to && !isNaN(t) && t > to) return false;
+
+    if (caseId && String(a.caseId||'') !== caseId) return false;
+    if (txId && String(a.txId||'') !== txId) return false;
+    if (actorPhone && String(a.actorPhone||a.byPhone||'') !== actorPhone) return false;
+
+    if (actionType && String(a.actionType||'').toLowerCase() !== actionType) return false;
+
+    return true;
+  });
+
   const header = ['id','caseId','txId','timestamp','actionType','policyCode','nextStatus','actorPhone','actorRole','note'].join(',');
-  const csv = [header].concat((issueActions||[]).slice().reverse().map(a => [
+  const csv = [header].concat(rows.map(a => [
     a.id||'', a.caseId||'', a.txId||'', a.timestamp||'', a.actionType||'', a.policyCode||'', a.nextStatus||'',
-    a.actorPhone||'', a.actorRole||'', (a.note||'').replace(/\r?\n/g,' ')
+    (a.actorPhone||a.byPhone||''), (a.actorRole||a.byRole||''), (a.note||'').replace(/\r?\n/g,' ')
   ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues-actions.csv"');
   res.send(csv);
 });
 
+
 app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
+
+  const q = req.query || {};
+  const from = q.from ? Date.parse(String(q.from)) : null;
+  const to = q.to ? Date.parse(String(q.to)) : null;
+  const status = q.status ? String(q.status).trim().toLowerCase() : null;
+  const severity = q.severity ? String(q.severity).trim().toLowerCase() : null;
+  const category = q.category ? String(q.category).trim().toLowerCase() : null;
+  const createdBy = q.createdBy ? String(q.createdBy).trim() : null;
+
+  let rows = (complianceIncidents||[]).slice().reverse();
+
+  rows = rows.filter(i => {
+    const t = i.createdAt ? Date.parse(String(i.createdAt)) : NaN;
+    if (from && !isNaN(t) && t < from) return false;
+    if (to && !isNaN(t) && t > to) return false;
+    if (status && String(i.status||'').toLowerCase() !== status) return false;
+    if (severity && String(i.severity||'').toLowerCase() !== severity) return false;
+    if (category && String(i.category||'').toLowerCase() !== category) return false;
+    if (createdBy && String(i.createdBy||'') !== createdBy) return false;
+    return true;
+  });
+
   const header = ['id','createdAt','severity','category','status','createdBy','title','description'].join(',');
-  const csv = [header].concat((complianceIncidents||[]).slice().reverse().map(i => [
-    i.id||'', i.createdAt||'', i.severity||'', i.category||'', i.status||'', i.createdBy||'', (i.title||'').replace(/,/g,' '), (i.description||'').replace(/\r?\n/g,' ')
+  const csv = [header].concat(rows.map(i => [
+    i.id||'', i.createdAt||'', i.severity||'', i.category||'', i.status||'', i.createdBy||'',
+    (i.title||'').replace(/,/g,' '), (i.description||'').replace(/\r?\n/g,' ')
   ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-incidents.csv"');
   res.send(csv);
 });
+
+app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireAdmin, (req,res) => {
+  const q = req.query || {};
+  const from = q.from ? Date.parse(String(q.from)) : null;
+  const to = q.to ? Date.parse(String(q.to)) : null;
+  const outcome = q.outcome ? String(q.outcome).trim().toLowerCase() : null; // refund|reject
+  const byPhone = q.byPhone ? String(q.byPhone).trim() : null;
+
+  let rows = issueCaseList().filter(r => r && r.approval && r.approval.actionType);
+
+  rows = rows.filter(r => {
+    const at = r.approval && r.approval.at ? Date.parse(String(r.approval.at)) : NaN;
+    if (from && !isNaN(at) && at < from) return false;
+    if (to && !isNaN(at) && at > to) return false;
+
+    if (byPhone && String(r.approval.byPhone||'') !== byPhone) return false;
+
+    if (outcome) {
+      const act = String(r.approval.actionType||'').toLowerCase();
+      const out = act.includes('refund') ? 'refund' : (act.includes('reject') ? 'reject' : '');
+      if (out !== outcome) return false;
+    }
+    return true;
+  });
+
+  const header = [
+    'caseId','txId','status_before','status_after',
+    'ra_recommended_outcome','ra_by','ra_at',
+    'admin_actionType','admin_policyCode','admin_note','admin_by','admin_at'
+  ].join(',');
+
+  const csv = [header].concat(rows.map(r => {
+    const recOutcome = r.recommendation && r.recommendation.outcome ? r.recommendation.outcome : '';
+    const recBy = r.recommendation && (r.recommendation.byPhone || r.recommendation.by) ? (r.recommendation.byPhone || r.recommendation.by) : '';
+    const recAt = r.recommendation && (r.recommendation.at || r.recommendation.createdAt) ? (r.recommendation.at || r.recommendation.createdAt) : '';
+    const appr = r.approval || {};
+    return [
+      r.caseId, r.txId,
+      '', String(r.status||''),  // status_before not tracked consistently; kept blank
+      (recOutcome||'').replace(/,/g,' '), recBy||'', recAt||'',
+      appr.actionType||'', appr.policyCode||'', (appr.note||'').replace(/\r?\n/g,' '),
+      appr.byPhone||'', appr.at||''
+    ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(',');
+  })).join('\n');
+
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues-approvals.csv"');
+  res.send(csv);
+});
+
+
 
   app.get('/api/admin/compliance/export', requireAuth, (req,res)=> {
     if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
