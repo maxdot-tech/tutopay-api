@@ -707,7 +707,7 @@ app.post("/api/callbacks/airtel/collection", (req, res) => processProviderCallba
 // ===== Dispute document uploads (Multer) =====
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir);
+  fs.mkdirSync(uploadDir, { recursive: true });
 }
 
 const disputeUpload = multer({
@@ -751,7 +751,12 @@ function saveDataUrlToUploads(dataUrl, prefix = "item") {
   const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
   const filename = `${prefix}-${unique}.${ext}`;
   const fp = path.join(uploadDir, filename);
-  fs.writeFileSync(fp, buf);
+  try {
+    fs.writeFileSync(fp, buf);
+  } catch (e) {
+    console.error('[uploads] write failed', e && e.message ? e.message : e);
+    return "";
+  }
   return `/uploads/${filename}`;
 }
 
@@ -2083,6 +2088,7 @@ if (!it) return res.status(404).json({ error: "Item not found" });
 });
 
 app.post("/api/items", requireAuth, (req, res) => {
+  try {
     const {
   title,
   details,
@@ -2154,6 +2160,11 @@ const cache = new Map();
 
   items.push(item);
   res.status(201).json(item);
+  } catch (e) {
+    console.error('[api/items] create failed', e && e.message ? e.message : e);
+    return res.status(500).json({ error: "Create item failed", details: String(e && e.message ? e.message : e) });
+  }
+
 });
 
 // Public: catalogue for a given seller
@@ -2475,6 +2486,7 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
 
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
   return res.json(tx);
+
 });
 
 app.post("/api/transactions/:id/payment/requery", requireAuth, requeryLimiter, idempotencyMiddleware, async (req, res) => {
