@@ -3868,6 +3868,106 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireAdmin, (re
     ,{ code:'ADM-02', label:'ADMIN: Approve Reject (Close)', actionType:'admin_execute_reject', nextStatus:'resolved', template:'Admin approval: reject complaint outcome (money-moving decision) + close case.' }
     ];
   const issueCaseStore = globalThis.__tpIssueCaseStore || (globalThis.__tpIssueCaseStore = new Map()); // caseId -> state/meta
+
+  // ==========================
+  // Step 8.4: SLA timers + auto escalation (BoZ ops maturity)
+  // ==========================
+  function pickSlaHoursFromPriority(priority){
+    const p = String(priority||'').toLowerCase().trim();
+    if (p === 'critical') return 12;
+    if (p === 'high') return 24;
+    if (p === 'medium') return 48;
+    if (p === 'low') return 72;
+    return 24;
+  }
+  function computeSlaMeta(deadlineIso){
+    const now = Date.now();
+    const dl = Date.parse(deadlineIso || '') || 0;
+    const remainingMs = dl - now;
+    return {
+      slaRemainingMs: remainingMs,
+      slaOverdue: remainingMs < 0,
+      slaRemainingHuman: remainingMs < 0
+        ? `overdue ${Math.ceil(Math.abs(remainingMs)/60000)}m`
+        : `${Math.floor(remainingMs/3600000)}h ${Math.floor((remainingMs%3600000)/60000)}m`
+    };
+  }
+  async function logSystemIssueAction(caseId, txId, actionType, note, extra){
+    const entry = {
+      id: uuid(),
+      timestamp: nowIso(),
+      caseId,
+      txId,
+      actionType,
+      policyCode: 'SYS-SLA',
+      nextStatus: (extra && extra.nextStatus) ? extra.nextStatus : undefined,
+      note: note || '',
+      actorPhone: 'SYSTEM',
+      actorRole: 'system'
+    };
+    try { issueActions.push(entry); } catch(e){}
+    try { await dbInsertIssueAction(entry); } catch(e){}
+    return entry;
+  }
+  async function runSlaEscalationSweep(){
+    try{
+      const now = Date.now();
+      for (const [caseId, st] of issueCaseStore.entries()){
+        if (!st) continue;
+        const status = String(st.status||'').toLowerCase();
+        if (status === 'resolved' || status === 'closed') continue;
+
+        if (!st.slaHours) st.slaHours = pickSlaHoursFromPriority(st.priority);
+        if (!st.slaDeadlineAt){
+          const createdMs = Date.parse(st.createdAt||'') || now;
+          st.slaDeadlineAt = new Date(createdMs + (Number(st.slaHours)||24)*3600000).toISOString();
+        }
+
+        const deadline = Date.parse(st.slaDeadlineAt) || 0;
+        if (!deadline) continue;
+
+        const overdueMs = Math.max(0, now - deadline);
+        const prevLevel = Number(st.slaEscalationLevel || 0);
+        let nextLevel = prevLevel;
+        let nextPriority = st.priority;
+
+        if (overdueMs > 0 && prevLevel < 1){
+          nextLevel = 1;
+          nextPriority = 'high';
+        }
+        if (overdueMs > 24*3600000 && prevLevel < 2){
+          nextLevel = 2;
+          nextPriority = 'critical';
+        }
+
+        st.slaEscalationLevel = nextLevel;
+        const meta = computeSlaMeta(st.slaDeadlineAt);
+        st.slaRemainingMs = meta.slaRemainingMs;
+        st.slaOverdue = meta.slaOverdue;
+
+        if (nextLevel !== prevLevel){
+          st.priority = nextPriority;
+          st.escalatedAt = nowIso();
+          st.tags = Array.isArray(st.tags) ? st.tags : [];
+          if (!st.tags.includes('sla_escalated')) st.tags.push('sla_escalated');
+          const txId = st.txId || (caseId.startsWith('CASE-') ? caseId.slice(5) : null);
+
+          await logSystemIssueAction(caseId, txId, 'auto_escalate_overdue',
+            `Auto escalated to ${nextPriority} (level ${nextLevel}) due to SLA overdue.`,
+            { nextStatus: st.status }
+          );
+        }
+
+        try { await dbUpsertIssueCase(st); } catch(e){}
+      }
+    }catch(e){}
+  }
+
+  // Run every 5 minutes (lightweight)
+  setInterval(runSlaEscalationSweep, 5*60*1000);
+  setTimeout(runSlaEscalationSweep, 15*1000);
+
+
   const issueActions = globalThis.__tpIssueActions || (globalThis.__tpIssueActions = []); // append-only action log
 
   function issuesTxs(){ return (typeof transactions !== 'undefined' && Array.isArray(transactions)) ? transactions : (globalThis.transactions||[]); }
