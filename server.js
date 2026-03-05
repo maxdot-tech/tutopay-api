@@ -707,7 +707,7 @@ app.post("/api/callbacks/airtel/collection", (req, res) => processProviderCallba
 // ===== Dispute document uploads (Multer) =====
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+  fs.mkdirSync(uploadDir);
 }
 
 const disputeUpload = multer({
@@ -751,12 +751,7 @@ function saveDataUrlToUploads(dataUrl, prefix = "item") {
   const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
   const filename = `${prefix}-${unique}.${ext}`;
   const fp = path.join(uploadDir, filename);
-  try {
-    fs.writeFileSync(fp, buf);
-  } catch (e) {
-    console.error('[uploads] write failed', e && e.message ? e.message : e);
-    return "";
-  }
+  fs.writeFileSync(fp, buf);
   return `/uploads/${filename}`;
 }
 
@@ -2088,7 +2083,6 @@ if (!it) return res.status(404).json({ error: "Item not found" });
 });
 
 app.post("/api/items", requireAuth, (req, res) => {
-  try {
     const {
   title,
   details,
@@ -2160,11 +2154,6 @@ const cache = new Map();
 
   items.push(item);
   res.status(201).json(item);
-  } catch (e) {
-    console.error('[api/items] create failed', e && e.message ? e.message : e);
-    return res.status(500).json({ error: "Create item failed", details: String(e && e.message ? e.message : e) });
-  }
-
 });
 
 // Public: catalogue for a given seller
@@ -2486,7 +2475,6 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
 
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
   return res.json(tx);
-
 });
 
 app.post("/api/transactions/:id/payment/requery", requireAuth, requeryLimiter, idempotencyMiddleware, async (req, res) => {
@@ -3662,195 +3650,275 @@ const server =
   });
 
 // ---- Step 8A exports (CSV) ----
-app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, (req, res) => {
+
+function parseFromTo(req){
+  const fromRaw = req.query.from ? String(req.query.from).trim() : '';
+  const toRaw = req.query.to ? String(req.query.to).trim() : '';
+  let fromD = null, toD = null;
+  if (fromRaw){
+    fromD = new Date(fromRaw.length===10 ? (fromRaw+'T00:00:00.000Z') : fromRaw);
+    if (isNaN(fromD.getTime())) fromD = null;
+  }
+  if (toRaw){
+    toD = new Date(toRaw.length===10 ? (toRaw+'T23:59:59.999Z') : toRaw);
+    if (isNaN(toD.getTime())) toD = null;
+  }
+  return { fromD, toD };
+}
+app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
 
-  const q = req.query || {};
-  const from = q.from ? Date.parse(String(q.from)) : null;
-  const to = q.to ? Date.parse(String(q.to)) : null;
-  const status = q.status ? String(q.status).trim().toLowerCase() : null;
-  const assignedTo = q.assignedTo ? String(q.assignedTo).trim() : null;
-  const outcome = q.outcome ? String(q.outcome).trim().toLowerCase() : null;
-  const priority = q.priority ? String(q.priority).trim().toLowerCase() : null;
+  const { fromD, toD } = parseFromTo(req);
+  const statusQ = String(req.query.status || '').trim().toLowerCase();
+  const assignedQ = String(req.query.assignedTo || '').trim();
+  const priorityQ = String(req.query.priority || '').trim().toLowerCase();
+  const outcomeQ = normalizeOutcome(req.query.outcome);
 
-  let rows = issueCaseList();
+  let rows = [];
+  try{
+    if (_pgPool){
+      const params = [];
+      let where = 'WHERE 1=1';
+      if (fromD){ params.push(fromD.toISOString()); where += ` AND (updated_at >= $${params.length} OR created_at >= $${params.length})`; }
+      if (toD){ params.push(toD.toISOString()); where += ` AND (updated_at <= $${params.length} OR created_at <= $${params.length})`; }
+      if (statusQ){ params.push(statusQ); where += ` AND status = $${params.length}`; }
+      if (assignedQ){ params.push(assignedQ); where += ` AND assigned_to = $${params.length}`; }
+      if (priorityQ){ params.push(priorityQ); where += ` AND priority = $${params.length}`; }
+      if (outcomeQ){ params.push(outcomeQ); where += ` AND executed_outcome = $${params.length}`; }
 
-  rows = rows.filter(r => {
-    const createdMs = r.createdAt ? Date.parse(String(r.createdAt)) : NaN;
-    const updatedMs = r.updatedAt ? Date.parse(String(r.updatedAt)) : NaN;
-    const t = isNaN(updatedMs) ? createdMs : updatedMs;
-
-    if (from && !isNaN(t) && t < from) return false;
-    if (to && !isNaN(t) && t > to) return false;
-
-    if (status && String(r.status||'').toLowerCase() !== status) return false;
-    if (priority && String(r.priority||'').toLowerCase() !== priority) return false;
-
-    if (assignedTo && String(r.assignedTo||'') !== assignedTo) return false;
-
-    if (outcome) {
-      const recOut = r.recommendation && r.recommendation.outcome ? String(r.recommendation.outcome).toLowerCase() : '';
-      const apprAct = r.approval && r.approval.actionType ? String(r.approval.actionType).toLowerCase() : '';
-      const finalOut =
-        apprAct.includes('refund') ? 'refund' :
-        apprAct.includes('reject') ? 'reject' :
-        recOut || '';
-      if (finalOut !== outcome) return false;
+      const q = `
+        SELECT case_id, tx_id, status, priority, assigned_to, assigned_at,
+               sla_hours, sla_deadline_at, sla_remaining_ms, sla_overdue,
+               buyer_phone, seller_phone, amount, currency, reason_code,
+               docs_count, executed_outcome, closed_at,
+               created_at, updated_at
+        FROM tutopay_issue_cases
+        ${where}
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC
+        LIMIT 5000
+      `;
+      const r = await _pgPool.query(q, params);
+      rows = (r.rows || []).map(x => ({
+        caseId: x.case_id, txId: x.tx_id,
+        status: x.status, priority: x.priority,
+        assignedTo: x.assigned_to, assignedAt: x.assigned_at,
+        slaHours: x.sla_hours, slaDeadlineAt: x.sla_deadline_at,
+        slaRemainingMs: x.sla_remaining_ms, slaOverdue: x.sla_overdue,
+        buyerPhone: x.buyer_phone, sellerPhone: x.seller_phone,
+        amount: x.amount, currency: x.currency,
+        reasonCode: x.reason_code, docsCount: x.docs_count,
+        executedOutcome: x.executed_outcome, closedAt: x.closed_at,
+        createdAt: x.created_at, updatedAt: x.updated_at
+      }));
+    } else {
+      rows = issueCaseList();
+      rows = rows.filter(r => {
+        if (!inRange(r.updatedAt || r.createdAt, fromD, toD)) return false;
+        if (statusQ && String(r.status||'').toLowerCase() !== statusQ) return false;
+        if (assignedQ && String(r.assignedTo||'') !== assignedQ) return false;
+        if (priorityQ && String(r.priority||'').toLowerCase() !== priorityQ) return false;
+        if (outcomeQ && String(r.executedOutcome||'') !== outcomeQ) return false;
+        return true;
+      });
     }
+  }catch(e){
+    console.error('[export issues] failed', e);
+    return res.status(500).json({ error: 'Export issues failed' });
+  }
 
-    return true;
-  });
-
-  const header = [
-    'caseId','txId','status','priority','assignedTo','assignedAt','slaDeadlineAt','createdAt','updatedAt',
-    'buyerPhone','sellerPhone','amount','currency','reasonCode','docsCount',
-    'recOutcome','recBy','recAt',
-    'adminDecision','adminBy','adminAt'
-  ].join(',');
-
-  const csv = [header].concat(rows.map(r => {
-    const recOutcome = r.recommendation && r.recommendation.outcome ? r.recommendation.outcome : '';
-    const recBy = r.recommendation && (r.recommendation.byPhone || r.recommendation.by) ? (r.recommendation.byPhone || r.recommendation.by) : '';
-    const recAt = r.recommendation && (r.recommendation.at || r.recommendation.createdAt) ? (r.recommendation.at || r.recommendation.createdAt) : '';
-    const adminDecision = r.approval && r.approval.actionType ? r.approval.actionType : '';
-    const adminBy = r.approval && r.approval.byPhone ? r.approval.byPhone : '';
-    const adminAt = r.approval && r.approval.at ? r.approval.at : '';
-
-    return [
-      r.caseId, r.txId, r.status, r.priority, r.assignedTo||'', r.assignedAt||'', r.slaDeadlineAt||'', r.createdAt||'', r.updatedAt||'',
-      r.buyerPhone||'', r.sellerPhone||'', r.amount||0, r.currency||'', (r.reasonCode||'').replace(/,/g,' '), r.docsCount||0,
-      (recOutcome||'').replace(/,/g,' '), recBy||'', recAt||'',
-      (adminDecision||'').replace(/,/g,' '), adminBy||'', adminAt||''
-    ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(',');
-  })).join('\n');
+  const header = ['caseId','txId','status','priority','assignedTo','assignedAt','slaHours','slaDeadlineAt','slaRemainingMs','slaOverdue','createdAt','updatedAt','buyerPhone','sellerPhone','amount','currency','reasonCode','docsCount','executedOutcome','closedAt'].join(',');
+  const csv = [header].concat(rows.map(r => [
+    r.caseId, r.txId, r.status, r.priority, r.assignedTo||'', r.assignedAt||'',
+    r.slaHours||'', r.slaDeadlineAt||'', (r.slaRemainingMs ?? ''), (r.slaOverdue ?? ''),
+    r.createdAt||'', r.updatedAt||'',
+    r.buyerPhone||'', r.sellerPhone||'', r.amount||0, r.currency||'',
+    (r.reasonCode||'').replace(/,/g,' '), r.docsCount||0,
+    r.executedOutcome||'', r.closedAt||''
+  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
 
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues.csv"');
-  res.send(csv);
+  res.end(csv);
 });
 
 
-app.get('/api/admin/export/issues-actions.csv', requireAuth, requireIssuesDesk, (req, res) => {
+app.get('/api/admin/export/issues-actions.csv', requireAuth, requireIssuesDesk, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
 
-  const q = req.query || {};
-  const from = q.from ? Date.parse(String(q.from)) : null;
-  const to = q.to ? Date.parse(String(q.to)) : null;
-  const caseId = q.caseId ? String(q.caseId).trim() : null;
-  const txId = q.txId ? String(q.txId).trim() : null;
-  const actionType = q.actionType ? String(q.actionType).trim().toLowerCase() : null;
-  const actorPhone = q.actorPhone ? String(q.actorPhone).trim() : null;
+  const { fromD, toD } = parseFromTo(req);
+  const caseIdQ = String(req.query.caseId || '').trim();
+  const actorQ = String(req.query.actorPhone || '').trim();
 
-  let rows = (issueActions||[]).slice().reverse();
+  let rows = [];
+  try{
+    if (_pgPool){
+      const params = [];
+      let where = 'WHERE 1=1';
+      if (fromD){ params.push(fromD.toISOString()); where += ` AND ts >= $${params.length}`; }
+      if (toD){ params.push(toD.toISOString()); where += ` AND ts <= $${params.length}`; }
+      if (caseIdQ){ params.push(caseIdQ); where += ` AND case_id = $${params.length}`; }
+      if (actorQ){ params.push(actorQ); where += ` AND actor_phone = $${params.length}`; }
 
-  rows = rows.filter(a => {
-    const t = a.timestamp ? Date.parse(String(a.timestamp)) : NaN;
-    if (from && !isNaN(t) && t < from) return false;
-    if (to && !isNaN(t) && t > to) return false;
-
-    if (caseId && String(a.caseId||'') !== caseId) return false;
-    if (txId && String(a.txId||'') !== txId) return false;
-    if (actorPhone && String(a.actorPhone||a.byPhone||'') !== actorPhone) return false;
-
-    if (actionType && String(a.actionType||'').toLowerCase() !== actionType) return false;
-
-    return true;
-  });
+      const q = `
+        SELECT id, ts, case_id, tx_id, action_type, policy_code, next_status, actor_phone, actor_role, note
+        FROM tutopay_issue_actions
+        ${where}
+        ORDER BY ts DESC
+        LIMIT 20000
+      `;
+      const r = await _pgPool.query(q, params);
+      rows = (r.rows || []).map(a => ({
+        id: a.id, timestamp: a.ts, caseId: a.case_id, txId: a.tx_id,
+        actionType: a.action_type, policyCode: a.policy_code,
+        nextStatus: a.next_status, actorPhone: a.actor_phone, actorRole: a.actor_role,
+        note: a.note
+      }));
+    } else {
+      rows = (issueActions||[]).slice();
+      rows.sort((a,b)=> (Date.parse(b.timestamp||b.ts||0)||0)-(Date.parse(a.timestamp||a.ts||0)||0));
+      rows = rows.filter(a=>{
+        const ts = a.timestamp || a.ts || a.createdAt;
+        if (!inRange(ts, fromD, toD)) return false;
+        if (caseIdQ && String(a.caseId||a.case_id||'') !== caseIdQ) return false;
+        if (actorQ && String(a.actorPhone||'') !== actorQ) return false;
+        return true;
+      });
+    }
+  }catch(e){
+    console.error('[export actions] failed', e);
+    return res.status(500).json({ error: 'Export actions failed' });
+  }
 
   const header = ['id','caseId','txId','timestamp','actionType','policyCode','nextStatus','actorPhone','actorRole','note'].join(',');
   const csv = [header].concat(rows.map(a => [
-    a.id||'', a.caseId||'', a.txId||'', a.timestamp||'', a.actionType||'', a.policyCode||'', a.nextStatus||'',
-    (a.actorPhone||a.byPhone||''), (a.actorRole||a.byRole||''), (a.note||'').replace(/\r?\n/g,' ')
+    a.id||'', a.caseId||'', a.txId||'', a.timestamp||'',
+    a.actionType||'', a.policyCode||'', a.nextStatus||'',
+    a.actorPhone||'', a.actorRole||'', (a.note||'').replace(/\s+/g,' ').trim()
   ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
 
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues-actions.csv"');
-  res.send(csv);
+  res.end(csv);
 });
 
 
-app.get('/api/admin/export/incidents.csv', requireAuth, (req,res) => {
+app.get('/api/admin/export/incidents.csv', requireAuth, requireIssuesDesk, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
 
-  const q = req.query || {};
-  const from = q.from ? Date.parse(String(q.from)) : null;
-  const to = q.to ? Date.parse(String(q.to)) : null;
-  const status = q.status ? String(q.status).trim().toLowerCase() : null;
-  const severity = q.severity ? String(q.severity).trim().toLowerCase() : null;
-  const category = q.category ? String(q.category).trim().toLowerCase() : null;
-  const createdBy = q.createdBy ? String(q.createdBy).trim() : null;
+  const { fromD, toD } = parseFromTo(req);
+  const severityQ = String(req.query.severity || '').trim().toLowerCase();
+  const categoryQ = String(req.query.category || '').trim().toLowerCase();
 
-  let rows = (complianceIncidents||[]).slice().reverse();
+  let rows = [];
+  try{
+    if (_pgPool){
+      const params = [];
+      let where = 'WHERE 1=1';
+      if (fromD){ params.push(fromD.toISOString()); where += ` AND ts >= $${params.length}`; }
+      if (toD){ params.push(toD.toISOString()); where += ` AND ts <= $${params.length}`; }
+      if (severityQ){ params.push(severityQ); where += ` AND severity = $${params.length}`; }
+      if (categoryQ){ params.push(categoryQ); where += ` AND category = $${params.length}`; }
 
-  rows = rows.filter(i => {
-    const t = i.createdAt ? Date.parse(String(i.createdAt)) : NaN;
-    if (from && !isNaN(t) && t < from) return false;
-    if (to && !isNaN(t) && t > to) return false;
-    if (status && String(i.status||'').toLowerCase() !== status) return false;
-    if (severity && String(i.severity||'').toLowerCase() !== severity) return false;
-    if (category && String(i.category||'').toLowerCase() !== category) return false;
-    if (createdBy && String(i.createdBy||'') !== createdBy) return false;
-    return true;
-  });
+      const q = `
+        SELECT id, ts, category, severity, title, summary, case_id, tx_id
+        FROM tutopay_incidents
+        ${where}
+        ORDER BY ts DESC
+        LIMIT 20000
+      `;
+      const r = await _pgPool.query(q, params);
+      rows = (r.rows || []).map(x => ({
+        id:x.id, ts:x.ts, category:x.category, severity:x.severity,
+        title:x.title, summary:x.summary, linkedCaseId:x.case_id, linkedTxId:x.tx_id
+      }));
+    } else {
+      rows = (incidents||[]).slice();
+      rows.sort((a,b)=> (Date.parse(b.ts||b.timestamp||0)||0) - (Date.parse(a.ts||a.timestamp||0)||0));
+      rows = rows.filter(x=>{
+        const ts = x.ts || x.timestamp;
+        if (!inRange(ts, fromD, toD)) return false;
+        if (severityQ && String(x.severity||x.data?.severity||'').toLowerCase() !== severityQ) return false;
+        if (categoryQ && String(x.category||x.data?.category||'').toLowerCase() !== categoryQ) return false;
+        return true;
+      }).map(x=>{
+        const d = x.data || x;
+        return { id:x.id||d.id, ts:x.ts||d.ts, category:d.category, severity:d.severity, title:d.title, summary:d.summary||d.note, linkedCaseId:d.caseId, linkedTxId:d.txId };
+      });
+    }
+  }catch(e){
+    console.error('[export incidents] failed', e);
+    return res.status(500).json({ error: 'Export incidents failed' });
+  }
 
-  const header = ['id','createdAt','severity','category','status','createdBy','title','description'].join(',');
-  const csv = [header].concat(rows.map(i => [
-    i.id||'', i.createdAt||'', i.severity||'', i.category||'', i.status||'', i.createdBy||'',
-    (i.title||'').replace(/,/g,' '), (i.description||'').replace(/\r?\n/g,' ')
+  const header = ['id','ts','category','severity','title','summary','linkedCaseId','linkedTxId'].join(',');
+  const csv = [header].concat(rows.map(x => [
+    x.id||'', x.ts||'', x.category||'', x.severity||'',
+    (x.title||'').replace(/,/g,' '),
+    (x.summary||'').replace(/\s+/g,' ').replace(/,/g,' ').trim(),
+    x.linkedCaseId||'', x.linkedTxId||''
   ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
 
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-incidents.csv"');
-  res.send(csv);
+  res.end(csv);
 });
 
-app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireAdmin, (req,res) => {
-  const q = req.query || {};
-  const from = q.from ? Date.parse(String(q.from)) : null;
-  const to = q.to ? Date.parse(String(q.to)) : null;
-  const outcome = q.outcome ? String(q.outcome).trim().toLowerCase() : null; // refund|reject
-  const byPhone = q.byPhone ? String(q.byPhone).trim() : null;
+app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).send('Admin only');
 
-  let rows = issueCaseList().filter(r => r && r.approval && r.approval.actionType);
+  const { fromD, toD } = parseFromTo(req);
+  const outcomeQ = normalizeOutcome(req.query.outcome);
+  const byPhoneQ = String(req.query.byPhone || '').trim();
 
-  rows = rows.filter(r => {
-    const at = r.approval && r.approval.at ? Date.parse(String(r.approval.at)) : NaN;
-    if (from && !isNaN(at) && at < from) return false;
-    if (to && !isNaN(at) && at > to) return false;
+  let rows = [];
+  try{
+    if (_pgPool){
+      const params = [];
+      let where = "WHERE action_type LIKE 'admin_execute_%'";
+      if (fromD){ params.push(fromD.toISOString()); where += ` AND ts >= $${params.length}`; }
+      if (toD){ params.push(toD.toISOString()); where += ` AND ts <= $${params.length}`; }
+      if (byPhoneQ){ params.push(byPhoneQ); where += ` AND actor_phone = $${params.length}`; }
 
-    if (byPhone && String(r.approval.byPhone||'') !== byPhone) return false;
-
-    if (outcome) {
-      const act = String(r.approval.actionType||'').toLowerCase();
-      const out = act.includes('refund') ? 'refund' : (act.includes('reject') ? 'reject' : '');
-      if (out !== outcome) return false;
+      const q = `
+        SELECT ts, case_id, tx_id, action_type, policy_code, actor_phone, note
+        FROM tutopay_issue_actions
+        ${where}
+        ORDER BY ts DESC
+        LIMIT 20000
+      `;
+      const r = await _pgPool.query(q, params);
+      rows = (r.rows || []).map(a => ({
+        timestamp: a.ts, caseId: a.case_id, txId: a.tx_id,
+        outcome: normalizeOutcome(a.action_type),
+        policyCode: a.policy_code, adminPhone: a.actor_phone, note: a.note
+      }));
+    } else {
+      rows = (issueActions||[]).slice().filter(a => String(a.actionType||a.action_type||'').startsWith('admin_execute_'))
+        .map(a => ({
+          timestamp: a.timestamp||a.ts||'',
+          caseId: a.caseId||a.case_id||'',
+          txId: a.txId||a.tx_id||'',
+          outcome: normalizeOutcome(a.actionType||a.action_type),
+          policyCode: a.policyCode||a.policy_code||'',
+          adminPhone: a.actorPhone||'',
+          note: a.note||''
+        }));
     }
-    return true;
-  });
+    if (outcomeQ) rows = rows.filter(r => r.outcome === outcomeQ);
+  }catch(e){
+    console.error('[export approvals] failed', e);
+    return res.status(500).json({ error: 'Export approvals failed' });
+  }
 
-  const header = [
-    'caseId','txId','status_before','status_after',
-    'ra_recommended_outcome','ra_by','ra_at',
-    'admin_actionType','admin_policyCode','admin_note','admin_by','admin_at'
-  ].join(',');
-
-  const csv = [header].concat(rows.map(r => {
-    const recOutcome = r.recommendation && r.recommendation.outcome ? r.recommendation.outcome : '';
-    const recBy = r.recommendation && (r.recommendation.byPhone || r.recommendation.by) ? (r.recommendation.byPhone || r.recommendation.by) : '';
-    const recAt = r.recommendation && (r.recommendation.at || r.recommendation.createdAt) ? (r.recommendation.at || r.recommendation.createdAt) : '';
-    const appr = r.approval || {};
-    return [
-      r.caseId, r.txId,
-      '', String(r.status||''),  // status_before not tracked consistently; kept blank
-      (recOutcome||'').replace(/,/g,' '), recBy||'', recAt||'',
-      appr.actionType||'', appr.policyCode||'', (appr.note||'').replace(/\r?\n/g,' '),
-      appr.byPhone||'', appr.at||''
-    ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(',');
-  })).join('\n');
+  const header = ['timestamp','caseId','txId','outcome','policyCode','adminPhone','note'].join(',');
+  const csv = [header].concat(rows.map(a => [
+    a.timestamp||'', a.caseId||'', a.txId||'', a.outcome||'',
+    a.policyCode||'', a.adminPhone||'', (a.note||'').replace(/\s+/g,' ').replace(/,/g,' ').trim()
+  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
 
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues-approvals.csv"');
-  res.send(csv);
+  res.end(csv);
 });
 
 
