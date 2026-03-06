@@ -86,6 +86,16 @@ function createRateLimiter({ windowMs, max, keyFn, message }) {
   };
 }
 
+function normalizeOutcome(v){
+  const s = String(v || '').toLowerCase().trim();
+  if (!s) return '';
+  // Accept either outcome words or actionType prefixes
+  if (s.includes('refund') || s.startsWith('admin_execute_refund')) return 'refund';
+  if (s.includes('reject') || s.startsWith('admin_execute_reject')) return 'reject';
+  if (s.includes('hold') || s.startsWith('admin_execute_hold')) return 'hold';
+  return s;
+}
+
 // Limiters (tuned for public demo)
 const loginLimiter = createRateLimiter({
   windowMs: 60 * 1000,
