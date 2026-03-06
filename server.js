@@ -86,16 +86,6 @@ function createRateLimiter({ windowMs, max, keyFn, message }) {
   };
 }
 
-function normalizeOutcome(v){
-  const s = String(v || '').toLowerCase().trim();
-  if (!s) return '';
-  // Accept either outcome words or actionType prefixes
-  if (s.includes('refund') || s.startsWith('admin_execute_refund')) return 'refund';
-  if (s.includes('reject') || s.startsWith('admin_execute_reject')) return 'reject';
-  if (s.includes('hold') || s.startsWith('admin_execute_hold')) return 'hold';
-  return s;
-}
-
 // Limiters (tuned for public demo)
 const loginLimiter = createRateLimiter({
   windowMs: 60 * 1000,
@@ -3701,6 +3691,15 @@ function parseFromTo(req){
     if (isNaN(toD.getTime())) toD = null;
   }
   return { fromD, toD };
+}
+
+function normalizeOutcome(v){
+  const s = String(v || '').toLowerCase().trim();
+  if (!s) return '';
+  if (s.includes('refund') || s.startsWith('admin_execute_refund')) return 'refund';
+  if (s.includes('reject') || s.startsWith('admin_execute_reject')) return 'reject';
+  if (s.includes('hold') || s.startsWith('admin_execute_hold')) return 'hold';
+  return s;
 }
 app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
