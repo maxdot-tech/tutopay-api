@@ -1572,7 +1572,7 @@ users.push({
 
 ensureAdminUserSeed();
 // Auth middleware
-async function requireAuth(req, res, next) {
+async async function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const parts = auth.split(" ");
   let token = parts.length === 2 && parts[0] === "Bearer" ? parts[1] : null;
