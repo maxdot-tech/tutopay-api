@@ -23,33 +23,6 @@ const DEMO_MODE = (process.env.DEMO_MODE || "true").toLowerCase() === "true";
 const DEMO_BANNER_TEXT = process.env.DEMO_BANNER_TEXT || "DEMO MODE: Test environment only. No real funds are moved.";
 
 const app = express();
-
-// ===== CORS (for tutopay.online -> api.tutopay.online authenticated fetch downloads) =====
-const ALLOWED_ORIGINS = new Set([
-  'https://tutopay.online',
-  'http://tutopay.online',
-  'http://localhost:3000',
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
-  'http://localhost:8080'
-]);
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    // Allow browser JS to read filename headers for downloads
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Type');
-  }
-  if (req.method === 'OPTIONS') {
-    return res.status(204).end();
-  }
-  next();
-});
 const PORT = process.env.PORT || 4000;
 
 
@@ -3691,15 +3664,6 @@ function parseFromTo(req){
     if (isNaN(toD.getTime())) toD = null;
   }
   return { fromD, toD };
-}
-
-function normalizeOutcome(v){
-  const s = String(v || '').toLowerCase().trim();
-  if (!s) return '';
-  if (s.includes('refund') || s.startsWith('admin_execute_refund')) return 'refund';
-  if (s.includes('reject') || s.startsWith('admin_execute_reject')) return 'reject';
-  if (s.includes('hold') || s.startsWith('admin_execute_hold')) return 'hold';
-  return s;
 }
 app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
