@@ -931,6 +931,14 @@ async function dbEnsureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS tutopay_sessions (
+      token TEXT PRIMARY KEY,
+      data JSONB NOT NULL,
+      expires_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_tutopay_sessions_expires ON tutopay_sessions(expires_at);
     CREATE INDEX IF NOT EXISTS tutopay_items_code_idx ON tutopay_items(code);
     CREATE INDEX IF NOT EXISTS tutopay_audit_ts_idx ON tutopay_audit(ts);
     CREATE INDEX IF NOT EXISTS tutopay_ledger_ts_idx ON tutopay_ledger(ts);
@@ -1056,6 +1064,37 @@ async function dbLoadIntoMemory() {
   // Ensure demo admin exists even after DB load
   ensureAdminUserSeed();
 
+}
+
+
+async function dbUpsertSession(token, sessionObj) {
+  if (!_pgPool) return;
+  const expiresAtIso = sessionObj && sessionObj.expiresAt ? new Date(sessionObj.expiresAt).toISOString() : null;
+  await _pgPool.query(
+    `INSERT INTO tutopay_sessions (token, data, expires_at, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (token) DO UPDATE SET data = EXCLUDED.data, expires_at = EXCLUDED.expires_at, updated_at = NOW()`,
+    [String(token), sessionObj, expiresAtIso]
+  );
+}
+
+async function dbGetSession(token) {
+  if (!_pgPool) return null;
+  const r = await _pgPool.query(`SELECT token, data, expires_at FROM tutopay_sessions WHERE token = $1 LIMIT 1`, [String(token)]);
+  if (!r.rows || !r.rows.length) return null;
+  const row = r.rows[0];
+  const data = row.data || null;
+  if (!data) return null;
+  // normalize expiresAt for runtime checks
+  if (row.expires_at) {
+    try { data.expiresAt = new Date(row.expires_at).getTime(); } catch(e){}
+  }
+  return data;
+}
+
+async function dbDeleteSession(token) {
+  if (!_pgPool) return;
+  await _pgPool.query(`DELETE FROM tutopay_sessions WHERE token = $1`, [String(token)]);
 }
 
 async function dbUpsertUser(user) {
@@ -1533,7 +1572,7 @@ users.push({
 
 ensureAdminUserSeed();
 // Auth middleware
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const parts = auth.split(" ");
   let token = parts.length === 2 && parts[0] === "Bearer" ? parts[1] : null;
@@ -1544,13 +1583,25 @@ function requireAuth(req, res, next) {
     token = (q.export_token || q.token || null);
   }
 
-  if (!token || !sessions.has(token)) {
+  
+  // If running multiple instances, the in-memory session map may not have the token.
+  // Fallback to Postgres-backed sessions for consistency across instances.
+  if (token && !sessions.has(token) && dbEnabled()) {
+    try {
+      const s = await dbGetSession(token);
+      if (s) sessions.set(token, s);
+    } catch (e) {
+      // ignore DB lookup errors; will fail auth below
+    }
+  }
+
+if (!token || !sessions.has(token)) {
     return res.status(401).json({ error: "Not authenticated" });
   }
 
   const session = sessions.get(token);
   if (!session || (session.expiresAt && Date.now() > session.expiresAt)) {
-    if (token) sessions.delete(token);
+    if (token) { sessions.delete(token); if (dbEnabled()) { dbDeleteSession(token).catch(()=>{}); } }
     return res.status(401).json({ error: "Session expired. Please sign in again." });
   }
 
@@ -1857,6 +1908,7 @@ const token = crypto.randomBytes(24).toString("hex");
     kycStatus: user.kycStatus,
     expiresAt: Date.now() + SESSION_TTL_MS,
   });
+  if (dbEnabled()) { dbUpsertSession(token, sessions.get(token)).catch(()=>{}); }
 
   logAudit(req, "auth_login_success", {
   phone: user.phone,
