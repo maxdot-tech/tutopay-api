@@ -564,7 +564,7 @@ async function momoDisburseTransfer({ amount, currency, payeeMsisdn, externalId,
   ]);
 
   const token = await momoGetToken("disbursement");
-  const referenceId = uuidv4();
+  const referenceId = uuid();
 
   const url = `${process.env.MOMO_BASE_URL}/disbursement/v1_0/transfer`;
   const targetEnv = (process.env.MOMO_TARGET_ENV || "sandbox").trim();
@@ -1572,7 +1572,7 @@ users.push({
 
 ensureAdminUserSeed();
 // Auth middleware
-async async function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const parts = auth.split(" ");
   let token = parts.length === 2 && parts[0] === "Bearer" ? parts[1] : null;
@@ -3583,8 +3583,6 @@ app.use((err, req, res, next) => {
  * - Start HTTP listener immediately so Railway can hit /health.
  * - Initialize DB in the background; API routes are gated until dbReady=true.
  */
-const server = 
-
 /* ===== Step 6+7: Compliance pack + Issues Desk foundation (BoZ trial ops) ===== */
 (function(){
   // ---- Compliance docs + incidents (Step 6, included here so this file is self-contained) ----
@@ -4600,7 +4598,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
 })();
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`TutoPay API running on port ${PORT}`);
 });
 
