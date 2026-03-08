@@ -3941,6 +3941,8 @@ app.get('/api/admin/export/incidents.csv', requireAuth, requireIssuesDesk, async
   const { fromD, toD } = parseFromTo(req);
   const severityQ = String(req.query.severity || '').trim().toLowerCase();
   const categoryQ = String(req.query.category || '').trim().toLowerCase();
+  const incidentsArr = globalThis.__tpComplianceIncidents || [];
+  const complianceIncidents = globalThis.__tpComplianceIncidents || [];
 
   let rows = [];
   try{
@@ -3954,8 +3956,8 @@ app.get('/api/admin/export/incidents.csv', requireAuth, requireIssuesDesk, async
       `);
       merged.push(...(r.rows || []).map(normalizeIncidentRow));
     }
-    merged.push(...((incidentsArr||[]).slice()).map(normalizeIncidentRow));
-    merged.push(...((complianceIncidents||[]).slice()).map(normalizeIncidentRow));
+    merged.push(...(incidentsArr.slice()).map(normalizeIncidentRow));
+    merged.push(...(complianceIncidents.slice()).map(normalizeIncidentRow));
 
     rows = uniqueBy(merged, x => x.id || `${x.ts}|${x.category}|${x.title}|${x.linkedTxId}`)
       .filter(x => {
