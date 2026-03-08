@@ -736,7 +736,7 @@ const disputeUpload = multer({
 // Expose uploaded dispute docs (e.g. for admin review)
 app.use("/uploads", express.static(uploadDir));
 
-// ===== Item image helpers (convert base64 data URLs to real files in /uploads) =====
+// ===== Item image helpers (Cloudinary-first when configured; local /uploads fallback otherwise) =====
 function extFromMime(mime) {
   if (!mime) return "png";
   if (mime.includes("jpeg")) return "jpg";
@@ -744,6 +744,62 @@ function extFromMime(mime) {
   if (mime.includes("webp")) return "webp";
   if (mime.includes("gif")) return "gif";
   return "png";
+}
+
+function cloudinaryConfigured() {
+  return !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
+}
+
+function normalizeCloudinaryFolder(folder) {
+  return String(folder || "tutopay/catalogue")
+    .replace(/\\+/g, "/")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/[^a-zA-Z0-9/_-]+/g, "-") || "tutopay/catalogue";
+}
+
+function cloudinarySignature(params, apiSecret) {
+  const toSign = Object.keys(params)
+    .filter((k) => params[k] !== undefined && params[k] !== null && params[k] !== "")
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join("&");
+  return crypto.createHash("sha1").update(toSign + apiSecret).digest("hex");
+}
+
+async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
+  if (typeof dataUrl !== "string") return "";
+  if (!dataUrl.startsWith("data:")) return dataUrl;
+  if (!cloudinaryConfigured()) return "";
+
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+  const folder = normalizeCloudinaryFolder(opts.folder || "tutopay/catalogue");
+  const timestamp = Math.floor(Date.now() / 1000);
+  const publicId = `${String(opts.prefix || "item")}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+  const paramsToSign = { folder, public_id: publicId, timestamp };
+  const signature = cloudinarySignature(paramsToSign, apiSecret);
+
+  const form = new FormData();
+  form.append("file", dataUrl);
+  form.append("api_key", apiKey);
+  form.append("timestamp", String(timestamp));
+  form.append("folder", folder);
+  form.append("public_id", publicId);
+  form.append("signature", signature);
+
+  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+    method: "POST",
+    body: form,
+  });
+
+  let payload = null;
+  try { payload = await resp.json(); } catch (e) {}
+  if (!resp.ok || !payload || !payload.secure_url) {
+    const msg = payload && payload.error && payload.error.message ? payload.error.message : `Cloudinary upload failed (${resp.status})`;
+    throw new Error(msg);
+  }
+  return payload.secure_url;
 }
 
 function saveDataUrlToUploads(dataUrl, prefix = "item") {
@@ -760,6 +816,19 @@ function saveDataUrlToUploads(dataUrl, prefix = "item") {
   const fp = path.join(uploadDir, filename);
   fs.writeFileSync(fp, buf);
   return `/uploads/${filename}`;
+}
+
+async function persistImageDataUrl(dataUrl, opts = {}) {
+  if (typeof dataUrl !== "string") return "";
+  if (!dataUrl.startsWith("data:")) return dataUrl;
+  if (cloudinaryConfigured()) {
+    try {
+      return await uploadDataUrlToCloudinary(dataUrl, opts);
+    } catch (err) {
+      console.error("[cloudinary] upload failed, falling back to local uploads:", err && err.message ? err.message : err);
+    }
+  }
+  return saveDataUrlToUploads(dataUrl, String(opts.prefix || "item"));
 }
 
 function migrateItemImagesInPlace(item) {
@@ -2141,7 +2210,7 @@ if (!it) return res.status(404).json({ error: "Item not found" });
   res.json(it);
 });
 
-app.post("/api/items", requireAuth, (req, res) => {
+app.post("/api/items", requireAuth, async (req, res) => {
     const {
   title,
   details,
@@ -2182,19 +2251,22 @@ app.post("/api/items", requireAuth, (req, res) => {
   }
 
 const cache = new Map();
-  const convert = (u) => {
+  const convert = async (u) => {
     if (typeof u !== "string") return "";
     if (!u.startsWith("data:")) return u;
     if (cache.has(u)) return cache.get(u);
-    const saved = saveDataUrlToUploads(u, "item");
+    const saved = await persistImageDataUrl(u, {
+      prefix: "item",
+      folder: `tutopay/catalogue/${String(sellerPhone || "unknown").replace(/[^0-9A-Za-z_-]+/g, "-")}`
+    });
     cache.set(u, saved);
     return saved;
   };
 
   const urlsArray = Array.isArray(imageUrls) ? imageUrls.slice(0, 15) : [];
-  const convertedUrls = urlsArray.map(convert).filter(Boolean);
+  const convertedUrls = (await Promise.all(urlsArray.map(convert))).filter(Boolean);
   const firstUrl = imageUrl || (convertedUrls[0] || (urlsArray[0] || ""));
-  const convertedFirst = convert(firstUrl) || convertedUrls[0] || "";
+  const convertedFirst = (await convert(firstUrl)) || convertedUrls[0] || "";
 
   const item = {
     id: uuid(),
@@ -2212,6 +2284,7 @@ const cache = new Map();
   };
 
   items.push(item);
+  try { await dbUpsertItem(item); } catch (e) { console.error("[items] dbUpsertItem failed:", e && e.message ? e.message : e); }
   res.status(201).json(item);
 });
 
