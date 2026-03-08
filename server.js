@@ -3753,6 +3753,13 @@ function parseFromTo(req){
   }
   return { fromD, toD };
 }
+function inRange(ts, fromD, toD){
+  const ms = Date.parse(ts || "");
+  if (!Number.isFinite(ms)) return false;
+  if (fromD && ms < fromD.getTime()) return false;
+  if (toD && ms > toD.getTime()) return false;
+  return true;
+}
 function toMs(val){
   const ms = Date.parse(val || '');
   return Number.isFinite(ms) ? ms : 0;
@@ -3947,7 +3954,7 @@ app.get('/api/admin/export/incidents.csv', requireAuth, requireIssuesDesk, async
       `);
       merged.push(...(r.rows || []).map(normalizeIncidentRow));
     }
-    merged.push(...((incidents||[]).slice()).map(normalizeIncidentRow));
+    merged.push(...((incidentsArr||[]).slice()).map(normalizeIncidentRow));
     merged.push(...((complianceIncidents||[]).slice()).map(normalizeIncidentRow));
 
     rows = uniqueBy(merged, x => x.id || `${x.ts}|${x.category}|${x.title}|${x.linkedTxId}`)
