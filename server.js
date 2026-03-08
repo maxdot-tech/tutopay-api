@@ -3710,6 +3710,34 @@ const server =
 
 // ---- Step 8A exports (CSV) ----
 
+
+function normalizeOutcome(raw){
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return '';
+  const map = {
+    refund: 'refund',
+    refunded: 'refund',
+    approve_refund: 'refund',
+    approved_refund: 'refund',
+    admin_execute_refund: 'refund',
+    recommend_refund: 'refund',
+    reject: 'reject',
+    rejected: 'reject',
+    decline: 'reject',
+    declined: 'reject',
+    deny: 'reject',
+    denied: 'reject',
+    approve_reject: 'reject',
+    approved_reject: 'reject',
+    admin_execute_reject: 'reject',
+    recommend_reject: 'reject',
+    close: 'close',
+    closed: 'close',
+    close_case: 'close',
+    resolved: 'close'
+  };
+  return map[v] || v;
+}
 function parseFromTo(req){
   const fromRaw = req.query.from ? String(req.query.from).trim() : '';
   const toRaw = req.query.to ? String(req.query.to).trim() : '';
