@@ -3711,6 +3711,7 @@ const server =
 // ---- Step 8A exports (CSV) ----
 
 
+
 function normalizeOutcome(raw){
   const v = String(raw || '').trim().toLowerCase();
   if (!v) return '';
@@ -3752,6 +3753,79 @@ function parseFromTo(req){
   }
   return { fromD, toD };
 }
+function toMs(val){
+  const ms = Date.parse(val || '');
+  return Number.isFinite(ms) ? ms : 0;
+}
+function uniqueBy(rows, keyFn){
+  const out = [];
+  const seen = new Set();
+  for (const row of (rows || [])){
+    const key = String(keyFn(row) || '').trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+  }
+  return out;
+}
+function csvEscape(v){
+  return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+}
+function normalizeCaseRow(x){
+  const d = (x && x.data) ? x.data : (x || {});
+  const docs = Array.isArray(d.docs) ? d.docs : (Array.isArray(d.evidenceDocs) ? d.evidenceDocs : []);
+  return {
+    caseId: d.caseId || d.case_id || x.case_id || '',
+    txId: d.txId || d.tx_id || x.tx_id || '',
+    status: d.status || '',
+    priority: d.priority || '',
+    assignedTo: d.assignedTo || d.assigned_to || '',
+    assignedAt: d.assignedAt || d.assigned_at || '',
+    slaHours: d.slaHours ?? d.sla_hours ?? '',
+    slaDeadlineAt: d.slaDeadlineAt || d.sla_deadline_at || '',
+    slaRemainingMs: d.slaRemainingMs ?? d.sla_remaining_ms ?? '',
+    slaOverdue: d.slaOverdue ?? d.sla_overdue ?? '',
+    buyerPhone: d.buyerPhone || d.buyer_phone || '',
+    sellerPhone: d.sellerPhone || d.seller_phone || '',
+    amount: d.amount ?? 0,
+    currency: d.currency || '',
+    reasonCode: d.reasonCode || d.reason_code || '',
+    docsCount: d.docsCount ?? d.docs_count ?? docs.length ?? 0,
+    executedOutcome: normalizeOutcome(d.executedOutcome || d.executed_outcome || ''),
+    closedAt: d.closedAt || d.closed_at || '',
+    createdAt: d.createdAt || d.created_at || x.created_at || x.updated_at || '',
+    updatedAt: d.updatedAt || d.updated_at || x.updated_at || d.createdAt || d.created_at || ''
+  };
+}
+function normalizeActionRow(a){
+  const d = (a && a.data) ? a.data : (a || {});
+  return {
+    id: a.id || d.id || '',
+    timestamp: d.timestamp || d.ts || d.createdAt || d.updatedAt || a.ts || a.timestamp || a.created_at || a.updated_at || '',
+    caseId: d.caseId || d.case_id || a.case_id || a.caseId || '',
+    txId: d.txId || d.tx_id || a.tx_id || a.txId || '',
+    actionType: d.actionType || d.action_type || a.action_type || a.actionType || '',
+    policyCode: d.policyCode || d.policy_code || a.policy_code || a.policyCode || '',
+    nextStatus: d.nextStatus || d.next_status || a.next_status || a.nextStatus || '',
+    actorPhone: d.actorPhone || d.actor_phone || d.byPhone || d.by_phone || a.actor_phone || a.by_phone || '',
+    actorRole: d.actorRole || d.actor_role || d.byRole || d.by_role || a.actor_role || a.by_role || '',
+    note: d.note || d.summary || ''
+  };
+}
+function normalizeIncidentRow(x){
+  const d = (x && x.data) ? x.data : (x || {});
+  return {
+    id: d.id || x.id || '',
+    ts: d.ts || d.timestamp || d.createdAt || x.ts || x.timestamp || '',
+    category: d.category || '',
+    severity: d.severity || '',
+    title: d.title || d.eventType || d.type || '',
+    summary: d.summary || d.note || d.message || '',
+    linkedCaseId: d.caseId || d.case_id || '',
+    linkedTxId: d.txId || d.tx_id || ''
+  };
+}
+
 app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).send('Admin only');
 
@@ -3763,61 +3837,28 @@ app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, async (r
 
   let rows = [];
   try{
+    const merged = [];
     if (_pgPool){
-      const params = [];
-      let where = 'WHERE 1=1';
-      if (fromD){ params.push(fromD.toISOString()); where += ` AND updated_at >= $${params.length}`; }
-      if (toD){ params.push(toD.toISOString()); where += ` AND updated_at <= $${params.length}`; }
-      if (statusQ){ params.push(statusQ); where += ` AND lower(coalesce(data->>'status','')) = $${params.length}`; }
-      if (assignedQ){ params.push(assignedQ); where += ` AND coalesce(data->>'assignedTo', data->>'assigned_to','') = $${params.length}`; }
-      if (priorityQ){ params.push(priorityQ); where += ` AND lower(coalesce(data->>'priority','')) = $${params.length}`; }
-      if (outcomeQ){ params.push(outcomeQ); where += ` AND lower(coalesce(data->>'executedOutcome', data->>'executed_outcome','')) = $${params.length}`; }
-
-      const q = `
+      const r = await _pgPool.query(`
         SELECT case_id, tx_id, updated_at, data
         FROM tutopay_issue_cases
-        ${where}
         ORDER BY updated_at DESC
         LIMIT 5000
-      `;
-      const r = await _pgPool.query(q, params);
-      rows = (r.rows || []).map(x => {
-        const d = x.data || {};
-        const docs = Array.isArray(d.docs) ? d.docs : (Array.isArray(d.evidenceDocs) ? d.evidenceDocs : []);
-        return {
-          caseId: d.caseId || d.case_id || x.case_id,
-          txId: d.txId || d.tx_id || x.tx_id,
-          status: d.status || '',
-          priority: d.priority || '',
-          assignedTo: d.assignedTo || d.assigned_to || '',
-          assignedAt: d.assignedAt || d.assigned_at || '',
-          slaHours: d.slaHours ?? d.sla_hours ?? '',
-          slaDeadlineAt: d.slaDeadlineAt || d.sla_deadline_at || '',
-          slaRemainingMs: d.slaRemainingMs ?? d.sla_remaining_ms ?? '',
-          slaOverdue: d.slaOverdue ?? d.sla_overdue ?? '',
-          buyerPhone: d.buyerPhone || d.buyer_phone || '',
-          sellerPhone: d.sellerPhone || d.seller_phone || '',
-          amount: d.amount ?? 0,
-          currency: d.currency || '',
-          reasonCode: d.reasonCode || d.reason_code || '',
-          docsCount: d.docsCount ?? d.docs_count ?? docs.length ?? 0,
-          executedOutcome: d.executedOutcome || d.executed_outcome || '',
-          closedAt: d.closedAt || d.closed_at || '',
-          createdAt: d.createdAt || d.created_at || '',
-          updatedAt: d.updatedAt || d.updated_at || x.updated_at || ''
-        };
-      });
-    } else {
-      rows = issueCaseList();
-      rows = rows.filter(r => {
+      `);
+      merged.push(...(r.rows || []).map(normalizeCaseRow));
+    }
+    merged.push(...issueCaseList().map(normalizeCaseRow));
+
+    rows = uniqueBy(merged, r => r.caseId || `${r.txId}|${r.updatedAt}`)
+      .filter(r => {
         if (!inRange(r.updatedAt || r.createdAt, fromD, toD)) return false;
         if (statusQ && String(r.status||'').toLowerCase() !== statusQ) return false;
         if (assignedQ && String(r.assignedTo||'') !== assignedQ) return false;
         if (priorityQ && String(r.priority||'').toLowerCase() !== priorityQ) return false;
-        if (outcomeQ && String(r.executedOutcome||'') !== outcomeQ) return false;
+        if (outcomeQ && normalizeOutcome(r.executedOutcome||'') !== outcomeQ) return false;
         return true;
-      });
-    }
+      })
+      .sort((a,b)=> toMs(b.updatedAt||b.createdAt)-toMs(a.updatedAt||a.createdAt));
   }catch(e){
     console.error('[export issues] failed', e);
     return res.status(500).json({ error: 'Export issues failed' });
@@ -3831,7 +3872,7 @@ app.get('/api/admin/export/issues.csv', requireAuth, requireIssuesDesk, async (r
     r.buyerPhone||'', r.sellerPhone||'', r.amount||0, r.currency||'',
     (r.reasonCode||'').replace(/,/g,' '), r.docsCount||0,
     r.executedOutcome||'', r.closedAt||''
-  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+  ].map(csvEscape).join(','))).join('\n');
 
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues.csv"');
@@ -3848,48 +3889,27 @@ app.get('/api/admin/export/issues-actions.csv', requireAuth, requireIssuesDesk, 
 
   let rows = [];
   try{
+    const merged = [];
     if (_pgPool){
-      const params = [];
-      let where = 'WHERE 1=1';
-      if (fromD){ params.push(fromD.toISOString()); where += ` AND ts >= $${params.length}`; }
-      if (toD){ params.push(toD.toISOString()); where += ` AND ts <= $${params.length}`; }
-      if (caseIdQ){ params.push(caseIdQ); where += ` AND case_id = $${params.length}`; }
-      if (actorQ){ params.push(actorQ); where += ` AND coalesce(data->>'actorPhone', data->>'actor_phone','') = $${params.length}`; }
-
-      const q = `
+      const r = await _pgPool.query(`
         SELECT id, ts, case_id, tx_id, action_type, policy_code, data
         FROM tutopay_issue_actions
-        ${where}
         ORDER BY ts DESC
         LIMIT 20000
-      `;
-      const r = await _pgPool.query(q, params);
-      rows = (r.rows || []).map(a => {
-        const d = a.data || {};
-        return {
-          id: a.id,
-          timestamp: d.timestamp || d.ts || a.ts,
-          caseId: d.caseId || d.case_id || a.case_id,
-          txId: d.txId || d.tx_id || a.tx_id,
-          actionType: d.actionType || d.action_type || a.action_type,
-          policyCode: d.policyCode || d.policy_code || a.policy_code,
-          nextStatus: d.nextStatus || d.next_status || '',
-          actorPhone: d.actorPhone || d.actor_phone || '',
-          actorRole: d.actorRole || d.actor_role || '',
-          note: d.note || ''
-        };
-      });
-    } else {
-      rows = (issueActions||[]).slice();
-      rows.sort((a,b)=> (Date.parse(b.timestamp||b.ts||0)||0)-(Date.parse(a.timestamp||a.ts||0)||0));
-      rows = rows.filter(a=>{
-        const ts = a.timestamp || a.ts || a.createdAt;
-        if (!inRange(ts, fromD, toD)) return false;
-        if (caseIdQ && String(a.caseId||a.case_id||'') !== caseIdQ) return false;
-        if (actorQ && String(a.actorPhone||a.actor_phone||'') !== actorQ) return false;
-        return true;
-      });
+      `);
+      merged.push(...(r.rows || []).map(normalizeActionRow));
     }
+    merged.push(...((issueActions||[]).slice()).map(normalizeActionRow));
+
+    rows = uniqueBy(merged, a => a.id || `${a.caseId}|${a.txId}|${a.timestamp}|${a.actionType}|${a.note}`)
+      .filter(a => {
+        const ts = a.timestamp || a.createdAt;
+        if (!inRange(ts, fromD, toD)) return false;
+        if (caseIdQ && String(a.caseId||'') !== caseIdQ) return false;
+        if (actorQ && String(a.actorPhone||'') !== actorQ) return false;
+        return true;
+      })
+      .sort((a,b)=> toMs(b.timestamp)-toMs(a.timestamp));
   }catch(e){
     console.error('[export actions] failed', e);
     return res.status(500).json({ error: 'Export actions failed' });
@@ -3900,7 +3920,7 @@ app.get('/api/admin/export/issues-actions.csv', requireAuth, requireIssuesDesk, 
     a.id||'', a.caseId||'', a.txId||'', a.timestamp||'',
     a.actionType||'', a.policyCode||'', a.nextStatus||'',
     a.actorPhone||'', a.actorRole||'', (a.note||'').replace(/\s+/g,' ').trim()
-  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+  ].map(csvEscape).join(','))).join('\n');
 
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues-actions.csv"');
@@ -3917,49 +3937,27 @@ app.get('/api/admin/export/incidents.csv', requireAuth, requireIssuesDesk, async
 
   let rows = [];
   try{
+    const merged = [];
     if (_pgPool){
-      const params = [];
-      let where = 'WHERE 1=1';
-      if (fromD){ params.push(fromD.toISOString()); where += ` AND ts >= $${params.length}`; }
-      if (toD){ params.push(toD.toISOString()); where += ` AND ts <= $${params.length}`; }
-      if (severityQ){ params.push(severityQ); where += ` AND lower(coalesce(data->>'severity','')) = $${params.length}`; }
-      if (categoryQ){ params.push(categoryQ); where += ` AND lower(coalesce(data->>'category','')) = $${params.length}`; }
-
-      const q = `
+      const r = await _pgPool.query(`
         SELECT id, ts, data
         FROM tutopay_incidents
-        ${where}
         ORDER BY ts DESC
         LIMIT 20000
-      `;
-      const r = await _pgPool.query(q, params);
-      rows = (r.rows || []).map(x => {
-        const d = x.data || {};
-        return {
-          id: d.id || x.id,
-          ts: d.ts || d.timestamp || d.createdAt || x.ts,
-          category: d.category || '',
-          severity: d.severity || '',
-          title: d.title || '',
-          summary: d.summary || d.note || '',
-          linkedCaseId: d.caseId || d.case_id || '',
-          linkedTxId: d.txId || d.tx_id || ''
-        };
-      });
-    } else {
-      rows = (incidents||[]).slice();
-      rows.sort((a,b)=> (Date.parse(b.ts||b.timestamp||0)||0) - (Date.parse(a.ts||a.timestamp||0)||0));
-      rows = rows.filter(x=>{
-        const ts = x.ts || x.timestamp;
-        if (!inRange(ts, fromD, toD)) return false;
-        if (severityQ && String(x.severity||x.data?.severity||'').toLowerCase() !== severityQ) return false;
-        if (categoryQ && String(x.category||x.data?.category||'').toLowerCase() !== categoryQ) return false;
-        return true;
-      }).map(x=>{
-        const d = x.data || x;
-        return { id:x.id||d.id, ts:x.ts||d.ts, category:d.category, severity:d.severity, title:d.title, summary:d.summary||d.note, linkedCaseId:d.caseId, linkedTxId:d.txId };
-      });
+      `);
+      merged.push(...(r.rows || []).map(normalizeIncidentRow));
     }
+    merged.push(...((incidents||[]).slice()).map(normalizeIncidentRow));
+    merged.push(...((complianceIncidents||[]).slice()).map(normalizeIncidentRow));
+
+    rows = uniqueBy(merged, x => x.id || `${x.ts}|${x.category}|${x.title}|${x.linkedTxId}`)
+      .filter(x => {
+        if (!inRange(x.ts, fromD, toD)) return false;
+        if (severityQ && String(x.severity||'').toLowerCase() !== severityQ) return false;
+        if (categoryQ && String(x.category||'').toLowerCase() !== categoryQ) return false;
+        return true;
+      })
+      .sort((a,b)=> toMs(b.ts)-toMs(a.ts));
   }catch(e){
     console.error('[export incidents] failed', e);
     return res.status(500).json({ error: 'Export incidents failed' });
@@ -3971,7 +3969,7 @@ app.get('/api/admin/export/incidents.csv', requireAuth, requireIssuesDesk, async
     (x.title||'').replace(/,/g,' '),
     (x.summary||'').replace(/\s+/g,' ').replace(/,/g,' ').trim(),
     x.linkedCaseId||'', x.linkedTxId||''
-  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+  ].map(csvEscape).join(','))).join('\n');
 
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-incidents.csv"');
@@ -3987,46 +3985,51 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
 
   let rows = [];
   try{
+    const merged = [];
     if (_pgPool){
-      const params = [];
-      let where = "WHERE action_type LIKE 'admin_execute_%'";
-      if (fromD){ params.push(fromD.toISOString()); where += ` AND ts >= $${params.length}`; }
-      if (toD){ params.push(toD.toISOString()); where += ` AND ts <= $${params.length}`; }
-      if (byPhoneQ){ params.push(byPhoneQ); where += ` AND coalesce(data->>'actorPhone', data->>'actor_phone','') = $${params.length}`; }
-
-      const q = `
+      const r = await _pgPool.query(`
         SELECT ts, case_id, tx_id, action_type, policy_code, data
         FROM tutopay_issue_actions
-        ${where}
         ORDER BY ts DESC
         LIMIT 20000
-      `;
-      const r = await _pgPool.query(q, params);
-      rows = (r.rows || []).map(a => {
-        const d = a.data || {};
+      `);
+      merged.push(...(r.rows || []).map(a => {
+        const n = normalizeActionRow(a);
         return {
-          timestamp: d.timestamp || d.ts || a.ts,
-          caseId: d.caseId || d.case_id || a.case_id,
-          txId: d.txId || d.tx_id || a.tx_id,
-          outcome: normalizeOutcome(d.actionType || d.action_type || a.action_type),
-          policyCode: d.policyCode || d.policy_code || a.policy_code,
-          adminPhone: d.actorPhone || d.actor_phone || '',
-          note: d.note || ''
+          timestamp: n.timestamp,
+          caseId: n.caseId,
+          txId: n.txId,
+          outcome: normalizeOutcome(n.actionType),
+          policyCode: n.policyCode,
+          adminPhone: n.actorPhone,
+          note: n.note,
+          rawActionType: n.actionType
         };
-      });
-    } else {
-      rows = (issueActions||[]).slice().filter(a => String(a.actionType||a.action_type||'').startsWith('admin_execute_'))
-        .map(a => ({
-          timestamp: a.timestamp||a.ts||'',
-          caseId: a.caseId||a.case_id||'',
-          txId: a.txId||a.tx_id||'',
-          outcome: normalizeOutcome(a.actionType||a.action_type),
-          policyCode: a.policyCode||a.policy_code||'',
-          adminPhone: a.actorPhone||a.actor_phone||'',
-          note: a.note||''
-        }));
+      }));
     }
-    if (outcomeQ) rows = rows.filter(r => r.outcome === outcomeQ);
+    merged.push(...((issueActions||[]).slice()).map(a => {
+      const n = normalizeActionRow(a);
+      return {
+        timestamp: n.timestamp,
+        caseId: n.caseId,
+        txId: n.txId,
+        outcome: normalizeOutcome(n.actionType),
+        policyCode: n.policyCode,
+        adminPhone: n.actorPhone,
+        note: n.note,
+        rawActionType: n.actionType
+      };
+    }));
+
+    rows = uniqueBy(merged, r => `${r.caseId}|${r.txId}|${r.timestamp}|${r.rawActionType}|${r.note}`)
+      .filter(r => {
+        if (!String(r.rawActionType||'').startsWith('admin_execute_')) return false;
+        if (!inRange(r.timestamp, fromD, toD)) return false;
+        if (outcomeQ && normalizeOutcome(r.outcome||'') !== outcomeQ) return false;
+        if (byPhoneQ && String(r.adminPhone||'') !== byPhoneQ) return false;
+        return true;
+      })
+      .sort((a,b)=> toMs(b.timestamp)-toMs(a.timestamp));
   }catch(e){
     console.error('[export approvals] failed', e);
     return res.status(500).json({ error: 'Export approvals failed' });
@@ -4036,12 +4039,13 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
   const csv = [header].concat(rows.map(a => [
     a.timestamp||'', a.caseId||'', a.txId||'', a.outcome||'',
     a.policyCode||'', a.adminPhone||'', (a.note||'').replace(/\s+/g,' ').replace(/,/g,' ').trim()
-  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))).join('\n');
+  ].map(csvEscape).join(','))).join('\n');
 
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="tutopay-issues-approvals.csv"');
   res.end(csv);
 });
+
 
 
   app.get('/api/admin/compliance/export', requireAuth, (req,res)=> {
