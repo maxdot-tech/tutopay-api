@@ -1667,6 +1667,51 @@ function ensureUserKycDefaults(user) {
   return user;
 }
 
+
+function ensureKycThreadDefaults(user) {
+  if (!user || typeof user !== "object") return user;
+  if (!Array.isArray(user.kycThread)) user.kycThread = [];
+  return user;
+}
+
+function kycAttachmentEntriesFromProfile(profile) {
+  const p = profile && typeof profile === "object" ? profile : {};
+  const specs = [
+    ["idFrontUrl", "ID Front"],
+    ["idBackUrl", "ID Back"],
+    ["passportUrl", "Passport"],
+    ["selfieUrl", "Selfie"],
+    ["proofOfAddressUrl", "Proof of Address"],
+    ["businessCertUrl", "Business Certificate"],
+  ];
+  return specs
+    .map(([key, label]) => {
+      const url = typeof p[key] === "string" ? p[key].trim() : "";
+      return url ? { key, label, url } : null;
+    })
+    .filter(Boolean);
+}
+
+function sanitizeKycThread(thread) {
+  return (Array.isArray(thread) ? thread : []).map((m) => ({
+    id: m && m.id ? String(m.id) : uuid(),
+    at: m && m.at ? String(m.at) : nowIso(),
+    byRole: m && m.byRole ? String(m.byRole) : "user",
+    byPhone: m && m.byPhone ? String(m.byPhone) : "",
+    message: m && m.message ? String(m.message) : "",
+    attachments: Array.isArray(m && m.attachments) ? m.attachments.filter(Boolean) : [],
+    statusAfter: m && m.statusAfter ? String(m.statusAfter) : null,
+  }));
+}
+
+function pushKycThreadMessage(user, msg) {
+  ensureKycThreadDefaults(user);
+  const clean = sanitizeKycThread([msg])[0];
+  user.kycThread.push(clean);
+  if (user.kycThread.length > 100) user.kycThread.splice(0, user.kycThread.length - 100);
+  return clean;
+}
+
 function getEffectiveKycLevel(user) {
   if (!user) return "basic";
   if (user.role === "admin") return "admin";
@@ -2108,6 +2153,7 @@ app.post("/api/auth/logout", requireAuth, (req, res) => {
 app.get("/api/kyc/me", requireAuth, (req, res) => {
   const user = ensureUserKycDefaults(findUserByPhone(req.user.phone));
   if (!user) return res.status(404).json({ error: "User not found" });
+  ensureKycThreadDefaults(user);
   return res.json({
     phone: user.phone,
     role: user.role,
@@ -2120,6 +2166,8 @@ app.get("/api/kyc/me", requireAuth, (req, res) => {
     kycRejectionReason: user.kycRejectionReason || null,
     kycProfile: user.kycProfile || {},
     kycHistory: Array.isArray(user.kycHistory) ? user.kycHistory : [],
+    kycThread: sanitizeKycThread(user.kycThread),
+    attachmentList: kycAttachmentEntriesFromProfile(user.kycProfile || {}),
   });
 });
 
@@ -2159,6 +2207,7 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
   }
 
   user.kycProfile = {
+    ...(user.kycProfile || {}),
     fullName,
     idType,
     idNumber,
@@ -2171,6 +2220,7 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
     submittedFields: Object.keys(body || {}).sort(),
     ...kycDocs,
   };
+  ensureKycThreadDefaults(user);
   user.kycStatus = "pending";
   user.kycSubmittedAt = nowIso();
   user.kycRejectionReason = null;
@@ -2182,6 +2232,15 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
     by: req.user.phone,
     requestedKycLevel,
     docsStored: Object.keys(kycDocs),
+  });
+  const submitMessage = String(body.message || "").trim() || "Initial KYC submission sent for review.";
+  pushKycThreadMessage(user, {
+    at: user.kycSubmittedAt,
+    byRole: user.role || "user",
+    byPhone: req.user.phone,
+    message: submitMessage,
+    attachments: kycAttachmentEntriesFromProfile(kycDocs).length ? kycAttachmentEntriesFromProfile(kycDocs) : kycAttachmentEntriesFromProfile(user.kycProfile),
+    statusAfter: user.kycStatus,
   });
 
   if (dbEnabled()) dbUpsertUser(user).catch(() => {});
@@ -2197,11 +2256,80 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
   });
 });
 
+
+
+app.post("/api/kyc/reply", requireAuth, async (req, res) => {
+  if (req.user.role === "admin") return res.status(403).json({ error: "Admin cannot use the KYC reply endpoint." });
+  const user = ensureKycThreadDefaults(ensureUserKycDefaults(findUserByPhone(req.user.phone)));
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const body = req.body || {};
+  const message = String(body.message || "").trim();
+  const kycDocs = {};
+  const kycDocSpecs = [
+    ["idFrontDataUrl", "idFrontUrl", "id-front"],
+    ["idBackDataUrl", "idBackUrl", "id-back"],
+    ["passportDataUrl", "passportUrl", "passport"],
+    ["selfieDataUrl", "selfieUrl", "selfie"],
+    ["proofOfAddressDataUrl", "proofOfAddressUrl", "proof-address"],
+    ["businessCertDataUrl", "businessCertUrl", "business-cert"],
+  ];
+
+  for (const [srcKey, dstKey, prefix] of kycDocSpecs) {
+    const raw = body[srcKey] || body[dstKey] || "";
+    if (typeof raw === "string" && raw.trim()) {
+      try {
+        kycDocs[dstKey] = await persistKycDataUrl(raw, { folder: "tutopay/kyc", prefix });
+      } catch (e) {
+        console.error(`[kyc-reply] failed to persist ${srcKey}:`, e && e.message ? e.message : e);
+        kycDocs[dstKey] = raw;
+      }
+    }
+  }
+
+  if (!message && !Object.keys(kycDocs).length) {
+    return res.status(400).json({ error: "Add a message or at least one attachment." });
+  }
+
+  user.kycProfile = { ...(user.kycProfile || {}), ...kycDocs };
+  user.kycStatus = "pending";
+  user.kycSubmittedAt = nowIso();
+  user.kycHistory = Array.isArray(user.kycHistory) ? user.kycHistory : [];
+  user.kycHistory.push({
+    at: user.kycSubmittedAt,
+    action: "user_reply",
+    by: req.user.phone,
+    docsStored: Object.keys(kycDocs),
+    message: message || null,
+  });
+
+  const attachments = kycAttachmentEntriesFromProfile(kycDocs);
+  pushKycThreadMessage(user, {
+    at: user.kycSubmittedAt,
+    byRole: user.role || "user",
+    byPhone: req.user.phone,
+    message: message || "Additional KYC information submitted.",
+    attachments,
+    statusAfter: user.kycStatus,
+  });
+
+  if (dbEnabled()) dbUpsertUser(user).catch(() => {});
+  logAudit(req, "kyc_reply", { phone: user.phone, docsStored: Object.keys(kycDocs), hasMessage: !!message });
+
+  return res.json({
+    ok: true,
+    message: "KYC reply sent to admin.",
+    kycStatus: user.kycStatus,
+    attachmentList: attachments,
+    kycThread: sanitizeKycThread(user.kycThread),
+  });
+});
+
 app.get("/api/admin/kyc/pending", requireAuth, (req, res) => {
   if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
   const pending = users
     .map(u => ensureUserKycDefaults(u))
-    .filter(u => u.role !== "admin" && (u.kycStatus === "pending" || u.kycStatus === "under_review"))
+    .filter(u => u.role !== "admin" && (u.kycStatus === "pending" || u.kycStatus === "under_review" || u.kycStatus === "needs_more_info"))
     .map(u => ({
       phone: u.phone,
       role: u.role,
@@ -2212,6 +2340,8 @@ app.get("/api/admin/kyc/pending", requireAuth, (req, res) => {
       displayName: u.profile && (u.profile.displayName || u.profile.fullName),
       businessName: u.profile && u.profile.businessName,
       kycProfile: u.kycProfile || {},
+      kycThread: sanitizeKycThread(u.kycThread),
+      attachmentList: kycAttachmentEntriesFromProfile(u.kycProfile || {}),
     }));
   return res.json(pending);
 });
@@ -2233,6 +2363,7 @@ app.post("/api/admin/kyc/:phone/review", requireAuth, (req, res) => {
   }
 
   const at = nowIso();
+  ensureKycThreadDefaults(user);
   if (["approve","approved","verify","verified"].includes(decision)) {
     user.kycStatus = "verified";
     user.kycLevel = level;
@@ -2260,6 +2391,14 @@ app.post("/api/admin/kyc/:phone/review", requireAuth, (req, res) => {
     kycLevel: user.kycLevel,
     reason: user.kycRejectionReason || null,
   });
+  pushKycThreadMessage(user, {
+    at,
+    byRole: "admin",
+    byPhone: req.user.phone,
+    message: user.kycRejectionReason || (user.kycStatus === "verified" ? `KYC approved at ${level} level.` : "KYC reviewed."),
+    attachments: [],
+    statusAfter: user.kycStatus,
+  });
 
   if (dbEnabled()) dbUpsertUser(user).catch(() => {});
   logAudit(req, "kyc_review", { targetPhone: user.phone, decision: user.kycStatus, kycLevel: user.kycLevel });
@@ -2281,6 +2420,8 @@ app.post("/api/admin/kyc/:phone/review", requireAuth, (req, res) => {
     kycReviewedAt: user.kycReviewedAt,
     kycReviewedBy: user.kycReviewedBy,
     reason: user.kycRejectionReason || null,
+    kycThread: sanitizeKycThread(user.kycThread),
+    attachmentList: kycAttachmentEntriesFromProfile(user.kycProfile || {}),
   });
 });
 
