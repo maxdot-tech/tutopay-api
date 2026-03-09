@@ -806,6 +806,57 @@ async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
   return payload.secure_url;
 }
 
+async function uploadLocalFileToCloudinary(filePath, opts = {}) {
+  if (!filePath || !cloudinaryConfigured()) return null;
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+  const folder = normalizeCloudinaryFolder(opts.folder || "tutopay/evidence");
+  const timestamp = Math.floor(Date.now() / 1000);
+  const publicId = `${String(opts.prefix || "file")}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+  const paramsToSign = { folder, public_id: publicId, resource_type: "auto", timestamp };
+  const signature = cloudinarySignature(paramsToSign, apiSecret);
+
+  const fileBuf = fs.readFileSync(filePath);
+  const mimeType = String(opts.mimetype || "application/octet-stream");
+  const form = new FormData();
+  form.append("file", new Blob([fileBuf], { type: mimeType }), String(opts.filename || path.basename(filePath)));
+  form.append("api_key", apiKey);
+  form.append("timestamp", String(timestamp));
+  form.append("folder", folder);
+  form.append("public_id", publicId);
+  form.append("resource_type", "auto");
+  form.append("signature", signature);
+
+  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`, {
+    method: "POST",
+    body: form,
+  });
+  let payload = null;
+  try { payload = await resp.json(); } catch (e) {}
+  if (!resp.ok || !payload || !payload.secure_url) {
+    const msg = payload && payload.error && payload.error.message ? payload.error.message : `Cloudinary file upload failed (${resp.status})`;
+    throw new Error(msg);
+  }
+  return {
+    secureUrl: payload.secure_url,
+    publicId: payload.public_id || publicId,
+    resourceType: payload.resource_type || "auto",
+    bytes: payload.bytes || opts.size || null,
+    format: payload.format || null,
+    originalFilename: payload.original_filename || null,
+  };
+}
+
+async function persistKycDataUrl(dataUrl, opts = {}) {
+  if (typeof dataUrl !== "string" || !dataUrl) return "";
+  if (!dataUrl.startsWith("data:")) return dataUrl;
+  return await persistImageDataUrl(dataUrl, {
+    folder: opts.folder || "tutopay/kyc",
+    prefix: opts.prefix || "kyc",
+  });
+}
+
 function saveDataUrlToUploads(dataUrl, prefix = "item") {
   if (typeof dataUrl !== "string") return "";
   if (!dataUrl.startsWith("data:")) return dataUrl; // already a normal URL/path
@@ -2072,7 +2123,7 @@ app.get("/api/kyc/me", requireAuth, (req, res) => {
   });
 });
 
-app.post("/api/kyc/submit", requireAuth, (req, res) => {
+app.post("/api/kyc/submit", requireAuth, async (req, res) => {
   if (req.user.role === "admin") return res.status(403).json({ error: "Admin accounts do not require KYC submission." });
   const user = ensureUserKycDefaults(findUserByPhone(req.user.phone));
   if (!user) return res.status(404).json({ error: "User not found" });
@@ -2086,6 +2137,27 @@ app.post("/api/kyc/submit", requireAuth, (req, res) => {
     return res.status(400).json({ error: "fullName, idType, and idNumber are required for KYC submission." });
   }
 
+  const kycDocs = {};
+  const kycDocSpecs = [
+    ["idFrontDataUrl", "idFrontUrl", "id-front"],
+    ["idBackDataUrl", "idBackUrl", "id-back"],
+    ["passportDataUrl", "passportUrl", "passport"],
+    ["selfieDataUrl", "selfieUrl", "selfie"],
+    ["proofOfAddressDataUrl", "proofOfAddressUrl", "proof-address"],
+    ["businessCertDataUrl", "businessCertUrl", "business-cert"],
+  ];
+  for (const [srcKey, dstKey, prefix] of kycDocSpecs) {
+    const raw = body[srcKey] || body[dstKey] || "";
+    if (typeof raw === "string" && raw.trim()) {
+      try {
+        kycDocs[dstKey] = await persistKycDataUrl(raw, { folder: "tutopay/kyc", prefix });
+      } catch (e) {
+        console.error(`[kyc] failed to persist ${srcKey}:`, e && e.message ? e.message : e);
+        kycDocs[dstKey] = raw;
+      }
+    }
+  }
+
   user.kycProfile = {
     fullName,
     idType,
@@ -2094,9 +2166,10 @@ app.post("/api/kyc/submit", requireAuth, (req, res) => {
     address: body.address ? String(body.address).trim() : undefined,
     businessName: body.businessName ? String(body.businessName).trim() : undefined,
     sellerType: body.sellerType ? String(body.sellerType).trim() : undefined,
-    selfieProvided: !!(user.profile && user.profile.selfieDataUrl),
+    selfieProvided: !!((user.profile && user.profile.selfieDataUrl) || kycDocs.selfieUrl),
     logoProvided: !!(user.profile && user.profile.logoDataUrl),
     submittedFields: Object.keys(body || {}).sort(),
+    ...kycDocs,
   };
   user.kycStatus = "pending";
   user.kycSubmittedAt = nowIso();
@@ -2108,10 +2181,11 @@ app.post("/api/kyc/submit", requireAuth, (req, res) => {
     action: "submitted",
     by: req.user.phone,
     requestedKycLevel,
+    docsStored: Object.keys(kycDocs),
   });
 
   if (dbEnabled()) dbUpsertUser(user).catch(() => {});
-  logAudit(req, "kyc_submit", { phone: user.phone, requestedKycLevel, idType });
+  logAudit(req, "kyc_submit", { phone: user.phone, requestedKycLevel, idType, docsStored: Object.keys(kycDocs) });
   return res.json({
     ok: true,
     message: "KYC submitted for review.",
@@ -2119,6 +2193,7 @@ app.post("/api/kyc/submit", requireAuth, (req, res) => {
     requestedKycLevel: user.kycLevel,
     effectiveKycLevel: getEffectiveKycLevel(user),
     kycSubmittedAt: user.kycSubmittedAt,
+    docsStored: Object.keys(kycDocs),
   });
 });
 
@@ -3238,7 +3313,7 @@ app.post("/api/transactions/:id/dispute/decision", requireAuth, (req, res) => {
 
 // Upload a supporting document for a dispute (up to 10 MB)
 app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
-  disputeUpload.single("file")(req, res, (err) => {
+  disputeUpload.single("file")(req, res, async (err) => {
     if (err) {
       if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
         return res.status(413).json({ error: "File too large (max 10 MB)" });
@@ -3262,7 +3337,27 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
       tx.disputeDocs = [];
     }
 
-    const urlPath = `/uploads/${req.file.filename}`;
+    let urlPath = `/uploads/${req.file.filename}`;
+    let finalUrl = `${PUBLIC_API_BASE}${urlPath}`;
+    let cloudinaryMeta = null;
+    if (cloudinaryConfigured()) {
+      try {
+        cloudinaryMeta = await uploadLocalFileToCloudinary(req.file.path, {
+          folder: "tutopay/evidence",
+          prefix: "evidence",
+          filename: req.file.originalname || req.file.filename,
+          mimetype: req.file.mimetype,
+          size: req.file.size,
+        });
+        if (cloudinaryMeta && cloudinaryMeta.secureUrl) {
+          finalUrl = cloudinaryMeta.secureUrl;
+          urlPath = null;
+        }
+      } catch (e) {
+        console.error('[cloudinary] evidence upload failed, keeping local upload:', e && e.message ? e.message : e);
+      }
+    }
+
     const doc = {
       id: uuid(),
       filename: req.file.filename,
@@ -3274,10 +3369,18 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
       uploadedByPhone: (req.user && req.user.phone) ? String(req.user.phone) : null,
       urlPath,
       // Absolute URL so evidence links work from tutopay.online (frontend) to api.tutopay.online (backend)
-      url: `${PUBLIC_API_BASE}${urlPath}`,
+      url: finalUrl,
+      cloudinary: cloudinaryMeta ? {
+        publicId: cloudinaryMeta.publicId,
+        resourceType: cloudinaryMeta.resourceType,
+        bytes: cloudinaryMeta.bytes,
+        format: cloudinaryMeta.format,
+      } : null,
     };
 
     tx.disputeDocs.push(doc);
+    if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+    logAudit(req, 'dispute_evidence_upload', { txId: tx.id, filename: doc.name, mimeType: doc.mimetype, cloudinary: !!cloudinaryMeta });
 
     res.json({ ok: true, doc });
   });
@@ -4682,6 +4785,10 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const docs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
     const doc = docs.find((d, idx) => String(d.id || `${got.c.caseId}-doc-${idx+1}`) === docId) || null;
     if (!doc) return res.status(404).json({ error: 'Evidence file not found' });
+
+    if (doc.url && String(doc.url).startsWith('http')) {
+      return res.redirect(String(doc.url));
+    }
 
     const filename = String(doc.filename || '').trim();
     if (!filename) return res.status(404).json({ error: 'Evidence filename missing' });
