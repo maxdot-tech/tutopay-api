@@ -766,9 +766,8 @@ function cloudinarySignature(params, apiSecret) {
   return crypto.createHash("sha1").update(toSign + apiSecret).digest("hex");
 }
 
-async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
-  if (typeof dataUrl !== "string") return "";
-  if (!dataUrl.startsWith("data:")) return dataUrl;
+async function uploadDataToCloudinary(fileValue, opts = {}) {
+  if (typeof fileValue !== "string" || !fileValue) return "";
   if (!cloudinaryConfigured()) return "";
 
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
@@ -776,19 +775,20 @@ async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
   const apiSecret = process.env.CLOUDINARY_API_SECRET;
   const folder = normalizeCloudinaryFolder(opts.folder || "tutopay/catalogue");
   const timestamp = Math.floor(Date.now() / 1000);
-  const publicId = `${String(opts.prefix || "item")}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+  const publicId = `${String(opts.prefix || "file")}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+  const resourceType = String(opts.resourceType || "image").trim().toLowerCase() || "image";
   const paramsToSign = { folder, public_id: publicId, timestamp };
   const signature = cloudinarySignature(paramsToSign, apiSecret);
 
   const form = new FormData();
-  form.append("file", dataUrl);
+  form.append("file", fileValue);
   form.append("api_key", apiKey);
   form.append("timestamp", String(timestamp));
   form.append("folder", folder);
   form.append("public_id", publicId);
   form.append("signature", signature);
 
-  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`, {
     method: "POST",
     body: form,
   });
@@ -799,7 +799,22 @@ async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
     const msg = payload && payload.error && payload.error.message ? payload.error.message : `Cloudinary upload failed (${resp.status})`;
     throw new Error(msg);
   }
-  return payload.secure_url;
+  return payload;
+}
+
+async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
+  if (typeof dataUrl !== "string") return "";
+  if (!dataUrl.startsWith("data:")) return dataUrl;
+  const payload = await uploadDataToCloudinary(dataUrl, { ...opts, resourceType: opts.resourceType || "image" });
+  return payload && payload.secure_url ? payload.secure_url : "";
+}
+
+async function uploadLocalFileToCloudinary(localPath, mimetype, opts = {}) {
+  if (!localPath || !fs.existsSync(localPath)) return null;
+  const mime = String(mimetype || "application/octet-stream").trim() || "application/octet-stream";
+  const buf = fs.readFileSync(localPath);
+  const dataUrl = `data:${mime};base64,${buf.toString("base64")}`;
+  return await uploadDataToCloudinary(dataUrl, { ...opts, resourceType: opts.resourceType || "auto" });
 }
 
 function saveDataUrlToUploads(dataUrl, prefix = "item") {
@@ -1459,6 +1474,45 @@ function normalizePublicProfile(rawProfile, phone) {
   return { phone: phoneSafe, displayName, businessName, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
 }
 
+async function persistProfileMedia(profile, phone) {
+  const normalized = normalizePublicProfile(profile, phone);
+  const out = { ...normalized };
+
+  if (typeof out.selfieDataUrl === "string" && out.selfieDataUrl.startsWith("data:")) {
+    try {
+      const url = await uploadDataUrlToCloudinary(out.selfieDataUrl, {
+        folder: "tutopay/profiles/selfies",
+        prefix: `selfie-${String(phone || "user").replace(/\D+/g, "") || "user"}`,
+        resourceType: "image",
+      });
+      if (url) {
+        out.selfieUrl = url;
+        out.selfieDataUrl = "";
+      }
+    } catch (e) {
+      console.error("[cloudinary] profile selfie upload failed:", e && e.message ? e.message : e);
+    }
+  }
+
+  if (typeof out.logoDataUrl === "string" && out.logoDataUrl.startsWith("data:")) {
+    try {
+      const url = await uploadDataUrlToCloudinary(out.logoDataUrl, {
+        folder: "tutopay/profiles/logos",
+        prefix: `logo-${String(phone || "user").replace(/\D+/g, "") || "user"}`,
+        resourceType: "image",
+      });
+      if (url) {
+        out.logoUrl = url;
+        out.logoDataUrl = "";
+      }
+    } catch (e) {
+      console.error("[cloudinary] profile logo upload failed:", e && e.message ? e.message : e);
+    }
+  }
+
+  return out;
+}
+
 function publicProfileResponseForUser(user) {
   const phone = user && user.phone ? String(user.phone).trim() : "";
   const prof = user && user.profile ? normalizePublicProfile(user.profile, phone) : normalizePublicProfile({}, phone);
@@ -1863,7 +1917,7 @@ app.post("/api/otp/start", requireAuth, (req, res) => {
 });
 
 // -------- Auth (phone + PIN, demo only) --------
-app.post("/api/auth/login", loginLimiter, (req, res) => {
+app.post("/api/auth/login", loginLimiter, async (req, res) => {
   const { phone, pin, rolePreference, profile } = req.body || {};
   if (!phone || !pin) {
     return res.status(400).json({ error: "Phone and PIN are required." });
@@ -1966,7 +2020,7 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
 // If frontend sent profile data (name/selfie/logo), store it for cross-device display
 if (profile && typeof profile === "object") {
   try {
-    const normalized = normalizePublicProfile(profile, phoneNorm);
+    const normalized = await persistProfileMedia(profile, phoneNorm);
     user.profile = normalized;
     // persist user profile
     if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
@@ -2035,7 +2089,7 @@ app.get("/api/kyc/me", requireAuth, (req, res) => {
   });
 });
 
-app.post("/api/kyc/submit", requireAuth, (req, res) => {
+app.post("/api/kyc/submit", requireAuth, async (req, res) => {
   if (req.user.role === "admin") return res.status(403).json({ error: "Admin accounts do not require KYC submission." });
   const user = ensureUserKycDefaults(findUserByPhone(req.user.phone));
   if (!user) return res.status(404).json({ error: "User not found" });
@@ -2049,6 +2103,32 @@ app.post("/api/kyc/submit", requireAuth, (req, res) => {
     return res.status(400).json({ error: "fullName, idType, and idNumber are required for KYC submission." });
   }
 
+  const kycDocuments = [];
+  const candidateDocs = [
+    { key: "selfieDataUrl", label: "selfie", folder: "tutopay/kyc/selfies", resourceType: "image" },
+    { key: "idFrontDataUrl", label: "id_front", folder: "tutopay/kyc/id-front", resourceType: "image" },
+    { key: "idBackDataUrl", label: "id_back", folder: "tutopay/kyc/id-back", resourceType: "image" },
+    { key: "idDocDataUrl", label: "id_document", folder: "tutopay/kyc/id-docs", resourceType: "auto" },
+    { key: "proofOfAddressDataUrl", label: "proof_of_address", folder: "tutopay/kyc/proof-of-address", resourceType: "auto" },
+    { key: "businessDocDataUrl", label: "business_document", folder: "tutopay/kyc/business-docs", resourceType: "auto" },
+  ];
+  for (const spec of candidateDocs) {
+    const raw = body && typeof body[spec.key] === "string" ? body[spec.key] : "";
+    if (!raw || !raw.startsWith("data:")) continue;
+    try {
+      const url = await uploadDataUrlToCloudinary(raw, {
+        folder: spec.folder,
+        prefix: `${spec.label}-${String(user.phone || "user").replace(/\D+/g, "") || "user"}`,
+        resourceType: spec.resourceType,
+      });
+      if (url) {
+        kycDocuments.push({ type: spec.label, url, uploadedAt: nowIso() });
+      }
+    } catch (e) {
+      console.error(`[cloudinary] KYC ${spec.label} upload failed:`, e && e.message ? e.message : e);
+    }
+  }
+
   user.kycProfile = {
     fullName,
     idType,
@@ -2057,8 +2137,9 @@ app.post("/api/kyc/submit", requireAuth, (req, res) => {
     address: body.address ? String(body.address).trim() : undefined,
     businessName: body.businessName ? String(body.businessName).trim() : undefined,
     sellerType: body.sellerType ? String(body.sellerType).trim() : undefined,
-    selfieProvided: !!(user.profile && user.profile.selfieDataUrl),
-    logoProvided: !!(user.profile && user.profile.logoDataUrl),
+    selfieProvided: !!((user.profile && (user.profile.selfieUrl || user.profile.selfieDataUrl)) || kycDocuments.find(d => d.type === "selfie")),
+    logoProvided: !!(user.profile && (user.profile.logoUrl || user.profile.logoDataUrl)),
+    kycDocuments,
     submittedFields: Object.keys(body || {}).sort(),
   };
   user.kycStatus = "pending";
@@ -3201,7 +3282,7 @@ app.post("/api/transactions/:id/dispute/decision", requireAuth, (req, res) => {
 
 // Upload a supporting document for a dispute (up to 10 MB)
 app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
-  disputeUpload.single("file")(req, res, (err) => {
+  disputeUpload.single("file")(req, res, async (err) => {
     if (err) {
       if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
         return res.status(413).json({ error: "File too large (max 10 MB)" });
@@ -3225,7 +3306,29 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
       tx.disputeDocs = [];
     }
 
-    const urlPath = `/uploads/${req.file.filename}`;
+    const localUrlPath = `/uploads/${req.file.filename}`;
+    let remoteUrl = "";
+    let cloudinaryMeta = null;
+    if (cloudinaryConfigured()) {
+      try {
+        const uploaded = await uploadLocalFileToCloudinary(req.file.path, req.file.mimetype, {
+          folder: "tutopay/disputes/evidence",
+          prefix: `evidence-${String(tx.id || "tx").replace(/[^a-zA-Z0-9_-]+/g, "-")}`,
+          resourceType: "auto",
+        });
+        if (uploaded && uploaded.secure_url) {
+          remoteUrl = uploaded.secure_url;
+          cloudinaryMeta = {
+            publicId: uploaded.public_id || null,
+            resourceType: uploaded.resource_type || null,
+            format: uploaded.format || null,
+          };
+        }
+      } catch (e) {
+        console.error("[cloudinary] dispute evidence upload failed:", e && e.message ? e.message : e);
+      }
+    }
+
     const doc = {
       id: uuid(),
       filename: req.file.filename,
@@ -3235,12 +3338,21 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
       size: req.file.size,
       uploadedAt: nowIso(),
       uploadedByPhone: (req.user && req.user.phone) ? String(req.user.phone) : null,
-      urlPath,
+      urlPath: remoteUrl ? null : localUrlPath,
+      localUrlPath,
+      storage: remoteUrl ? "cloudinary" : "local",
+      cloudinary: cloudinaryMeta,
       // Absolute URL so evidence links work from tutopay.online (frontend) to api.tutopay.online (backend)
-      url: `${PUBLIC_API_BASE}${urlPath}`,
+      url: remoteUrl || `${PUBLIC_API_BASE}${localUrlPath}`,
     };
 
     tx.disputeDocs.push(doc);
+    if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
+    logAudit(req, "dispute_evidence_upload", { txId: tx.id, docId: doc.id, storage: doc.storage, mimetype: doc.mimetype, size: doc.size });
+
+    if (remoteUrl && req.file.path && fs.existsSync(req.file.path)) {
+      try { fs.unlinkSync(req.file.path); } catch (e) {}
+    }
 
     res.json({ ok: true, doc });
   });
@@ -4645,6 +4757,10 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const docs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
     const doc = docs.find((d, idx) => String(d.id || `${got.c.caseId}-doc-${idx+1}`) === docId) || null;
     if (!doc) return res.status(404).json({ error: 'Evidence file not found' });
+
+    if (doc.url && String(doc.url).startsWith('http')) {
+      return res.redirect(String(doc.url));
+    }
 
     const filename = String(doc.filename || '').trim();
     if (!filename) return res.status(404).json({ error: 'Evidence filename missing' });
