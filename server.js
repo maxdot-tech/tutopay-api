@@ -925,6 +925,12 @@ const KYC_LIMITS = {
 };
 
 const transactions = [];
+
+// Global helper used by admin/issues routes. Keep this in top-level scope so all routes can access it.
+function issuesTxs(){
+  return Array.isArray(transactions) ? transactions : (globalThis.transactions || []);
+}
+
 const requests = [];
 // -------- Audit log (in-memory) --------
 // Each entry: { id, timestamp, ip, userPhone, userRole, eventType, details }
@@ -1969,7 +1975,14 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
       kycHistory: [],
     };
     users.push(user);
-    if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
+    if (dbEnabled()) {
+      try {
+        await dbUpsertUser(user);
+        console.log('[DB] User persisted:', user.phone, user.role);
+      } catch (e) {
+        console.error('[DB] Failed to persist new user:', user.phone, e.message);
+      }
+    }
     console.log("Created demo user:", user.phone, user.role);
   } else {
     ensureUserKycDefaults(user);
@@ -4369,7 +4382,6 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
 
   const issueActions = globalThis.__tpIssueActions || (globalThis.__tpIssueActions = []); // append-only action log
 
-  function issuesTxs(){ return (typeof transactions !== 'undefined' && Array.isArray(transactions)) ? transactions : (globalThis.transactions||[]); }
 
   function isIssuesDeskRole(role) {
     const r = String(role || '').toLowerCase();
