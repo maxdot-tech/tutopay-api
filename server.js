@@ -24,6 +24,10 @@ const DEMO_BANNER_TEXT = process.env.DEMO_BANNER_TEXT || "DEMO MODE: Test enviro
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+const APP_ENV = String(process.env.APP_ENV || process.env.NODE_ENV || "").toLowerCase();
+const STRICT_DB_MODE = String(process.env.STRICT_DB_MODE || ((APP_ENV === "production") ? "true" : "false")).toLowerCase() === "true";
+const DB_INIT_RETRIES = Math.max(1, Number(process.env.DB_INIT_RETRIES || 10));
+const DB_INIT_RETRY_DELAY_MS = Math.max(500, Number(process.env.DB_INIT_RETRY_DELAY_MS || 3000));
 
 
 /**
@@ -766,8 +770,9 @@ function cloudinarySignature(params, apiSecret) {
   return crypto.createHash("sha1").update(toSign + apiSecret).digest("hex");
 }
 
-async function uploadDataToCloudinary(fileValue, opts = {}) {
-  if (typeof fileValue !== "string" || !fileValue) return "";
+async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
+  if (typeof dataUrl !== "string") return "";
+  if (!dataUrl.startsWith("data:")) return dataUrl;
   if (!cloudinaryConfigured()) return "";
 
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
@@ -775,20 +780,19 @@ async function uploadDataToCloudinary(fileValue, opts = {}) {
   const apiSecret = process.env.CLOUDINARY_API_SECRET;
   const folder = normalizeCloudinaryFolder(opts.folder || "tutopay/catalogue");
   const timestamp = Math.floor(Date.now() / 1000);
-  const publicId = `${String(opts.prefix || "file")}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-  const resourceType = String(opts.resourceType || "image").trim().toLowerCase() || "image";
+  const publicId = `${String(opts.prefix || "item")}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
   const paramsToSign = { folder, public_id: publicId, timestamp };
   const signature = cloudinarySignature(paramsToSign, apiSecret);
 
   const form = new FormData();
-  form.append("file", fileValue);
+  form.append("file", dataUrl);
   form.append("api_key", apiKey);
   form.append("timestamp", String(timestamp));
   form.append("folder", folder);
   form.append("public_id", publicId);
   form.append("signature", signature);
 
-  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`, {
+  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
     method: "POST",
     body: form,
   });
@@ -799,22 +803,7 @@ async function uploadDataToCloudinary(fileValue, opts = {}) {
     const msg = payload && payload.error && payload.error.message ? payload.error.message : `Cloudinary upload failed (${resp.status})`;
     throw new Error(msg);
   }
-  return payload;
-}
-
-async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
-  if (typeof dataUrl !== "string") return "";
-  if (!dataUrl.startsWith("data:")) return dataUrl;
-  const payload = await uploadDataToCloudinary(dataUrl, { ...opts, resourceType: opts.resourceType || "image" });
-  return payload && payload.secure_url ? payload.secure_url : "";
-}
-
-async function uploadLocalFileToCloudinary(localPath, mimetype, opts = {}) {
-  if (!localPath || !fs.existsSync(localPath)) return null;
-  const mime = String(mimetype || "application/octet-stream").trim() || "application/octet-stream";
-  const buf = fs.readFileSync(localPath);
-  const dataUrl = `data:${mime};base64,${buf.toString("base64")}`;
-  return await uploadDataToCloudinary(dataUrl, { ...opts, resourceType: opts.resourceType || "auto" });
+  return payload.secure_url;
 }
 
 function saveDataUrlToUploads(dataUrl, prefix = "item") {
@@ -925,12 +914,6 @@ const KYC_LIMITS = {
 };
 
 const transactions = [];
-
-// Global helper used by admin/issues routes. Keep this in top-level scope so all routes can access it.
-function issuesTxs(){
-  return Array.isArray(transactions) ? transactions : (globalThis.transactions || []);
-}
-
 const requests = [];
 // -------- Audit log (in-memory) --------
 // Each entry: { id, timestamp, ip, userPhone, userRole, eventType, details }
@@ -948,39 +931,72 @@ function dbEnabled() {
   return !!(_dbReady && _pgPool);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function dbInit() {
   if (!HAS_DATABASE_URL) {
-    console.log("[DB] DATABASE_URL not set — using in-memory storage.");
-    return;
+    const err = new Error("DATABASE_URL not set");
+    dbInitError = err;
+    console.error("[DB] DATABASE_URL not set.");
+    if (STRICT_DB_MODE) throw err;
+    console.warn("[DB] Continuing in memory-only mode because STRICT_DB_MODE=false.");
+    return false;
   }
 
   let Pool;
   try {
     ({ Pool } = require("pg"));
   } catch (e) {
-    console.warn("[DB] pg module not installed. Run: npm i pg. Using in-memory storage for now.");
-    return;
+    dbInitError = e;
+    console.error("[DB] pg module not installed. Run: npm i pg.");
+    if (STRICT_DB_MODE) throw e;
+    console.warn("[DB] Continuing in memory-only mode because STRICT_DB_MODE=false.");
+    return false;
   }
 
-  try {
-    _pgPool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false }, // Railway Postgres often requires SSL
-      max: 5,
-    });
+  let lastErr = null;
+  for (let attempt = 1; attempt <= DB_INIT_RETRIES; attempt++) {
+    try {
+      if (_pgPool) {
+        try { await _pgPool.end(); } catch (_) {}
+        _pgPool = null;
+      }
 
-    // Quick ping
-    await _pgPool.query("SELECT 1 as ok");
-    await dbEnsureSchema();
-    await dbLoadIntoMemory();
-    await dbLoadOpsIntoMemory();
-    _dbReady = true;
-    console.log("[DB] Connected + schema ready.");
-  } catch (e) {
-    console.error("[DB] Failed to init Postgres. Using in-memory storage.", e.message);
-    _pgPool = null;
-    _dbReady = false;
+      _pgPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+        max: 5,
+      });
+
+      await _pgPool.query("SELECT 1 as ok");
+      await dbEnsureSchema();
+      await dbLoadIntoMemory();
+      await dbLoadOpsIntoMemory();
+      _dbReady = true;
+      dbInitError = null;
+      console.log(`[DB] Connected + schema ready. attempt=${attempt}/${DB_INIT_RETRIES}`);
+      return true;
+    } catch (e) {
+      lastErr = e;
+      dbInitError = e;
+      _dbReady = false;
+      if (_pgPool) {
+        try { await _pgPool.end(); } catch (_) {}
+      }
+      _pgPool = null;
+      console.error(`[DB] Init attempt ${attempt}/${DB_INIT_RETRIES} failed: ${e && e.message ? e.message : e}`);
+      if (attempt < DB_INIT_RETRIES) {
+        await sleep(DB_INIT_RETRY_DELAY_MS * attempt);
+      }
+    }
   }
+
+  console.error("[DB] Failed to init Postgres after retries.");
+  if (STRICT_DB_MODE) throw lastErr || new Error("Postgres init failed");
+  console.warn("[DB] Continuing in memory-only mode because STRICT_DB_MODE=false.");
+  return false;
 }
 
 async function dbEnsureSchema() {
@@ -1480,45 +1496,6 @@ function normalizePublicProfile(rawProfile, phone) {
   return { phone: phoneSafe, displayName, businessName, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
 }
 
-async function persistProfileMedia(profile, phone) {
-  const normalized = normalizePublicProfile(profile, phone);
-  const out = { ...normalized };
-
-  if (typeof out.selfieDataUrl === "string" && out.selfieDataUrl.startsWith("data:")) {
-    try {
-      const url = await uploadDataUrlToCloudinary(out.selfieDataUrl, {
-        folder: "tutopay/profiles/selfies",
-        prefix: `selfie-${String(phone || "user").replace(/\D+/g, "") || "user"}`,
-        resourceType: "image",
-      });
-      if (url) {
-        out.selfieUrl = url;
-        out.selfieDataUrl = "";
-      }
-    } catch (e) {
-      console.error("[cloudinary] profile selfie upload failed:", e && e.message ? e.message : e);
-    }
-  }
-
-  if (typeof out.logoDataUrl === "string" && out.logoDataUrl.startsWith("data:")) {
-    try {
-      const url = await uploadDataUrlToCloudinary(out.logoDataUrl, {
-        folder: "tutopay/profiles/logos",
-        prefix: `logo-${String(phone || "user").replace(/\D+/g, "") || "user"}`,
-        resourceType: "image",
-      });
-      if (url) {
-        out.logoUrl = url;
-        out.logoDataUrl = "";
-      }
-    } catch (e) {
-      console.error("[cloudinary] profile logo upload failed:", e && e.message ? e.message : e);
-    }
-  }
-
-  return out;
-}
-
 function publicProfileResponseForUser(user) {
   const phone = user && user.phone ? String(user.phone).trim() : "";
   const prof = user && user.profile ? normalizePublicProfile(user.profile, phone) : normalizePublicProfile({}, phone);
@@ -1923,7 +1900,7 @@ app.post("/api/otp/start", requireAuth, (req, res) => {
 });
 
 // -------- Auth (phone + PIN, demo only) --------
-app.post("/api/auth/login", loginLimiter, async (req, res) => {
+app.post("/api/auth/login", loginLimiter, (req, res) => {
   const { phone, pin, rolePreference, profile } = req.body || {};
   if (!phone || !pin) {
     return res.status(400).json({ error: "Phone and PIN are required." });
@@ -1975,14 +1952,7 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
       kycHistory: [],
     };
     users.push(user);
-    if (dbEnabled()) {
-      try {
-        await dbUpsertUser(user);
-        console.log('[DB] User persisted:', user.phone, user.role);
-      } catch (e) {
-        console.error('[DB] Failed to persist new user:', user.phone, e.message);
-      }
-    }
+    if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
     console.log("Created demo user:", user.phone, user.role);
   } else {
     ensureUserKycDefaults(user);
@@ -2033,7 +2003,7 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
 // If frontend sent profile data (name/selfie/logo), store it for cross-device display
 if (profile && typeof profile === "object") {
   try {
-    const normalized = await persistProfileMedia(profile, phoneNorm);
+    const normalized = normalizePublicProfile(profile, phoneNorm);
     user.profile = normalized;
     // persist user profile
     if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
@@ -2102,7 +2072,7 @@ app.get("/api/kyc/me", requireAuth, (req, res) => {
   });
 });
 
-app.post("/api/kyc/submit", requireAuth, async (req, res) => {
+app.post("/api/kyc/submit", requireAuth, (req, res) => {
   if (req.user.role === "admin") return res.status(403).json({ error: "Admin accounts do not require KYC submission." });
   const user = ensureUserKycDefaults(findUserByPhone(req.user.phone));
   if (!user) return res.status(404).json({ error: "User not found" });
@@ -2116,32 +2086,6 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "fullName, idType, and idNumber are required for KYC submission." });
   }
 
-  const kycDocuments = [];
-  const candidateDocs = [
-    { key: "selfieDataUrl", label: "selfie", folder: "tutopay/kyc/selfies", resourceType: "image" },
-    { key: "idFrontDataUrl", label: "id_front", folder: "tutopay/kyc/id-front", resourceType: "image" },
-    { key: "idBackDataUrl", label: "id_back", folder: "tutopay/kyc/id-back", resourceType: "image" },
-    { key: "idDocDataUrl", label: "id_document", folder: "tutopay/kyc/id-docs", resourceType: "auto" },
-    { key: "proofOfAddressDataUrl", label: "proof_of_address", folder: "tutopay/kyc/proof-of-address", resourceType: "auto" },
-    { key: "businessDocDataUrl", label: "business_document", folder: "tutopay/kyc/business-docs", resourceType: "auto" },
-  ];
-  for (const spec of candidateDocs) {
-    const raw = body && typeof body[spec.key] === "string" ? body[spec.key] : "";
-    if (!raw || !raw.startsWith("data:")) continue;
-    try {
-      const url = await uploadDataUrlToCloudinary(raw, {
-        folder: spec.folder,
-        prefix: `${spec.label}-${String(user.phone || "user").replace(/\D+/g, "") || "user"}`,
-        resourceType: spec.resourceType,
-      });
-      if (url) {
-        kycDocuments.push({ type: spec.label, url, uploadedAt: nowIso() });
-      }
-    } catch (e) {
-      console.error(`[cloudinary] KYC ${spec.label} upload failed:`, e && e.message ? e.message : e);
-    }
-  }
-
   user.kycProfile = {
     fullName,
     idType,
@@ -2150,9 +2094,8 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
     address: body.address ? String(body.address).trim() : undefined,
     businessName: body.businessName ? String(body.businessName).trim() : undefined,
     sellerType: body.sellerType ? String(body.sellerType).trim() : undefined,
-    selfieProvided: !!((user.profile && (user.profile.selfieUrl || user.profile.selfieDataUrl)) || kycDocuments.find(d => d.type === "selfie")),
-    logoProvided: !!(user.profile && (user.profile.logoUrl || user.profile.logoDataUrl)),
-    kycDocuments,
+    selfieProvided: !!(user.profile && user.profile.selfieDataUrl),
+    logoProvided: !!(user.profile && user.profile.logoDataUrl),
     submittedFields: Object.keys(body || {}).sort(),
   };
   user.kycStatus = "pending";
@@ -3295,7 +3238,7 @@ app.post("/api/transactions/:id/dispute/decision", requireAuth, (req, res) => {
 
 // Upload a supporting document for a dispute (up to 10 MB)
 app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
-  disputeUpload.single("file")(req, res, async (err) => {
+  disputeUpload.single("file")(req, res, (err) => {
     if (err) {
       if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
         return res.status(413).json({ error: "File too large (max 10 MB)" });
@@ -3319,29 +3262,7 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
       tx.disputeDocs = [];
     }
 
-    const localUrlPath = `/uploads/${req.file.filename}`;
-    let remoteUrl = "";
-    let cloudinaryMeta = null;
-    if (cloudinaryConfigured()) {
-      try {
-        const uploaded = await uploadLocalFileToCloudinary(req.file.path, req.file.mimetype, {
-          folder: "tutopay/disputes/evidence",
-          prefix: `evidence-${String(tx.id || "tx").replace(/[^a-zA-Z0-9_-]+/g, "-")}`,
-          resourceType: "auto",
-        });
-        if (uploaded && uploaded.secure_url) {
-          remoteUrl = uploaded.secure_url;
-          cloudinaryMeta = {
-            publicId: uploaded.public_id || null,
-            resourceType: uploaded.resource_type || null,
-            format: uploaded.format || null,
-          };
-        }
-      } catch (e) {
-        console.error("[cloudinary] dispute evidence upload failed:", e && e.message ? e.message : e);
-      }
-    }
-
+    const urlPath = `/uploads/${req.file.filename}`;
     const doc = {
       id: uuid(),
       filename: req.file.filename,
@@ -3351,21 +3272,12 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
       size: req.file.size,
       uploadedAt: nowIso(),
       uploadedByPhone: (req.user && req.user.phone) ? String(req.user.phone) : null,
-      urlPath: remoteUrl ? null : localUrlPath,
-      localUrlPath,
-      storage: remoteUrl ? "cloudinary" : "local",
-      cloudinary: cloudinaryMeta,
+      urlPath,
       // Absolute URL so evidence links work from tutopay.online (frontend) to api.tutopay.online (backend)
-      url: remoteUrl || `${PUBLIC_API_BASE}${localUrlPath}`,
+      url: `${PUBLIC_API_BASE}${urlPath}`,
     };
 
     tx.disputeDocs.push(doc);
-    if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
-    logAudit(req, "dispute_evidence_upload", { txId: tx.id, docId: doc.id, storage: doc.storage, mimetype: doc.mimetype, size: doc.size });
-
-    if (remoteUrl && req.file.path && fs.existsSync(req.file.path)) {
-      try { fs.unlinkSync(req.file.path); } catch (e) {}
-    }
 
     res.json({ ok: true, doc });
   });
@@ -4382,6 +4294,7 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
 
   const issueActions = globalThis.__tpIssueActions || (globalThis.__tpIssueActions = []); // append-only action log
 
+  function issuesTxs(){ return (typeof transactions !== 'undefined' && Array.isArray(transactions)) ? transactions : (globalThis.transactions||[]); }
 
   function isIssuesDeskRole(role) {
     const r = String(role || '').toLowerCase();
@@ -4770,10 +4683,6 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const doc = docs.find((d, idx) => String(d.id || `${got.c.caseId}-doc-${idx+1}`) === docId) || null;
     if (!doc) return res.status(404).json({ error: 'Evidence file not found' });
 
-    if (doc.url && String(doc.url).startsWith('http')) {
-      return res.redirect(String(doc.url));
-    }
-
     const filename = String(doc.filename || '').trim();
     if (!filename) return res.status(404).json({ error: 'Evidence filename missing' });
 
@@ -4924,15 +4833,24 @@ app.post("/api/admin/staff-accounts", requireAuth, (req, res) => {
   return res.json({ ok: true, user: { id: user.id, phone: user.phone, role: user.role } });
 });
 
-// Run DB init in background (does NOT prevent the server from starting)
+// Run DB init in background. In strict/production mode, exit if Postgres never becomes ready.
 dbInit()
-  .then(() => {
-    dbReady = true;
-    console.log('[DB] Ready.');
+  .then((ok) => {
+    dbReady = !!dbEnabled();
+    console.log(`[DB] Ready. enabled=${dbEnabled()} strict=${STRICT_DB_MODE} mode=${dbEnabled() ? 'postgres+memory-cache' : 'memory-only'}`);
+    if (STRICT_DB_MODE && !dbEnabled()) {
+      console.error('[DB] Strict mode active and Postgres is not ready. Exiting.');
+      process.exit(1);
+    }
   })
   .catch((err) => {
     dbInitError = err;
+    dbReady = false;
     console.error('[DB] Init failed:', err);
+    if (STRICT_DB_MODE) {
+      console.error('[DB] Strict mode active. Exiting.');
+      process.exit(1);
+    }
   });
 
 // Nice shutdown (Railway sends SIGTERM on deploy/stop)
