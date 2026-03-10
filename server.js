@@ -5,8 +5,24 @@ function isAccountingRole(role) {
   const r = String(role || "").toLowerCase();
   return r === "admin" || r === "accounts_agent" || r === "accounts" || r === "finance_agent";
 }
+function isIssuesDeskRoleGlobal(role) {
+  const r = String(role || "").toLowerCase();
+  return r === "admin" || r === "risk_agent" || r === "fraud_agent";
+}
+function isComplianceRole(role) {
+  const r = String(role || "").toLowerCase();
+  return r === "admin" || r === "compliance_agent" || r === "compliance_officer";
+}
+function isInternalStaffRole(role) {
+  const r = String(role || "").toLowerCase();
+  return isIssuesDeskRoleGlobal(r) || isAccountingRole(r) || isComplianceRole(r);
+}
+function isPublicRole(role) {
+  const r = String(role || "").toLowerCase();
+  return r === "buyer" || r === "seller";
+}
 // server.js
-// TutoPay demo backend — escrow logic + catalogue + buyer→seller requests with replies + live GPS
+// TutoPay backend — non-custodial transaction workflow + catalogue + requests + disputes + partner-rail payment callbacks
 
 const express = require("express");
 const cors = require("cors");
@@ -17,8 +33,9 @@ const multer = require("multer");
 const crypto = require("crypto");
 const DEMO_ADMIN_PHONE = process.env.DEMO_ADMIN_PHONE || "0770100100";
 const DEMO_ADMIN_PIN = process.env.DEMO_ADMIN_PIN || "4567";
-// Optional: allow turning off public self-signup in production
-const ALLOW_PUBLIC_SIGNUP = (process.env.ALLOW_PUBLIC_SIGNUP || "true").toLowerCase() === "true";
+// Public self-signup is allowed by default only in demo/dev. In production, default is off unless explicitly enabled.
+const DEFAULT_PUBLIC_SIGNUP = ((String(process.env.APP_ENV || process.env.NODE_ENV || "").toLowerCase() === "production") ? "false" : "true");
+const ALLOW_PUBLIC_SIGNUP = (process.env.ALLOW_PUBLIC_SIGNUP || DEFAULT_PUBLIC_SIGNUP).toLowerCase() === "true";
 const DEMO_MODE = (process.env.DEMO_MODE || "true").toLowerCase() === "true";
 const DEMO_BANNER_TEXT = process.env.DEMO_BANNER_TEXT || "DEMO MODE: Test environment only. No real funds are moved.";
 
@@ -304,6 +321,8 @@ app.get("/api/config", (req, res) => {
     demoMode: DEMO_MODE,
     bannerText: DEMO_BANNER_TEXT,
     allowPublicSignup: ALLOW_PUBLIC_SIGNUP,
+    nonCustodial: true,
+    fundsHandledBy: "licensed_partner",
   });
 });
 
@@ -376,7 +395,26 @@ function normalizeCallbackStatus(raw, provider) {
   return "PENDING";
 }
 
+function markPartnerProcessing(tx, patch) {
+  if (!tx || typeof tx !== "object") return tx;
+  tx.partnerProcessing = Object.assign({
+    nonCustodial: true,
+    fundsCustodian: "licensed_partner",
+    paymentExecutionBy: "licensed_partner",
+    settlementBy: "licensed_partner",
+    refundBy: "licensed_partner",
+    reversalBy: "licensed_partner",
+  }, tx.partnerProcessing || {}, patch || {});
+  return tx;
+}
+
 function applyCollectionCallbackUpdate(tx, provider, normStatus, reference, rawBody) {
+  markPartnerProcessing(tx, {
+    provider: provider === "airtel" ? "airtel_sandbox" : "mtn_momo",
+    collectionStatus: normStatus,
+    lastCollectionReference: reference,
+    lastCollectionCallbackAt: nowIso(),
+  });
   tx.paymentProvider = provider === "airtel" ? "airtel_sandbox" : "mtn_momo";
   tx.paymentStatus = normStatus === "SUCCESSFUL" ? "paid" : (normStatus === "FAILED" ? "failed" : "pending");
   tx.paymentMeta = tx.paymentMeta || {};
@@ -395,6 +433,11 @@ function applyCollectionCallbackUpdate(tx, provider, normStatus, reference, rawB
 }
 
 function applyPayoutCallbackUpdate(tx, normStatus, reference, rawBody) {
+  markPartnerProcessing(tx, {
+    payoutStatus: normStatus,
+    lastPayoutReference: reference,
+    lastPayoutCallbackAt: nowIso(),
+  });
   tx.disbursement = tx.disbursement || {};
   tx.disbursement.referenceId = tx.disbursement.referenceId || reference;
   tx.disbursement.lastCallbackAt = nowIso();
@@ -2024,19 +2067,20 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
 
 
   if (!user) {
-    // Demo behaviour: auto-register new users as buyer/seller only (admin is never auto-created)
+    const wantedRole = String(rolePreference || "").trim().toLowerCase();
+    if (isInternalStaffRole(wantedRole) || wantedRole === "admin") {
+      logAudit(req, "auth_login_failed", { reason: "staff_autoreg_blocked", phoneTried: phoneNorm, rolePreference: wantedRole });
+      return res.status(403).json({ error: "Staff accounts cannot be created from the public sign-in page." });
+    }
+
+    // Demo behaviour: auto-register new users as buyer/seller only
     if (!ALLOW_PUBLIC_SIGNUP) {
       logAudit(req, "auth_login_failed", { reason: "public_signup_disabled", phoneTried: phoneNorm });
       return res.status(403).json({ error: "Sign-up is disabled on this environment." });
     }
 
-    if (rolePreference === "admin") {
-      logAudit(req, "auth_login_failed", { reason: "admin_autoreg_blocked", phoneTried: phoneNorm });
-      return res.status(403).json({ error: "Admin accounts cannot be created from the public sign-in page." });
-    }
-
     const allowedRoles = ["buyer", "seller"];
-    const role = allowedRoles.includes(rolePreference) ? rolePreference : "buyer";
+    const role = allowedRoles.includes(wantedRole) ? wantedRole : "buyer";
 
     user = {
       id: uuid(),
@@ -2061,6 +2105,15 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
     if (user.disabled) {
       logAudit(req, "auth_login_failed", { reason: "user_disabled", phoneTried: phoneNorm });
       return res.status(403).json({ error: "This account has been disabled. Please contact support." });
+    }
+
+    if (rolePreference && String(rolePreference).trim()) {
+      const requestedRole = String(rolePreference).trim().toLowerCase();
+      const actualRole = String(user.role || "").trim().toLowerCase();
+      if (requestedRole !== actualRole) {
+        logAudit(req, "auth_login_failed", { reason: "role_mismatch", phoneTried: phoneNorm, requestedRole, actualRole });
+        return res.status(403).json({ error: "Selected role does not match this account." });
+      }
     }
 
     if (!verifyPin(pin, user.pinHash)) {
@@ -2767,6 +2820,7 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
   if (PAYMENTS_MODE === "demo") {
     tx.paymentProvider = "demo";
     tx.paymentStatus = "paid";
+    markPartnerProcessing(tx, { provider: "demo", collectionStatus: "SUCCESSFUL", settlementStatus: "pending_workflow", lastCollectionCallbackAt: nowIso() });
     tx.paymentRef = tx.paymentRef || ("demo_" + uuid());
     tx.collectionReconciled = false;
     tx.paidAt = nowIso();
@@ -2782,6 +2836,7 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
     tx.paymentProvider = "airtel_sandbox";
     tx.paymentStatus = "pending";
     tx.paymentRef = tx.paymentRef || uuid();
+    markPartnerProcessing(tx, { provider: "airtel_sandbox", collectionStatus: "PENDING", paymentExecutionBy: "licensed_partner", lastCollectionReference: tx.paymentRef });
 
     const msisdn = airtelMsisdnFromPhone(tx.fromPhone);
 
@@ -2829,14 +2884,15 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
         amount: tx.amount,
         msisdn: phone,
         externalId: tx.id,
-        payerMessage: "TutoPay escrow deposit",
-        payeeNote: "Escrow deposit",
+        payerMessage: "TutoPay transaction payment",
+        payeeNote: "Transaction payment",
         callbackUrl: MOMO_CALLBACK_URL,
       });
 
       tx.paymentProvider = "mtn_momo";
       tx.paymentStatus = "pending";
       tx.paymentRef = referenceId;
+      markPartnerProcessing(tx, { provider: "mtn_momo", collectionStatus: "PENDING", paymentExecutionBy: "licensed_partner", lastCollectionReference: referenceId });
       recordLedger(req, tx, "deposit_initiated", { reference: referenceId, provider: "mtn_momo", notes: "MTN collection initiated" });
       logAudit(req, "tx_pay_mtn_start", { txId: tx.id, provider: "mtn_momo", paymentRef: referenceId });
     } catch (err) {
@@ -2853,6 +2909,7 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
     tx.paymentProvider = PAYMENTS_MODE;
     tx.paymentStatus = "pending";
     tx.paymentRef = tx.paymentRef || uuid();
+    markPartnerProcessing(tx, { provider: PAYMENTS_MODE, collectionStatus: "PENDING", paymentExecutionBy: "licensed_partner", lastCollectionReference: tx.paymentRef });
     recordLedger(req, tx, "deposit_initiated", { reference: tx.paymentRef, provider: PAYMENTS_MODE, notes: "Payment initiated" });
     logAudit(req, "tx_pay_start", { txId: tx.id, provider: PAYMENTS_MODE, paymentRef: tx.paymentRef });
 
@@ -3013,7 +3070,15 @@ app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotency
       referenceId,
       status: "pending",
       startedAt: Date.now(),
+      processedBy: "licensed_partner",
     };
+    markPartnerProcessing(tx, {
+      payoutStatus: "pending",
+      provider: "mtn_momo_disbursement",
+      settlementBy: "licensed_partner",
+      payoutInitiatedAt: nowIso(),
+      lastPayoutReference: referenceId,
+    });
     recordLedger(req, tx, "payout_initiated", { reference: referenceId, provider: "mtn_momo_disbursement", amount, currency, notes: "Seller payout initiated" });
 
     logAudit(req, "mtn_disbursement_initiated", {
@@ -3060,8 +3125,10 @@ app.get("/api/transactions/:id/payout-status", requireAuth, async (req, res) => 
 
     if (tx.disbursement.status === "successful") {
       tx.payoutReconciled = false;
+      markPartnerProcessing(tx, { payoutStatus: "successful", settlementStatus: "settled", lastPayoutReference: tx.disbursement.referenceId, lastPayoutCheckAt: nowIso() });
       recordLedger(req, tx, "payout_completed", { reference: tx.disbursement.referenceId, provider: "mtn_momo_disbursement", notes: "Seller payout successful" });
     } else if (tx.disbursement.status === "failed") {
+      markPartnerProcessing(tx, { payoutStatus: "failed", settlementStatus: "failed", lastPayoutReference: tx.disbursement.referenceId, lastPayoutCheckAt: nowIso() });
       recordLedger(req, tx, "payout_failed", { reference: tx.disbursement.referenceId, provider: "mtn_momo_disbursement", notes: "Seller payout failed" });
     }
 
@@ -4541,8 +4608,7 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
   function issuesTxs(){ return (typeof transactions !== 'undefined' && Array.isArray(transactions)) ? transactions : (globalThis.transactions||[]); }
 
   function isIssuesDeskRole(role) {
-    const r = String(role || '').toLowerCase();
-    return r === 'admin' || r === 'risk_agent' || r === 'fraud_agent';
+    return isIssuesDeskRoleGlobal(role);
   }
   
   function isAccountingRole(role) {
@@ -4588,13 +4654,22 @@ function requireIssuesDesk(req,res,next){
       const createdTs = Date.parse(openedAt) || Date.now();
       st = {
         caseId,
+        txId: tx.id,
         createdAt: openedAt,
         updatedAt: openedAt,
         status: 'new',
         priority: calcPriority(tx),
         assignedTo: null,
         assignedAt: null,
+        assignedRole: null,
+        complaintCategory: String(tx?.dispute?.type || tx?.dispute?.reasonCode || 'general').toLowerCase(),
+        severity: calcPriority(tx),
+        slaHours: pickSlaHoursFromPriority(calcPriority(tx)),
         slaDeadlineAt: new Date(createdTs + 24*60*60*1000).toISOString(),
+        partnerActionRequired: false,
+        partnerActionType: null,
+        outcomeCode: null,
+        appealStatus: 'none',
         tags: [],
         sourceType: 'dispute',
         sourceRef: tx.id,
@@ -4606,12 +4681,15 @@ function requireIssuesDesk(req,res,next){
     return {
       caseId,
       txId: tx.id,
+      complaintCategory: st.complaintCategory || String(tx?.dispute?.type || tx?.dispute?.reasonCode || 'general').toLowerCase(),
+      severity: st.severity || st.priority || calcPriority(tx),
       sourceType: st.sourceType,
       sourceRef: st.sourceRef,
       status: latestAction?.nextStatus || st.status || 'new',
       priority: st.priority || calcPriority(tx),
       assignedTo: st.assignedTo || null,
       assignedAt: st.assignedAt || null,
+      assignedRole: st.assignedRole || null,
       slaDeadlineAt: st.slaDeadlineAt || null,
       createdAt: st.createdAt,
       updatedAt: latestAction?.timestamp || st.updatedAt || st.createdAt,
@@ -4626,6 +4704,10 @@ function requireIssuesDesk(req,res,next){
       reasonCode: tx.dispute.reasonCode || null,
       reasonText: tx.dispute.reasonText || null,
       docsCount: Array.isArray(tx.disputeDocs) ? tx.disputeDocs.length : 0,
+      partnerActionRequired: !!st.partnerActionRequired,
+      partnerActionType: st.partnerActionType || null,
+      outcomeCode: st.outcomeCode || null,
+      appealStatus: st.appealStatus || 'none',
       tags: Array.isArray(st.tags) ? st.tags : [],
       phaseDurations: buildIssuePhaseDurations(tx),
     };
@@ -4800,6 +4882,7 @@ function requireIssuesDesk(req,res,next){
     const toPhone = String((req.body||{}).toPhone || req.user.phone).trim();
     st.assignedTo = toPhone;
     st.assignedAt = nowIso();
+    st.assignedRole = String(req.user.role || '').toLowerCase();
     st.updatedAt = nowIso();
     try { await dbUpsertIssueCase(st); } catch(e){}
     logAudit(req, 'issues_case_assign', { caseId: got.c.caseId, txId: got.tx.id, assignedTo: toPhone });
@@ -4826,12 +4909,23 @@ function requireIssuesDesk(req,res,next){
       tx.disputeActive = false;
       tx.status = 'refunded';
       tx.payoutReconciled = true;
-      recordLedger(req, tx, 'refund_completed', { notes: 'Admin executed refund via Issues Desk' });
+      markPartnerProcessing(tx, {
+        outcome: 'refund',
+        partnerActionRequired: true,
+        refundStatus: 'authorized_pending_partner_execution',
+        lastOutcomeAt: now,
+      });
+      recordLedger(req, tx, 'refund_completed', { notes: 'Admin authorized refund outcome; partner execution required' });
     } else if (outcome === 'reject') {
       tx.dispute.status = 'admin_rejected_complaint';
       tx.dispute.resolvedAt = now;
       tx.disputeActive = false;
       // Keep tx.status unchanged; complaint closed
+      markPartnerProcessing(tx, {
+        outcome: 'reject',
+        partnerActionRequired: false,
+        lastOutcomeAt: now,
+      });
       recordLedger(req, tx, 'dispute_rejected', { notes: 'Admin rejected complaint via Issues Desk' });
     }
   }
@@ -4854,6 +4948,9 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const allowed = new Set(ISSUE_POLICIES.map(p=>p.actionType));
     if (!allowed.has(actionType)) return res.status(400).json({ error:'Unsupported actionType' });
     const st = issueCaseStore.get(got.c.caseId);
+    if (String(actionType).startsWith('admin_execute_') && st && st.recommendation && String(st.recommendation.byPhone || '') === String(req.user.phone || '')) {
+      return res.status(403).json({ error:'Maker-checker control: the same staff member cannot both recommend and execute the final outcome.' });
+    }
     const nextStatus = String(body.nextStatus || policy.nextStatus || st.status || 'in_review').trim().toLowerCase();
     const entry = {
       id: uuid(),
@@ -4874,18 +4971,30 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     // Apply state transition before persisting
     st.status = nextStatus;
     st.updatedAt = entry.timestamp;
+    st.lastActionType = actionType;
+    st.lastActionAt = entry.timestamp;
+    st.lastActionBy = req.user.phone;
 
     // Store recommendation/approval metadata for governance
     if (actionType === 'recommend_refund') {
       st.pendingAdminApproval = true;
+      st.partnerActionRequired = true;
+      st.partnerActionType = 'refund';
+      st.outcomeCode = 'refund_recommended';
       st.recommendation = { outcome:'refund', policyCode, note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
     } else if (actionType === 'recommend_reject') {
       st.pendingAdminApproval = true;
+      st.partnerActionRequired = false;
+      st.partnerActionType = null;
+      st.outcomeCode = 'reject_recommended';
       st.recommendation = { outcome:'reject', policyCode, note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
     }
     if (String(actionType).startsWith('admin_execute_')) {
       st.pendingAdminApproval = false;
       st.approval = { actionType, policyCode, note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
+      st.outcomeCode = actionType === 'admin_execute_refund' ? 'refund_authorized' : 'complaint_rejected';
+      st.partnerActionRequired = actionType === 'admin_execute_refund';
+      st.partnerActionType = actionType === 'admin_execute_refund' ? 'refund' : null;
     }
 
     try { await dbInsertIssueAction(entry); } catch(e){}
@@ -4967,6 +5076,9 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if (!rec || !rec.outcome) return res.status(400).json({ error:'No recommendation found to approve' });
 
     const outcome = String(rec.outcome).toLowerCase();
+    if (String(rec.byPhone || '') === String(req.user.phone || '')) {
+      return res.status(403).json({ error:'Maker-checker control: the recommending officer cannot approve the same case.' });
+    }
     const actionType = outcome === 'refund' ? 'admin_execute_refund' : (outcome === 'reject' ? 'admin_execute_reject' : '');
     const policyCode = outcome === 'refund' ? 'ADM-01' : (outcome === 'reject' ? 'ADM-02' : '');
     if (!actionType) return res.status(400).json({ error:'Unsupported recommendation outcome' });
@@ -4988,6 +5100,9 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
     st.pendingAdminApproval = false;
     st.approval = { actionType, policyCode, note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
+    st.partnerActionRequired = outcome === 'refund';
+    st.partnerActionType = outcome === 'refund' ? 'refund' : null;
+    st.outcomeCode = outcome === 'refund' ? 'refund_authorized' : 'complaint_rejected';
     st.executedOutcome = outcome;
     st.executedAt = entry.timestamp;
     st.closedAt = entry.timestamp;
@@ -5027,6 +5142,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
     st.pendingAdminApproval = false;
     st.approvalRejected = { note: entry.note, at: entry.timestamp, byPhone: req.user.phone, byRole: req.user.role };
+    st.outcomeCode = 'recommendation_rejected';
     st.status = 'in_review';
     st.updatedAt = entry.timestamp;
 
@@ -5056,7 +5172,7 @@ app.post("/api/admin/staff-accounts", requireAuth, (req, res) => {
 
   if (!normalizedPhone || !pinVal) return res.status(400).json({ error: "Phone and PIN are required." });
 
-  const allowed = ["risk_agent", "accounts_agent"];
+  const allowed = ["risk_agent", "accounts_agent", "finance_agent", "compliance_agent"];
   if (!allowed.includes(roleNorm)) return res.status(400).json({ error: "Invalid staff role." });
 
   let user = findUserByPhone(normalizedPhone);
