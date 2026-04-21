@@ -33,9 +33,10 @@ const multer = require("multer");
 const crypto = require("crypto");
 const DEMO_ADMIN_PHONE = process.env.DEMO_ADMIN_PHONE || "0770100100";
 const DEMO_ADMIN_PIN = process.env.DEMO_ADMIN_PIN || "4567";
-// Public self-signup is allowed by default only in demo/dev. In production, default is off unless explicitly enabled.
-const DEFAULT_PUBLIC_SIGNUP = ((String(process.env.APP_ENV || process.env.NODE_ENV || "").toLowerCase() === "production") ? "false" : "true");
-const ALLOW_PUBLIC_SIGNUP = (process.env.ALLOW_PUBLIC_SIGNUP || DEFAULT_PUBLIC_SIGNUP).toLowerCase() === "true";
+// Public self-signup should remain available for buyer/seller onboarding unless you EXPLICITLY turn it off.
+// This avoids production deploys unexpectedly blocking account creation when ALLOW_PUBLIC_SIGNUP is unset.
+const DEFAULT_PUBLIC_SIGNUP = "true";
+const ALLOW_PUBLIC_SIGNUP = String(process.env.ALLOW_PUBLIC_SIGNUP || DEFAULT_PUBLIC_SIGNUP).toLowerCase() !== "false";
 const DEMO_MODE = (process.env.DEMO_MODE || "true").toLowerCase() === "true";
 const DEMO_BANNER_TEXT = process.env.DEMO_BANNER_TEXT || "DEMO MODE: Test environment only. No real funds are moved.";
 
