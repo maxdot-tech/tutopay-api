@@ -3200,7 +3200,9 @@ app.get("/api/transactions", requireAuth, (req, res) => {
   transactions.forEach(maybeAutoResolveDispute);
 
   let view = transactions;
-  if (req.user.role !== "admin") {
+  // Internal staff consoles need platform-wide visibility for operational work.
+  // Public buyers/sellers still only see their own transactions.
+  if (req.user.role !== "admin" && !isInternalStaffRole(req.user.role)) {
     view = transactions.filter(
       (t) => t.fromPhone === req.user.phone || t.toPhone === req.user.phone
     );
@@ -3805,8 +3807,8 @@ app.get("/api/public/seller-normalized/:phone", (req, res) => {
 
 // -------- Admin: view audit log --------
 app.get("/api/admin/audit", requireAuth, (req, res) => {
-  if (req.user.role !== "admin") {
-    return res.status(403).json({ error: "Admin only" });
+  if (!isInternalStaffRole(req.user.role)) {
+    return res.status(403).json({ error: "Internal staff only" });
   }
 
   const limit = Number(req.query.limit) || 200;
@@ -3989,7 +3991,7 @@ app.get("/api/admin/ledger", requireAuth, (req, res) => {
 
 
 app.get("/api/admin/callback-config", requireAuth, (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  if (!isAccountingRole(req.user.role)) return res.status(403).json({ error: "Accounting only" });
   return res.json({
     ok: true,
     callbacks: {
@@ -4044,7 +4046,7 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
 });
 
 app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  if (!isAccountingRole(req.user.role)) return res.status(403).json({ error: "Accounting only" });
 
   const tx = transactions.find((t) => String(t.id) === String(req.params.txId || ""));
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
