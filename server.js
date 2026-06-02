@@ -31,18 +31,36 @@ const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
 const crypto = require("crypto");
-const DEMO_ADMIN_PHONE = process.env.DEMO_ADMIN_PHONE || "0770100100";
-const DEMO_ADMIN_PIN = process.env.DEMO_ADMIN_PIN || "4567";
-// Public self-signup should remain available for buyer/seller onboarding unless you EXPLICITLY turn it off.
-// This avoids production deploys unexpectedly blocking account creation when ALLOW_PUBLIC_SIGNUP is unset.
+
+// ===== Partner Demo v1 operating mode =====
+// APP_STAGE options used by this file: local, partner_demo, pilot, production.
+// partner_demo is intentionally polished for PSP/BoZ/investor demonstrations while
+// still avoiding any claim that TutoPay itself holds or moves customer funds.
+const APP_ENV = String(process.env.APP_ENV || process.env.NODE_ENV || "").toLowerCase();
+const APP_STAGE = String(process.env.APP_STAGE || process.env.TUTOPAY_STAGE || "partner_demo").toLowerCase();
+const IS_PARTNER_DEMO = ["partner_demo", "partner-demo", "pilot"].includes(APP_STAGE);
+const PLATFORM_NOTICE_TEXT = process.env.PLATFORM_NOTICE_TEXT || (
+  IS_PARTNER_DEMO
+    ? "Controlled partner demo: TutoPay manages workflow, evidence, confirmations, disputes and records. Customer funds must be processed, settled, refunded or reversed by licensed PSP/mobile-money/bank rails."
+    : "TutoPay manages transaction workflow and records. Customer funds are processed by licensed payment partners, not held by TutoPay."
+);
+
+// Public self-signup remains available for buyer/seller onboarding unless explicitly turned off.
 const DEFAULT_PUBLIC_SIGNUP = "true";
 const ALLOW_PUBLIC_SIGNUP = String(process.env.ALLOW_PUBLIC_SIGNUP || DEFAULT_PUBLIC_SIGNUP).toLowerCase() !== "false";
-const DEMO_MODE = (process.env.DEMO_MODE || "true").toLowerCase() === "true";
-const DEMO_BANNER_TEXT = process.env.DEMO_BANNER_TEXT || "DEMO MODE: Test environment only. No real funds are moved.";
+
+// Demo/test flags. Keep demo wording available for internal testing, but do not make it the default public posture.
+const DEMO_MODE = String(process.env.DEMO_MODE || "false").toLowerCase() === "true";
+const DEMO_BANNER_TEXT = process.env.DEMO_BANNER_TEXT || "Internal test environment: no real funds are moved.";
+
+// Staff/admin seeding: use explicit env values for partner demos instead of hard-coded public credentials.
+const SEED_DEMO_USERS = String(process.env.SEED_DEMO_USERS || (APP_STAGE === "local" ? "true" : "false")).toLowerCase() === "true";
+const SEED_STAFF_ADMIN = String(process.env.SEED_STAFF_ADMIN || (process.env.DEMO_ADMIN_PHONE && process.env.DEMO_ADMIN_PIN ? "true" : "false")).toLowerCase() === "true";
+const DEMO_ADMIN_PHONE = process.env.DEMO_ADMIN_PHONE || (APP_STAGE === "local" ? "0770100100" : "");
+const DEMO_ADMIN_PIN = process.env.DEMO_ADMIN_PIN || (APP_STAGE === "local" ? "4567" : "");
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const APP_ENV = String(process.env.APP_ENV || process.env.NODE_ENV || "").toLowerCase();
 const STRICT_DB_MODE = String(process.env.STRICT_DB_MODE || ((APP_ENV === "production") ? "true" : "false")).toLowerCase() === "true";
 const DB_INIT_RETRIES = Math.max(1, Number(process.env.DB_INIT_RETRIES || 10));
 const DB_INIT_RETRY_DELAY_MS = Math.max(500, Number(process.env.DB_INIT_RETRY_DELAY_MS || 3000));
@@ -307,8 +325,12 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json({ limit: "50mb" }));  // ⬅️ change 5mb → 50mb
 
-// Demo mode headers (helps partners/regulators know this is not production)
+// Public operating-mode headers for partner/demo transparency.
 app.use((req, res, next) => {
+  res.set("X-App-Stage", APP_STAGE);
+  res.set("X-Non-Custodial", "true");
+  res.set("X-Funds-Handled-By", "licensed_partner");
+  if (IS_PARTNER_DEMO) res.set("X-Partner-Demo", "true");
   if (DEMO_MODE) {
     res.set("X-Demo-Mode", "true");
     res.set("X-Demo-Banner", DEMO_BANNER_TEXT);
@@ -316,14 +338,19 @@ app.use((req, res, next) => {
   next();
 });
 
-// Lightweight config endpoint for the frontend to show a demo banner
+// Lightweight config endpoint for the frontend disclosure bar.
 app.get("/api/config", (req, res) => {
   res.json({
+    appStage: APP_STAGE,
+    partnerDemoMode: IS_PARTNER_DEMO,
     demoMode: DEMO_MODE,
-    bannerText: DEMO_BANNER_TEXT,
+    bannerText: DEMO_MODE ? DEMO_BANNER_TEXT : PLATFORM_NOTICE_TEXT,
+    platformNoticeText: PLATFORM_NOTICE_TEXT,
     allowPublicSignup: ALLOW_PUBLIC_SIGNUP,
     nonCustodial: true,
     fundsHandledBy: "licensed_partner",
+    moneyMovementBy: "licensed_partner",
+    tutoPayRole: "workflow_evidence_disputes_records",
   });
 });
 
@@ -992,7 +1019,7 @@ const items = [
   },
 ];
 
-// -------- KYC TIERS & LIMITS (demo values) --------
+// -------- KYC TIERS & LIMITS (controlled partner-demo defaults) --------
 const KYC_LIMITS = {
   basic: {
     maxPerTx: 2000,     // e.g. KYC level 1: max 2,000 ZMW per transaction
@@ -1269,8 +1296,8 @@ async function dbLoadIntoMemory() {
       });
     }
   } catch (e) {}
-  // Ensure demo admin exists even after DB load
-  ensureAdminUserSeed();
+  // Ensure optional bootstrap admin exists only when explicitly enabled.
+  if (SEED_STAFF_ADMIN) ensureAdminUserSeed();
 
 }
 
@@ -1765,9 +1792,9 @@ function getEffectiveKycLevel(user) {
 
 
 function ensureAdminUserSeed() {
-  // Make sure the demo admin always exists (even if DB load overwrote in-memory users)
+  // Optional staff/admin bootstrap for controlled environments only.
   const adminPhone = String(DEMO_ADMIN_PHONE || "").trim();
-  if (!adminPhone) return;
+  if (!SEED_STAFF_ADMIN || !adminPhone || !DEMO_ADMIN_PIN) return;
   let admin = users.find((u) => u && String(u.phone).trim() === adminPhone && u.role === "admin");
   if (!admin) {
     admin = {
@@ -1781,7 +1808,7 @@ function ensureAdminUserSeed() {
     };
     users.push(admin);
   } else {
-    // Keep PIN in sync with env defaults (useful for demos)
+    // Keep PIN in sync only with explicit environment bootstrap values.
     admin.pinHash = hashPin(DEMO_ADMIN_PIN);
     admin.kycLevel = "admin";
     admin.kycStatus = "verified";
@@ -1794,36 +1821,28 @@ function ensureAdminUserSeed() {
   }
 }
 
-// Seed a couple of demo users (optional)
-users.push({
-  id: uuid(),
-  phone: "0977123456",
-  role: "buyer",
-  pinHash: hashPin("1111"),
-  kycLevel: "basic",
-  kycStatus: "unsubmitted",
-});
+// Optional seeded accounts are disabled by default in Partner Demo v1.
+if (SEED_DEMO_USERS) {
+  users.push({
+    id: uuid(),
+    phone: "0977123456",
+    role: "buyer",
+    pinHash: hashPin("1111"),
+    kycLevel: "basic",
+    kycStatus: "unsubmitted",
+  });
 
-users.push({
-  id: uuid(),
-  phone: "0977234567",
-  role: "seller",
-  pinHash: hashPin("2222"),
-  kycLevel: "basic",
-  kycStatus: "unsubmitted",
-});
+  users.push({
+    id: uuid(),
+    phone: "0977234567",
+    role: "seller",
+    pinHash: hashPin("2222"),
+    kycLevel: "basic",
+    kycStatus: "unsubmitted",
+  });
+}
 
-users.push({
-  id: uuid(),
-  phone: DEMO_ADMIN_PHONE,
-  role: "admin",
-  pinHash: hashPin(DEMO_ADMIN_PIN),
-  kycLevel: "admin",
-  kycStatus: "verified",
-});
-
-
-ensureAdminUserSeed();
+if (SEED_STAFF_ADMIN) ensureAdminUserSeed();
 // Auth middleware
 async function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
@@ -2039,7 +2058,7 @@ app.post("/api/otp/start", requireAuth, (req, res) => {
   });
 });
 
-// -------- Auth (phone + PIN, demo only) --------
+// -------- Auth (phone + PIN) --------
 app.post("/api/auth/login", loginLimiter, (req, res) => {
   const { phone, pin, rolePreference, profile } = req.body || {};
   if (!phone || !pin) {
@@ -2056,8 +2075,8 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
 
   let user = findUserByPhone(phoneNorm);
 
-  // Special-case demo admin login: allow the configured admin to sign in even if DB doesn't yet contain it
-  if ((!user) && rolePreference === "admin") {
+  // Optional bootstrap admin login: enabled only when explicit env values are present.
+  if ((!user) && rolePreference === "admin" && SEED_STAFF_ADMIN) {
     const adminPhone = String(DEMO_ADMIN_PHONE || "").trim();
     const pinOk = String(pin) === String(DEMO_ADMIN_PIN);
     if (String(phoneNorm).trim() === adminPhone && pinOk) {
@@ -2074,7 +2093,7 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
       return res.status(403).json({ error: "Staff accounts cannot be created from the public sign-in page." });
     }
 
-    // Demo behaviour: auto-register new users as buyer/seller only
+    // Controlled onboarding: auto-register new public users as buyer/seller only.
     if (!ALLOW_PUBLIC_SIGNUP) {
       logAudit(req, "auth_login_failed", { reason: "public_signup_disabled", phoneTried: phoneNorm });
       return res.status(403).json({ error: "Sign-up is disabled on this environment." });
@@ -2091,14 +2110,15 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
       kycLevel: "basic",
       kycStatus: "unsubmitted",
       kycHistory: [],
+      consents: profile && profile.consents ? profile.consents : {},
     };
     users.push(user);
     if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
-    console.log("Created demo user:", user.phone, user.role);
+    console.log("Created public user:", user.phone, user.role);
   } else {
     ensureUserKycDefaults(user);
-    // Hardening: only allow the seeded demo admin phone to act as admin
-    if (user.role === "admin" && user.phone !== DEMO_ADMIN_PHONE) {
+    // Hardening: if an admin bootstrap phone is configured, restrict bootstrap admin access to it.
+    if (DEMO_ADMIN_PHONE && user.role === "admin" && user.phone !== DEMO_ADMIN_PHONE) {
       logAudit(req, "auth_login_failed", { reason: "admin_phone_mismatch", phoneTried: phoneNorm });
       return res.status(403).json({ error: "Admin access is restricted." });
     }
@@ -2155,6 +2175,7 @@ if (profile && typeof profile === "object") {
   try {
     const normalized = normalizePublicProfile(profile, phoneNorm);
     user.profile = normalized;
+    if (profile.consents && typeof profile.consents === "object") user.consents = profile.consents;
     // persist user profile
     if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
   } catch (e) {}
@@ -2203,7 +2224,7 @@ app.post("/api/auth/logout", requireAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
-// -------- KYC (BoZ trial prep) --------
+// -------- KYC (PSP/BoZ partner-demo prep) --------
 app.get("/api/kyc/me", requireAuth, (req, res) => {
   const user = ensureUserKycDefaults(findUserByPhone(req.user.phone));
   if (!user) return res.status(404).json({ error: "User not found" });
@@ -3782,7 +3803,7 @@ app.get("/api/public/seller-normalized/:phone", (req, res) => {
   res.json(sellerItems);
 });
 
-// -------- Admin: view audit log (demo) --------
+// -------- Admin: view audit log --------
 app.get("/api/admin/audit", requireAuth, (req, res) => {
   if (req.user.role !== "admin") {
     return res.status(403).json({ error: "Admin only" });
@@ -3816,7 +3837,7 @@ app.get("/api/admin/users", requireAuth, (req, res) => {
   res.json({ users: list });
 });
 
-// Update a user (demo): toggle disabled via query param
+// Update a user: toggle disabled via query param
 // Example: GET /api/admin/users/0977123456?disabled=1
 app.get("/api/admin/users/:phone", requireAuth, (req, res) => {
   if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
@@ -4012,43 +4033,73 @@ app.use((err, req, res, next) => {
  * - Start HTTP listener immediately so Railway can hit /health.
  * - Initialize DB in the background; API routes are gated until dbReady=true.
  */
-const server = 
-
-/* ===== Step 6+7: Compliance pack + Issues Desk foundation (BoZ trial ops) ===== */
+/* ===== Step 6+7: Compliance pack + Issues Desk foundation (Partner Demo v1 controls) ===== */
 (function(){
   // ---- Compliance docs + incidents (Step 6, included here so this file is self-contained) ----
   const complianceDocs = [
     {
       id: 'terms',
       title: 'TutoPay Terms of Use',
-      version: '0.1-trial',
-      updatedAt: '2026-02-25T00:00:00.000Z',
+      version: '1.0-partner-demo',
+      updatedAt: '2026-06-02T00:00:00.000Z',
       path: '/api/public/compliance/docs/terms',
-      body: 'TutoPay provides an escrow-style transaction workflow for trial use. Users agree to provide accurate details, avoid prohibited goods, and cooperate with dispute and KYC checks. TutoPay may pause, limit, or refuse transactions for risk, fraud, compliance, or operational reasons.'
+      body: 'TutoPay provides a non-custodial marketplace transaction workflow. TutoPay manages transaction records, evidence capture, confirmations, issue handling and dispute workflow. Customer funds are processed, settled, refunded and reversed by licensed PSP, mobile-money or banking partners. Users must provide accurate information, avoid prohibited goods, cooperate with KYC and dispute checks, and accept that TutoPay may pause or refuse transactions for fraud, risk, compliance, legal or operational reasons.'
     },
     {
       id: 'privacy',
       title: 'TutoPay Privacy Notice',
-      version: '0.1-trial',
-      updatedAt: '2026-02-25T00:00:00.000Z',
+      version: '1.0-partner-demo',
+      updatedAt: '2026-06-02T00:00:00.000Z',
       path: '/api/public/compliance/docs/privacy',
-      body: 'TutoPay collects account, transaction, KYC, and dispute information to operate escrow, prevent fraud, support investigations, and meet legal obligations. Trial data may be reviewed by authorized staff for support, risk monitoring, and reconciliation purposes.'
-    },
-    {
-      id: 'disputes',
-      title: 'Disputes & Complaints SOP',
-      version: '0.1-trial',
-      updatedAt: '2026-02-25T00:00:00.000Z',
-      path: '/api/public/compliance/docs/disputes',
-      body: 'Complaints are logged against transactions and routed to the Issues Desk for review. Investigators review timeline events, uploaded evidence, and policy codes before recommending or taking actions. High-risk or repeated patterns are escalated and recorded in audit logs.'
+      body: 'TutoPay collects account details, contact details, transaction records, catalogue records, KYC information, device/session metadata and dispute evidence to operate the platform, verify users, prevent fraud, support investigations, resolve complaints, maintain audit trails and meet legal or partner obligations. Access is restricted to authorised staff according to role and purpose.'
     },
     {
       id: 'kyc-limits',
-      title: 'KYC & Transaction Limits Policy',
-      version: '0.1-trial',
-      updatedAt: '2026-02-25T00:00:00.000Z',
+      title: 'KYC/CDD & Transaction Limits Policy',
+      version: '1.0-partner-demo',
+      updatedAt: '2026-06-02T00:00:00.000Z',
       path: '/api/public/compliance/docs/kyc-limits',
-      body: 'Trial account limits are applied by KYC level. Unverified users may face lower limits and restricted features. TutoPay may request additional documentation, place holds, or prevent payouts when account behavior triggers risk review.'
+      body: 'TutoPay applies account limits according to verification level and risk. Unverified users remain on basic limits. Higher activity may require NRC, selfie, business details, supporting documents, manual review or partner verification. TutoPay may restrict accounts, pause releases or escalate cases when identity, transaction behaviour or evidence indicates increased risk.'
+    },
+    {
+      id: 'aml-cft',
+      title: 'AML/CFT Controls Summary',
+      version: '1.0-partner-demo',
+      updatedAt: '2026-06-02T00:00:00.000Z',
+      path: '/api/public/compliance/docs/aml-cft',
+      body: 'TutoPay monitors transaction patterns, repeat disputes, unusual amounts, suspicious behaviour, prohibited goods indicators and failed verification attempts. Cases may be escalated to compliance staff, restricted, documented in the incident register, or referred to the licensed payment partner for additional action under the partner\'s AML/CFT obligations.'
+    },
+    {
+      id: 'disputes',
+      title: 'Disputes, Refunds & Complaints SOP',
+      version: '1.0-partner-demo',
+      updatedAt: '2026-06-02T00:00:00.000Z',
+      path: '/api/public/compliance/docs/disputes',
+      body: 'Complaints are linked to transaction records and routed to the Issues Desk. Staff review timelines, uploaded evidence, delivery/collection records, buyer and seller statements, risk indicators and policy codes before recommending release, refund, reversal request or escalation. Maker-checker controls apply to sensitive outcomes, and all staff actions are logged.'
+    },
+    {
+      id: 'data-retention',
+      title: 'Data Retention & Evidence Handling Policy',
+      version: '1.0-partner-demo',
+      updatedAt: '2026-06-02T00:00:00.000Z',
+      path: '/api/public/compliance/docs/data-retention',
+      body: 'TutoPay retains transaction records, audit logs, KYC submissions, evidence files and incident records for compliance, dispute resolution, fraud prevention, reconciliation and legal purposes. Access to sensitive evidence is limited to authorised staff and should be protected through authenticated or expiring access mechanisms in production.'
+    },
+    {
+      id: 'incident-response',
+      title: 'Incident Response Policy',
+      version: '1.0-partner-demo',
+      updatedAt: '2026-06-02T00:00:00.000Z',
+      path: '/api/public/compliance/docs/incident-response',
+      body: 'Operational, fraud, security, reconciliation and partner-callback incidents are recorded in the compliance incident register. Incidents are classified by severity, assigned to responsible staff, investigated, documented, escalated when necessary and closed with an audit trail.'
+    },
+    {
+      id: 'psp-settlement',
+      title: 'PSP Settlement & Reconciliation SOP',
+      version: '1.0-partner-demo',
+      updatedAt: '2026-06-02T00:00:00.000Z',
+      path: '/api/public/compliance/docs/psp-settlement',
+      body: 'TutoPay does not custody customer funds. Collections, payouts, reversals, refunds and settlement occur on licensed partner rails. TutoPay records partner references, callback statuses, workflow events, release/refund decisions and reconciliation flags so every transaction can be matched against partner statements and operational evidence.'
     }
   ];
   const complianceIncidents = globalThis.__tpComplianceIncidents || (globalThis.__tpComplianceIncidents = []);
@@ -4487,7 +4538,7 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
       overview: _complianceOverview(),
       incidents: complianceIncidents.slice(-500),
       docs: complianceDocs,
-      notes: 'Trial compliance export package (JSON)'
+      notes: 'Partner Demo v1 compliance export package (JSON)'
     };
     res.json({ ok:true, package: pkg });
   });
@@ -5157,8 +5208,8 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
 })();
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`TutoPay API running on port ${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`TutoPay API running on port ${PORT} [stage=${APP_STAGE}]`);
 });
 
 
@@ -5201,7 +5252,7 @@ app.post("/api/admin/staff-accounts", requireAuth, (req, res) => {
 // Run DB init in background. In strict/production mode, exit if Postgres never becomes ready.
 dbInit()
   .then((ok) => {
-    dbReady = !!dbEnabled();
+    dbReady = dbEnabled() || !STRICT_DB_MODE;
     console.log(`[DB] Ready. enabled=${dbEnabled()} strict=${STRICT_DB_MODE} mode=${dbEnabled() ? 'postgres+memory-cache' : 'memory-only'}`);
     if (STRICT_DB_MODE && !dbEnabled()) {
       console.error('[DB] Strict mode active and Postgres is not ready. Exiting.');
@@ -5210,7 +5261,7 @@ dbInit()
   })
   .catch((err) => {
     dbInitError = err;
-    dbReady = false;
+    dbReady = !STRICT_DB_MODE;
     console.error('[DB] Init failed:', err);
     if (STRICT_DB_MODE) {
       console.error('[DB] Strict mode active. Exiting.');
