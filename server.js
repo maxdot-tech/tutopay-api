@@ -5427,6 +5427,66 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
 })();
 
+/* ===== TutoPay v1.4: Controlled Pilot Metrics backend ===== */
+(function TP_PILOT_METRICS_BACKEND_V14(){
+  if (globalThis.__tpPilotMetricsBackendV14) return;
+  globalThis.__tpPilotMetricsBackendV14 = true;
+  function allowed(req){ const r=String((req.user&&req.user.role)||'').toLowerCase(); return r==='admin'||isInternalStaffRole(r); }
+  function gate(req,res,next){ if(!req.user||!allowed(req)) return res.status(403).json({error:'Internal staff only'}); next(); }
+  const num=v=>{ const n=Number(v); return Number.isFinite(n)?n:0; };
+  const money=v=>Math.round(num(v)*100)/100;
+  const ms=v=>{ const x=Date.parse(v||''); return Number.isFinite(x)?x:0; };
+  const txTime=t=>t.createdAt||t.paidAt||t.updatedAt||t.completedAt||t.releasedAt||'';
+  function range(req){
+    const f=String((req.query&&req.query.from)||'').trim(), to=String((req.query&&req.query.to)||'').trim();
+    let fm=null,tm=null;
+    if(f){ const d=new Date(f.length===10?f+'T00:00:00.000Z':f); if(!isNaN(d.getTime())) fm=d.getTime(); }
+    if(to){ const d=new Date(to.length===10?to+'T23:59:59.999Z':to); if(!isNaN(d.getTime())) tm=d.getTime(); }
+    return {from:fm,to:tm,fromRaw:f||null,toRaw:to||null};
+  }
+  function inRange(t,r){ const x=ms(t); if(!x) return true; if(r.from&&x<r.from) return false; if(r.to&&x>r.to) return false; return true; }
+  function pct(a,b){ b=Math.max(1,num(b)); return Math.max(0,Math.min(100,Math.round(num(a)/b*100))); }
+  function roleCount(role){ return users.filter(u=>String((u&&u.role)||'').toLowerCase()===role).length; }
+  function active(txs,field){ const s=new Set(); txs.forEach(t=>{ const v=String((t&&t[field])||'').trim(); if(v) s.add(v); }); return s.size; }
+  function pilotStatus(t){
+    const s=String((t&&t.status)||'').toLowerCase(), p=String((t&&t.paymentStatus)||'').toLowerCase(), d=String((t&&t.disbursement&&t.disbursement.status)||'').toLowerCase();
+    if(t&&t.disputeActive) return 'disputed';
+    if(s==='completed'||s==='released'||d==='successful') return 'completed';
+    if(s.includes('refund')) return 'refund';
+    if(s.includes('cancel')) return 'cancelled';
+    if(p==='failed'||s==='failed') return 'failed';
+    if(p==='paid'||s==='pending'||s==='held') return 'held';
+    if(s==='pending_payment'||!p||p==='pending') return 'pending_payment';
+    return s||p||'unknown';
+  }
+  function safeTx(tx){ const t=ensureTxReconDefaults(tx||{}); return {id:t.id,itemCode:t.itemCode||'',buyerPhone:t.buyerPhone||'',sellerPhone:t.sellerPhone||'',amount:money(t.amount),currency:t.currency||'ZMW',status:t.status||'',pilotStatus:pilotStatus(t),paymentStatus:t.paymentStatus||'',paymentProvider:t.paymentProvider||'',collectionReconciled:!!t.collectionReconciled,payoutReconciled:!!t.payoutReconciled,disputeActive:!!t.disputeActive,createdAt:t.createdAt||'',paidAt:t.paidAt||'',updatedAt:t.updatedAt||''}; }
+  function flag(ok,label,detail,action,weight){ return {ok:!!ok,label,detail:String(detail||''),action:String(action||''),weight:Number(weight||1)||1}; }
+  function score(flags){ const total=flags.reduce((s,f)=>s+(f.weight||1),0)||1, got=flags.reduce((s,f)=>s+(f.ok?(f.weight||1):0),0); return Math.round(got/total*100); }
+  function topCats(){ const m=new Map(); (items||[]).forEach(i=>{ const c=String((i&&(i.category||i.itemCategory||i.type))||'Other').trim()||'Other'; m.set(c,(m.get(c)||0)+1); }); return Array.from(m.entries()).map(([category,count])=>({category,count})).sort((a,b)=>b.count-a.count).slice(0,10); }
+  function overview(req){
+    const r=range(req), txs=(transactions||[]).map(ensureTxReconDefaults).filter(t=>inRange(txTime(t),r));
+    const buyers=roleCount('buyer'), sellers=roleCount('seller'), total=txs.length;
+    const statuses=txs.reduce((m,t)=>{const s=pilotStatus(t); m[s]=(m[s]||0)+1; return m;},{});
+    const completed=statuses.completed||0, openDisputes=txs.filter(t=>t.disputeActive||String(t.status||'').toLowerCase()==='disputed').length;
+    const paid=txs.filter(t=>String(t.paymentStatus||'').toLowerCase()==='paid'||['completed','released'].includes(String(t.status||'').toLowerCase()));
+    const held=txs.filter(t=>String(t.paymentStatus||'').toLowerCase()==='paid'&&!['completed','released','refunded'].includes(String(t.status||'').toLowerCase()));
+    const collectionUnreconciled=paid.filter(t=>!t.collectionReconciled).length;
+    const payoutUnreconciled=txs.filter(t=>(String(t.status||'').toLowerCase()==='completed'||String((t.disbursement&&t.disbursement.status)||'').toLowerCase()==='successful')&&!t.payoutReconciled).length;
+    const incidents=globalThis.__tpComplianceIncidents||[], openIncidents=incidents.filter(i=>String((i&&i.status)||'open').toLowerCase()!=='closed').length;
+    const totalValue=money(txs.reduce((s,t)=>s+num(t.amount),0)), collectedValue=money(paid.reduce((s,t)=>s+num(t.amount),0)), heldValue=money(held.reduce((s,t)=>s+num(t.amount),0)), completedValue=money(txs.filter(t=>pilotStatus(t)==='completed').reduce((s,t)=>s+num(t.amount),0));
+    const successRate=total?Math.round(completed/total*100):0, disputeRate=total?Math.round(openDisputes/total*100):0;
+    const targetBuyers=num((req.query&&req.query.targetBuyers)||process.env.PILOT_TARGET_BUYERS||100), targetSellers=num((req.query&&req.query.targetSellers)||process.env.PILOT_TARGET_SELLERS||20), targetTransactions=num((req.query&&req.query.targetTransactions)||process.env.PILOT_TARGET_TRANSACTIONS||100), targetValue=num((req.query&&req.query.targetValue)||process.env.PILOT_TARGET_VALUE||50000);
+    const progress=[{label:'Registered buyers',current:buyers,target:targetBuyers,percent:pct(buyers,targetBuyers),note:'Public users who can initiate transactions.'},{label:'Registered sellers',current:sellers,target:targetSellers,percent:pct(sellers,targetSellers),note:'Sellers able to list catalogue items.'},{label:'Pilot transactions',current:total,target:targetTransactions,percent:pct(total,targetTransactions),note:'Transactions created in the selected period.'},{label:'Transaction value',current:totalValue,target:targetValue,percent:pct(totalValue,targetValue),note:'Total ZMW value represented by pilot records.'}];
+    const flags=[flag(buyers>=Math.min(10,targetBuyers),'Minimum buyer pool started',`${buyers}/${targetBuyers} buyers`,'Register controlled pilot buyers.',1),flag(sellers>=Math.min(5,targetSellers),'Minimum seller pool started',`${sellers}/${targetSellers} sellers`,'Recruit pilot sellers in one narrow category first.',1),flag(total>0,'Transaction workflow has evidence',`${total} transactions`,'Run controlled pilot transactions.',2),flag(successRate>=70||total<5,'Completion rate acceptable',`${successRate}% completed`,'Improve handover, confirmation and payout/release journey.',2),flag(disputeRate<=15,'Dispute rate under watch threshold',`${disputeRate}% open disputes`,'Investigate repeat disputes and friction.',1),flag(collectionUnreconciled===0,'Collections reconciled',`${collectionUnreconciled} unreconciled collections`,'Accounts should reconcile paid transactions against PSP records.',2),flag(payoutUnreconciled===0,'Payout/settlement checks clear',`${payoutUnreconciled} unreconciled payouts`,'Finance should reconcile completed payouts/settlements.',2),flag(openIncidents===0,'No open compliance incidents',`${openIncidents} open incidents`,'Close or document action plans before external reviews.',1),flag(auditLog.length>0,'Audit trail has activity',`${auditLog.length} audit events`,'Continue recording staff and system actions.',1),flag(ledgerEntries.length>0||total===0,'Ledger evidence available',`${ledgerEntries.length} ledger entries`,'Ensure money events write ledger entries.',2)];
+    const sc=score(flags);
+    return {ok:true,generatedAt:nowIso(),period:{from:r.fromRaw,to:r.toRaw,mode:(r.fromRaw||r.toRaw)?'filtered':'all_time'},targets:{buyers:targetBuyers,sellers:targetSellers,transactions:targetTransactions,value:targetValue},score:sc,band:sc>=85?'Pilot evidence strong':sc>=70?'Pilot evidence moderate':sc>=50?'Pilot evidence early':'Pilot evidence weak',participants:{buyers,sellers,activeBuyers:active(txs,'buyerPhone'),activeSellers:active(txs,'sellerPhone'),verifiedUsers:users.filter(u=>String((u&&u.kycStatus)||'').toLowerCase()==='verified').length,pendingKyc:users.filter(u=>['pending','under_review','needs_more_info'].includes(String((u&&u.kycStatus)||'').toLowerCase())).length},transactions:{total,statuses,completed,openDisputes,successRate,disputeRate},value:{totalValue,collectedValue,heldValue,completedValue,avgTxValue:total?money(totalValue/total):0,currency:'ZMW'},operations:{collectionUnreconciled,payoutUnreconciled,openIncidents,auditEvents:auditLog.length,ledgerEvents:ledgerEntries.length},progress,flags,actionPlan:flags.filter(f=>!f.ok).sort((a,b)=>(b.weight||1)-(a.weight||1)).map(f=>({issue:f.label,action:f.action,detail:f.detail})),topCategories:topCats(),recentTransactions:txs.slice().sort((a,b)=>ms(txTime(b))-ms(txTime(a))).slice(0,20).map(safeTx),note:'Pilot metrics are generated from TutoPay workflow records. Payment processing, settlement, refunds and reversals remain the responsibility of licensed PSP/mobile-money/banking partners.'};
+  }
+  app.get('/api/admin/pilot/overview', requireAuth, gate, (req,res)=>res.json(overview(req)));
+  app.get('/api/admin/pilot/export', requireAuth, gate, (req,res)=>res.json({ok:true,title:'TutoPay Controlled Pilot Evidence Pack',generatedAt:nowIso(),generatedBy:{phone:req.user.phone,role:req.user.role},nonCustodialStatement:'TutoPay manages transaction workflow, evidence, confirmations, disputes, audit records and reconciliation metadata. Customer funds are processed, held, settled, refunded or reversed by licensed PSP/mobile-money/banking partners.',overview:overview(req),controls:{staffSegregation:'Admin, Risk, Accounts, Finance and Compliance roles are separated.',reconciliation:'Collections and payouts can be marked reconciled/unreconciled by authorised accounting/finance staff.',compliance:'Compliance console tracks readiness gaps, KYC review, restrictions and incidents.',audit:'Staff and system actions are captured in audit logs where implemented.'},nextRecommendedEvidence:['Run 20-100 controlled pilot transactions with real sellers and buyers.','Export reconciliation CSV and match records against PSP sandbox/partner statements.','Resolve or document every open dispute and incident before external review.','Attach the compliance policy pack, system architecture and transaction flow diagram to PSP/BoZ submissions.']}));
+  const csv=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
+  app.get('/api/admin/pilot/metrics.csv', requireAuth, gate, (req,res)=>{ const o=overview(req); const rows=[['metric','value','note'],['readiness_score',o.score,o.band],['buyers',o.participants.buyers,'Registered buyer accounts'],['sellers',o.participants.sellers,'Registered seller accounts'],['active_buyers',o.participants.activeBuyers,'Buyers appearing in pilot transactions'],['active_sellers',o.participants.activeSellers,'Sellers appearing in pilot transactions'],['transactions_total',o.transactions.total,'Total transaction records'],['success_rate_percent',o.transactions.successRate,'Completed / total transactions'],['dispute_rate_percent',o.transactions.disputeRate,'Open disputes / total transactions'],['total_value_zmw',o.value.totalValue,'Total pilot value'],['collected_value_zmw',o.value.collectedValue,'Paid/collected value'],['held_value_zmw',o.value.heldValue,'Paid but not completed/refunded'],['completed_value_zmw',o.value.completedValue,'Completed/released value'],['unreconciled_collections',o.operations.collectionUnreconciled,'Paid transactions needing collection reconciliation'],['unreconciled_payouts',o.operations.payoutUnreconciled,'Completed payouts needing finance reconciliation'],['open_incidents',o.operations.openIncidents,'Compliance incidents not closed'],['audit_events',o.operations.auditEvents,'Audit log count'],['ledger_events',o.operations.ledgerEvents,'Ledger event count']]; res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-metrics.csv"'); res.end(rows.map(r=>r.map(csv).join(',')).join('\n')); });
+})();
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`TutoPay API running on port ${PORT} [stage=${APP_STAGE}]`);
 });
