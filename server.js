@@ -5307,6 +5307,20 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const doc = docs.find((d, idx) => String(d.id || `${got.c.caseId}-doc-${idx+1}`) === docId) || null;
     if (!doc) return res.status(404).json({ error: 'Evidence file not found' });
 
+    try {
+      if (globalThis.__tpLogEvidenceAccess) {
+        globalThis.__tpLogEvidenceAccess(req, {
+          evidenceType: 'dispute',
+          source: 'issues_case_evidence',
+          txId: tx.id,
+          caseId: got.c.caseId,
+          docId,
+          docName: doc.name || doc.originalname || doc.filename || null,
+          mimetype: doc.mimetype || null,
+        });
+      }
+    } catch (_) {}
+
     if (doc.url && String(doc.url).startsWith('http')) {
       return res.redirect(String(doc.url));
     }
@@ -5485,6 +5499,320 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   app.get('/api/admin/pilot/export', requireAuth, gate, (req,res)=>res.json({ok:true,title:'TutoPay Controlled Pilot Evidence Pack',generatedAt:nowIso(),generatedBy:{phone:req.user.phone,role:req.user.role},nonCustodialStatement:'TutoPay manages transaction workflow, evidence, confirmations, disputes, audit records and reconciliation metadata. Customer funds are processed, held, settled, refunded or reversed by licensed PSP/mobile-money/banking partners.',overview:overview(req),controls:{staffSegregation:'Admin, Risk, Accounts, Finance and Compliance roles are separated.',reconciliation:'Collections and payouts can be marked reconciled/unreconciled by authorised accounting/finance staff.',compliance:'Compliance console tracks readiness gaps, KYC review, restrictions and incidents.',audit:'Staff and system actions are captured in audit logs where implemented.'},nextRecommendedEvidence:['Run 20-100 controlled pilot transactions with real sellers and buyers.','Export reconciliation CSV and match records against PSP sandbox/partner statements.','Resolve or document every open dispute and incident before external review.','Attach the compliance policy pack, system architecture and transaction flow diagram to PSP/BoZ submissions.']}));
   const csv=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
   app.get('/api/admin/pilot/metrics.csv', requireAuth, gate, (req,res)=>{ const o=overview(req); const rows=[['metric','value','note'],['readiness_score',o.score,o.band],['buyers',o.participants.buyers,'Registered buyer accounts'],['sellers',o.participants.sellers,'Registered seller accounts'],['active_buyers',o.participants.activeBuyers,'Buyers appearing in pilot transactions'],['active_sellers',o.participants.activeSellers,'Sellers appearing in pilot transactions'],['transactions_total',o.transactions.total,'Total transaction records'],['success_rate_percent',o.transactions.successRate,'Completed / total transactions'],['dispute_rate_percent',o.transactions.disputeRate,'Open disputes / total transactions'],['total_value_zmw',o.value.totalValue,'Total pilot value'],['collected_value_zmw',o.value.collectedValue,'Paid/collected value'],['held_value_zmw',o.value.heldValue,'Paid but not completed/refunded'],['completed_value_zmw',o.value.completedValue,'Completed/released value'],['unreconciled_collections',o.operations.collectionUnreconciled,'Paid transactions needing collection reconciliation'],['unreconciled_payouts',o.operations.payoutUnreconciled,'Completed payouts needing finance reconciliation'],['open_incidents',o.operations.openIncidents,'Compliance incidents not closed'],['audit_events',o.operations.auditEvents,'Audit log count'],['ledger_events',o.operations.ledgerEvents,'Ledger event count']]; res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-metrics.csv"'); res.end(rows.map(r=>r.map(csv).join(',')).join('\n')); });
+})();
+
+
+/* ===== Data Protection + Evidence Privacy Console v1.5 =====
+   Adds consent records, data subject request register, evidence access logs,
+   privacy incident capture, user export pack, and authenticated evidence routes.
+*/
+(function(){
+  const DATA_RETENTION_DAYS = Number(process.env.DATA_RETENTION_DAYS || 2555); // ~7 years default
+  const dataRequests = globalThis.__tpDataRequests || (globalThis.__tpDataRequests = []);
+  const evidenceAccessLog = globalThis.__tpEvidenceAccessLog || (globalThis.__tpEvidenceAccessLog = []);
+
+  function roleName(req){ return String((req && req.user && req.user.role) || '').toLowerCase(); }
+  function isPrivacyStaffRole(role){
+    const r = String(role || '').toLowerCase();
+    return r === 'admin' || r === 'compliance_agent' || r === 'compliance_officer';
+  }
+  function isEvidenceStaffRole(role){
+    const r = String(role || '').toLowerCase();
+    return r === 'admin' || r === 'risk_agent' || r === 'fraud_agent' || r === 'compliance_agent' || r === 'compliance_officer';
+  }
+  function requirePrivacyStaff(req,res,next){
+    if (!req.user || !isPrivacyStaffRole(req.user.role)) return res.status(403).json({ error:'Admin or Compliance Agent only' });
+    return next();
+  }
+  function sanitizePhone(v){ return String(v || '').trim(); }
+  function reqIp(req){ return (req && (req.ip || (req.headers && req.headers['x-forwarded-for']))) || null; }
+  function safeUserForPrivacy(u){
+    if (!u) return null;
+    const profile = u.profile || {};
+    const kyc = u.kycProfile || {};
+    return {
+      id: u.id || null,
+      phone: u.phone,
+      role: u.role,
+      disabled: !!u.disabled,
+      kycLevel: getEffectiveKycLevel(u),
+      kycStatus: u.kycStatus || 'unsubmitted',
+      createdAt: u.createdAt || null,
+      profile: {
+        displayName: profile.displayName || profile.fullName || profile.firstName || null,
+        businessName: profile.businessName || null,
+        email: profile.email || null,
+        accountKind: profile.accountKind || null,
+      },
+      kycSummary: {
+        fullName: kyc.fullName || null,
+        idType: kyc.idType || null,
+        idNumber: kyc.idNumber ? maskId(kyc.idNumber) : null,
+        businessName: kyc.businessName || null,
+        submittedAt: u.kycSubmittedAt || null,
+        reviewedAt: u.kycReviewedAt || null,
+        reviewedBy: u.kycReviewedBy || null,
+        attachmentCount: kycAttachmentEntriesFromProfile(kyc).length,
+      },
+      consents: normalizeConsentRecord(u),
+      complianceRestricted: !!u.complianceRestricted,
+      restrictionReason: u.restrictionReason || null,
+    };
+  }
+  function maskId(v){
+    const s = String(v || '');
+    if (s.length <= 4) return '****';
+    return `${s.slice(0,2)}***${s.slice(-2)}`;
+  }
+  function normalizeConsentRecord(u){
+    const c = (u && u.consents) || {};
+    const acceptedAt = c.acceptedAt || c.termsAcceptedAt || c.dataProcessingAcceptedAt || (u && u.createdAt) || null;
+    return {
+      termsAccepted: !!(c.termsAccepted || c.terms || c.termsOfUseAccepted),
+      dataProcessingAccepted: !!(c.dataProcessingAccepted || c.privacyAccepted || c.dataConsent),
+      nonCustodialModelAcknowledged: !!(c.nonCustodialModelAcknowledged || c.nonCustodialAccepted),
+      acceptedAt,
+      policyVersion: c.policyVersion || '1.0-partner-demo',
+    };
+  }
+  function countSensitiveEvidence(){
+    const kycCount = users.reduce((acc,u)=> acc + kycAttachmentEntriesFromProfile((u && u.kycProfile) || {}).length, 0);
+    const disputeCount = transactions.reduce((acc,t)=> acc + (Array.isArray(t && t.disputeDocs) ? t.disputeDocs.length : 0), 0);
+    const legacyPublicEvidence = transactions.reduce((acc,t)=>{
+      const docs = Array.isArray(t && t.disputeDocs) ? t.disputeDocs : [];
+      return acc + docs.filter(d => String(d.urlPath||'').startsWith('/uploads/') || String(d.url||'').includes('/uploads/')).length;
+    }, 0);
+    return { kycCount, disputeCount, total: kycCount + disputeCount, legacyPublicEvidence };
+  }
+  function privacyScore(flags){
+    const max = flags.reduce((a,f)=>a+(f.weight||1),0) || 1;
+    const got = flags.reduce((a,f)=>a+(f.ok ? (f.weight||1) : 0),0);
+    return Math.round((got/max)*100);
+  }
+  async function dbEnsurePrivacySchema(){
+    if (!dbEnabled()) return false;
+    await _pgPool.query(`
+      CREATE TABLE IF NOT EXISTS tutopay_data_requests (
+        id TEXT PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data JSONB NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS tutopay_evidence_access (
+        id TEXT PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data JSONB NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS tutopay_data_requests_ts_idx ON tutopay_data_requests(ts);
+      CREATE INDEX IF NOT EXISTS tutopay_evidence_access_ts_idx ON tutopay_evidence_access(ts);
+    `);
+    return true;
+  }
+  async function dbInsertDataRequest(row){
+    if (!dbEnabled()) return;
+    await dbEnsurePrivacySchema();
+    await _pgPool.query(`INSERT INTO tutopay_data_requests(id, ts, data) VALUES ($1, $2, $3::jsonb) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`, [row.id, new Date(row.createdAt || nowIso()), JSON.stringify(row)]);
+  }
+  async function dbUpdateDataRequest(row){ return dbInsertDataRequest(row); }
+  async function dbListDataRequests(limit=200){
+    if (!dbEnabled()) return dataRequests.slice().sort((a,b)=>String(b.createdAt||'').localeCompare(String(a.createdAt||''))).slice(0,limit);
+    await dbEnsurePrivacySchema();
+    const r = await _pgPool.query(`SELECT data FROM tutopay_data_requests ORDER BY ts DESC LIMIT $1`, [limit]);
+    return (r.rows || []).map(x=>x.data);
+  }
+  async function dbInsertEvidenceAccess(row){
+    if (!dbEnabled()) return;
+    await dbEnsurePrivacySchema();
+    await _pgPool.query(`INSERT INTO tutopay_evidence_access(id, ts, data) VALUES ($1, $2, $3::jsonb) ON CONFLICT (id) DO NOTHING`, [row.id, new Date(row.accessedAt || nowIso()), JSON.stringify(row)]);
+  }
+  async function dbListEvidenceAccess(limit=300){
+    if (!dbEnabled()) return evidenceAccessLog.slice().sort((a,b)=>String(b.accessedAt||'').localeCompare(String(a.accessedAt||''))).slice(0,limit);
+    await dbEnsurePrivacySchema();
+    const r = await _pgPool.query(`SELECT data FROM tutopay_evidence_access ORDER BY ts DESC LIMIT $1`, [limit]);
+    return (r.rows || []).map(x=>x.data);
+  }
+  function logEvidenceAccess(req, details={}){
+    const entry = {
+      id: uuid(),
+      accessedAt: nowIso(),
+      actorPhone: (req && req.user && req.user.phone) || 'system',
+      actorRole: (req && req.user && req.user.role) || 'system',
+      ip: reqIp(req),
+      ...details,
+    };
+    evidenceAccessLog.push(entry);
+    if (evidenceAccessLog.length > 1000) evidenceAccessLog.splice(0, evidenceAccessLog.length - 1000);
+    dbInsertEvidenceAccess(entry).catch(()=>{});
+    try { logAudit(req, 'privacy_evidence_access', { evidenceType: entry.evidenceType, source: entry.source, txId: entry.txId || null, docId: entry.docId || null, targetPhone: entry.targetPhone || null }); } catch(_){ }
+    return entry;
+  }
+  globalThis.__tpLogEvidenceAccess = logEvidenceAccess;
+
+  function userIsTxParticipant(req, tx){
+    if (!req.user || !tx) return false;
+    const p = String(req.user.phone || '');
+    return p && (String(tx.fromPhone || '') === p || String(tx.toPhone || '') === p || String(tx.buyerPhone || '') === p || String(tx.sellerPhone || '') === p);
+  }
+  function findTxDoc(txId, docId){
+    const tx = transactions.find(t => String(t.id || '') === String(txId || '')) || null;
+    if (!tx) return { err:'Transaction not found' };
+    const docs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
+    const doc = docs.find((d,idx)=> String(d.id || `${tx.id}-doc-${idx+1}`) === String(docId || '')) || null;
+    if (!doc) return { err:'Evidence file not found', tx };
+    return { tx, doc };
+  }
+  function serveEvidenceDoc(req,res,doc){
+    if (doc.url && String(doc.url).startsWith('http')) return res.redirect(String(doc.url));
+    const filename = String(doc.filename || '').trim();
+    if (!filename) return res.status(404).json({ error:'Evidence filename missing' });
+    const fp = path.join(uploadDir, filename);
+    if (!fs.existsSync(fp)) return res.status(404).json({ error:'Evidence file missing on server' });
+    res.setHeader('Content-Type', doc.mimetype || 'application/octet-stream');
+    const disp = (String(doc.mimetype||'').startsWith('image/') || String(doc.mimetype||'').includes('pdf')) ? 'inline' : 'attachment';
+    res.setHeader('Content-Disposition', `${disp}; filename="${String(doc.originalname||doc.name||filename).replace(/"/g,'')}"`);
+    return res.sendFile(fp);
+  }
+
+  app.get('/api/privacy/me', requireAuth, async (req,res)=>{
+    const user = findUserByPhone(req.user.phone);
+    if (!user) return res.status(404).json({ error:'User not found' });
+    const mine = (await dbListDataRequests(300)).filter(r => String(r.userPhone||'') === String(req.user.phone||''));
+    res.json({ ok:true, user: safeUserForPrivacy(user), dataRequests: mine });
+  });
+
+  app.post('/api/privacy/request', requireAuth, async (req,res)=>{
+    const body = req.body || {};
+    const type = String(body.type || 'access').toLowerCase();
+    if (!['access','correction','deletion','export','restriction','objection','other'].includes(type)) return res.status(400).json({ error:'Invalid request type' });
+    const row = {
+      id: uuid(),
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      status: 'open',
+      type,
+      userPhone: req.user.phone,
+      submittedBy: req.user.phone,
+      submittedByRole: req.user.role,
+      description: String(body.description || '').trim(),
+      assignedTo: null,
+      notes: [],
+    };
+    dataRequests.push(row);
+    await dbInsertDataRequest(row).catch(()=>{});
+    logAudit(req, 'privacy_data_request_created', { id: row.id, type: row.type, userPhone: row.userPhone });
+    res.json({ ok:true, request: row });
+  });
+
+  app.get('/api/admin/privacy/overview', requireAuth, requirePrivacyStaff, async (req,res)=>{
+    const requests = await dbListDataRequests(500).catch(()=>dataRequests);
+    const access = await dbListEvidenceAccess(500).catch(()=>evidenceAccessLog);
+    const consents = users.map(normalizeConsentRecord);
+    const evidence = countSensitiveEvidence();
+    const openReqs = requests.filter(r=>!['closed','resolved','rejected'].includes(String(r.status||'open').toLowerCase())).length;
+    const privacyIncidents = (globalThis.__tpComplianceIncidents || []).filter(i=>String(i.category||'').toLowerCase().includes('data') || String(i.type||'').toLowerCase().includes('privacy'));
+    const openPrivacyIncidents = privacyIncidents.filter(i=>String(i.status||'open').toLowerCase() !== 'closed').length;
+    const flags = [
+      { label:'Consent captured at signup', ok: users.length === 0 || consents.some(c=>c.termsAccepted && c.dataProcessingAccepted && c.nonCustodialModelAcknowledged), detail:`${consents.filter(c=>c.termsAccepted&&c.dataProcessingAccepted&&c.nonCustodialModelAcknowledged).length}/${users.length} users have full consent record`, action:'Keep terms, privacy and non-custodial acknowledgement mandatory during onboarding.', weight:2 },
+      { label:'Data request register active', ok:true, detail:`${requests.length} data requests recorded`, action:'Use the register for correction, deletion, export or restriction requests.', weight:1 },
+      { label:'Evidence access logging active', ok:true, detail:`${access.length} sensitive evidence access events logged`, action:'Open evidence through authenticated routes so access is recorded.', weight:2 },
+      { label:'Sensitive evidence inventory visible', ok:evidence.total >= 0, detail:`KYC ${evidence.kycCount}, dispute evidence ${evidence.disputeCount}`, action:'Keep KYC and dispute evidence restricted to authorised staff.', weight:1 },
+      { label:'Legacy public evidence exposure under control', ok:evidence.legacyPublicEvidence === 0, detail:`${evidence.legacyPublicEvidence} evidence links still reference public /uploads`, action:'Use authenticated evidence routes for dispute/KYC documents. Catalogue images may remain public.', weight:2 },
+      { label:'Privacy incident register active', ok:openPrivacyIncidents === 0, detail:`${openPrivacyIncidents} open privacy/data incidents`, action:'Document and close privacy incidents with action taken.', weight:1 },
+      { label:'Retention policy defined', ok:DATA_RETENTION_DAYS > 0, detail:`Default retention setting: ${DATA_RETENTION_DAYS} days`, action:'Confirm the period with legal/PSP guidance before live launch.', weight:1 },
+    ];
+    const score = privacyScore(flags);
+    res.json({ ok:true, generatedAt: nowIso(), stage: APP_STAGE, score, band: score>=85?'Privacy posture strong':score>=70?'Privacy posture moderate':score>=50?'Privacy posture early':'Privacy posture weak', retentionDays: DATA_RETENTION_DAYS, counts:{ users: users.length, consentFull: consents.filter(c=>c.termsAccepted&&c.dataProcessingAccepted&&c.nonCustodialModelAcknowledged).length, dataRequests: requests.length, openDataRequests: openReqs, evidenceAccessEvents: access.length, sensitiveEvidenceTotal: evidence.total, kycEvidence: evidence.kycCount, disputeEvidence: evidence.disputeCount, legacyPublicEvidence: evidence.legacyPublicEvidence, privacyIncidents: privacyIncidents.length, openPrivacyIncidents }, flags, recentAccess: access.slice(0,10), recentRequests: requests.slice(0,10), note:'TutoPay should use authenticated evidence access, record consent, maintain a data-request register, and restrict sensitive files to authorised staff.' });
+  });
+
+  app.get('/api/admin/privacy/requests', requireAuth, requirePrivacyStaff, async (req,res)=>{
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit || 200)));
+    const rows = await dbListDataRequests(limit).catch(()=>dataRequests.slice(-limit).reverse());
+    res.json({ ok:true, requests: rows });
+  });
+
+  app.post('/api/admin/privacy/requests', requireAuth, requirePrivacyStaff, async (req,res)=>{
+    const body = req.body || {};
+    const userPhone = sanitizePhone(body.userPhone || body.phone);
+    if (!userPhone) return res.status(400).json({ error:'userPhone is required' });
+    const type = String(body.type || 'access').toLowerCase();
+    const row = { id:uuid(), createdAt:nowIso(), updatedAt:nowIso(), status:String(body.status||'open'), type, userPhone, submittedBy:req.user.phone, submittedByRole:req.user.role, description:String(body.description||'').trim(), assignedTo:String(body.assignedTo||req.user.phone||''), notes:[{ at:nowIso(), by:req.user.phone, note:String(body.note||body.description||'Created by staff').trim() }] };
+    dataRequests.push(row);
+    await dbInsertDataRequest(row).catch(()=>{});
+    logAudit(req, 'privacy_staff_data_request_created', { id:row.id, type:row.type, userPhone });
+    res.json({ ok:true, request: row });
+  });
+
+  app.post('/api/admin/privacy/requests/:id/status', requireAuth, requirePrivacyStaff, async (req,res)=>{
+    const id = String(req.params.id||'').trim();
+    const rows = await dbListDataRequests(1000).catch(()=>dataRequests);
+    const row = rows.find(r=>String(r.id)===id) || dataRequests.find(r=>String(r.id)===id);
+    if (!row) return res.status(404).json({ error:'Data request not found' });
+    const status = String((req.body||{}).status || '').toLowerCase();
+    if (!['open','in_progress','resolved','closed','rejected'].includes(status)) return res.status(400).json({ error:'Invalid status' });
+    row.status = status;
+    row.updatedAt = nowIso();
+    row.closedAt = ['resolved','closed','rejected'].includes(status) ? nowIso() : null;
+    row.notes = Array.isArray(row.notes) ? row.notes : [];
+    const note = String((req.body||{}).note || '').trim();
+    if (note) row.notes.push({ at: nowIso(), by:req.user.phone, note });
+    await dbUpdateDataRequest(row).catch(()=>{});
+    logAudit(req, 'privacy_data_request_status', { id, status, userPhone: row.userPhone });
+    res.json({ ok:true, request: row });
+  });
+
+  app.get('/api/admin/privacy/evidence-access', requireAuth, requirePrivacyStaff, async (req,res)=>{
+    const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 300)));
+    const rows = await dbListEvidenceAccess(limit).catch(()=>evidenceAccessLog.slice(-limit).reverse());
+    res.json({ ok:true, access: rows });
+  });
+
+  app.get('/api/admin/privacy/users/:phone/export', requireAuth, requirePrivacyStaff, async (req,res)=>{
+    const phone = sanitizePhone(req.params.phone);
+    const user = findUserByPhone(phone);
+    if (!user) return res.status(404).json({ error:'User not found' });
+    const userTxs = transactions.filter(t => String(t.fromPhone||t.buyerPhone||'') === phone || String(t.toPhone||t.sellerPhone||'') === phone).map(t => ({ id:t.id, itemCode:t.itemCode||t.code||null, amount:t.amount||0, status:t.status||null, paymentStatus:t.paymentStatus||null, createdAt:t.createdAt||t.startedAt||null }));
+    const userReqs = (await dbListDataRequests(500).catch(()=>dataRequests)).filter(r=>String(r.userPhone||'')===phone);
+    const access = (await dbListEvidenceAccess(500).catch(()=>evidenceAccessLog)).filter(a=>String(a.targetPhone||'')===phone || String(a.actorPhone||'')===phone);
+    logAudit(req, 'privacy_user_export', { targetPhone: phone, txCount: userTxs.length });
+    res.json({ ok:true, generatedAt: nowIso(), generatedBy:{ phone:req.user.phone, role:req.user.role }, user: safeUserForPrivacy(user), transactions: userTxs, dataRequests:userReqs, relatedEvidenceAccess:access, retentionDays:DATA_RETENTION_DAYS, note:'This export is an internal data-protection pack for responding to access/correction/export requests. Review before sharing externally.' });
+  });
+
+  app.post('/api/admin/privacy/incidents', requireAuth, requirePrivacyStaff, async (req,res)=>{
+    const body = req.body || {};
+    const incident = { id:uuid(), createdAt:nowIso(), updatedAt:nowIso(), title:String(body.title||'Data protection incident').trim(), severity:String(body.severity||'medium').toLowerCase(), category:'data_protection', type:'privacy', status:'open', description:String(body.description||body.note||'').trim(), createdBy:req.user.phone, createdByRole:req.user.role };
+    const incArr = globalThis.__tpComplianceIncidents || (globalThis.__tpComplianceIncidents = []);
+    incArr.push(incident);
+    if (dbEnabled()) { try { await dbInsertIncident(incident); } catch(_){} }
+    logAudit(req, 'privacy_incident_created', { id:incident.id, severity:incident.severity, title:incident.title });
+    res.json({ ok:true, incident });
+  });
+
+  app.get('/api/evidence/transactions/:txId/:docId', requireAuth, (req,res)=>{
+    const got = findTxDoc(req.params.txId, req.params.docId);
+    if (got.err) return res.status(404).json({ error: got.err });
+    if (!isEvidenceStaffRole(roleName(req)) && !userIsTxParticipant(req, got.tx)) return res.status(403).json({ error:'Not authorised to view this evidence' });
+    logEvidenceAccess(req, { evidenceType:'dispute', source:'transaction_evidence', txId:got.tx.id, docId:req.params.docId, docName:got.doc.name||got.doc.originalname||got.doc.filename||null, mimetype:got.doc.mimetype||null });
+    return serveEvidenceDoc(req,res,got.doc);
+  });
+
+  app.get('/api/admin/privacy/users/:phone/kyc-attachment/:key', requireAuth, requirePrivacyStaff, (req,res)=>{
+    const phone = sanitizePhone(req.params.phone);
+    const key = String(req.params.key || '').trim();
+    const user = findUserByPhone(phone);
+    if (!user) return res.status(404).json({ error:'User not found' });
+    const kyc = user.kycProfile || {};
+    const entries = kycAttachmentEntriesFromProfile(kyc);
+    const entry = entries.find(e => String(e.key||'') === key || String(e.label||'') === key);
+    if (!entry || !entry.url) return res.status(404).json({ error:'KYC attachment not found' });
+    logEvidenceAccess(req, { evidenceType:'kyc', source:'kyc_attachment', targetPhone:phone, docId:key, docName:entry.label||key });
+    const u = String(entry.url || '');
+    if (u.startsWith('http')) return res.redirect(u);
+    if (u.startsWith('/uploads/')) {
+      const fp = path.join(uploadDir, path.basename(u));
+      if (!fs.existsSync(fp)) return res.status(404).json({ error:'KYC file missing on server' });
+      return res.sendFile(fp);
+    }
+    return res.status(400).json({ error:'Attachment is not viewable through this route' });
+  });
 })();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
