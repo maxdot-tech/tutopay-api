@@ -4195,23 +4195,97 @@ app.use((err, req, res, next) => {
     };
   }
 
+  function _readinessFlag(ok, label, detail, action, category, weight){
+    return { ok: !!ok, label, detail: String(detail || ''), action: String(action || ''), category: category || 'general', weight: Number(weight || 1) || 1 };
+  }
+  function _envSet(name){ return !!String(process.env[name] || '').trim(); }
+  function _envAny(names){ return names.some(_envSet); }
+  function _maskedEnvStatus(name){ return _envSet(name) ? 'configured' : 'missing'; }
+  function _kycBreakdown(){
+    const out = { unsubmitted:0, pending:0, under_review:0, verified:0, rejected:0, needs_more_info:0, other:0 };
+    users.forEach(u => {
+      const s = String((u && u.kycStatus) || 'unsubmitted').toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(out, s)) out[s] += 1;
+      else out.other += 1;
+    });
+    return out;
+  }
+  function _staffBreakdown(){
+    const out = { admin:0, risk_agent:0, accounts_agent:0, finance_agent:0, compliance_agent:0, other_staff:0 };
+    users.forEach(u => {
+      const r = String((u && u.role) || '').toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(out, r)) out[r] += 1;
+      else if (isInternalStaffRole(r)) out.other_staff += 1;
+    });
+    return out;
+  }
+  function _readinessScore(controls){
+    const total = controls.reduce((s,c)=>s + (Number(c.weight)||1), 0) || 1;
+    const got = controls.reduce((s,c)=>s + (c.ok ? (Number(c.weight)||1) : 0), 0);
+    return Math.round((got / total) * 100);
+  }
   function _complianceOverview() {
     const counts = _complianceCounts();
+    const txs = issuesTxs().map(ensureTxReconDefaults);
+    const pendingCollection = txs.filter((t) => t.paymentStatus === 'paid' && !t.collectionReconciled).length;
+    const pendingPayout = txs.filter((t) => (t.status === 'completed' || (t.disbursement && t.disbursement.status === 'successful')) && !t.payoutReconciled).length;
+    const openIncidents = complianceIncidents.filter(i => String(i.status || 'open').toLowerCase() !== 'closed').length;
+    const openDisputes = txs.filter(t => !!t.disputeActive || String(t.status||'').toLowerCase()==='disputed').length;
+    const paymentsConfigured = PAYMENTS_MODE === 'demo' || _envAny(['MTN_COLLECTION_SUB_KEY','AIRTEL_CLIENT_ID']);
+    const payoutConfigured = PAYMENTS_MODE === 'demo' || _envAny(['MTN_DISBURSEMENT_SUB_KEY']);
+    const cloudinaryConfigured = _envAny(['CLOUDINARY_URL']) || (_envSet('CLOUDINARY_CLOUD_NAME') && _envSet('CLOUDINARY_API_KEY') && _envSet('CLOUDINARY_API_SECRET'));
+    const callbackSecretConfigured = !!(process.env.MTN_CALLBACK_SECRET || process.env.CALLBACK_SHARED_SECRET || process.env.AIRTEL_CALLBACK_SECRET);
+    const staff = _staffBreakdown();
+    const kyc = _kycBreakdown();
+
     const controls = [
-      { key:'auth', label:'Auth sessions & role guard', ok:true, detail:'Token-based sessions and role checks active' },
-      { key:'kyc', label:'KYC workflow', ok: true, detail:'KYC submission/review endpoints enabled' },
-      { key:'ledger', label:'Ledger & reconciliation', ok: ledgerEntries.length >= 0, detail: `${ledgerEntries.length} ledger events tracked` },
-      { key:'audit', label:'Audit logging', ok: auditLog.length >= 0, detail: `${auditLog.length} audit events retained` },
-      { key:'callbacks', label:'Provider callback secret', ok: !!(process.env.MTN_CALLBACK_SECRET || process.env.CALLBACK_SHARED_SECRET || process.env.AIRTEL_CALLBACK_SECRET), detail: 'Secrets configured for callback verification' },
-      { key:'issues', label:'Issues Desk operations', ok: true, detail: 'Risk/fraud investigation panel and APIs enabled' },
+      _readinessFlag(DEMO_MODE === false, 'Demo mode disabled', `DEMO_MODE=${DEMO_MODE}`, 'Set DEMO_MODE=false for partner-facing demonstrations.', 'environment', 2),
+      _readinessFlag(String(APP_STAGE||'').toLowerCase().includes('partner'), 'Partner-demo stage set', `APP_STAGE=${APP_STAGE || 'unset'}`, 'Set APP_STAGE=partner_demo to identify controlled demo deployments.', 'environment', 1),
+      _readinessFlag(dbReady && (dbEnabled() || !STRICT_DB_MODE), 'Database/startup readiness', `dbReady=${dbReady}, dbEnabled=${dbEnabled()}, strict=${STRICT_DB_MODE}`, 'Use Postgres DATABASE_URL and STRICT_DB_MODE=true before live money movement.', 'infrastructure', 2),
+      _readinessFlag(!!PUBLIC_API_BASE && /^https:/.test(String(PUBLIC_API_BASE)), 'HTTPS public API base', `PUBLIC_API_BASE=${PUBLIC_API_BASE || 'unset'}`, 'Use an HTTPS API base for callbacks and partner integrations.', 'infrastructure', 1),
+      _readinessFlag(callbackSecretConfigured, 'Callback shared secret configured', `MTN=${_maskedEnvStatus('MTN_CALLBACK_SECRET')}, Airtel=${_maskedEnvStatus('AIRTEL_CALLBACK_SECRET')}`, 'Configure provider callback secrets and share only with PSP partners.', 'payments', 2),
+      _readinessFlag(paymentsConfigured, 'Collection rail configuration', `PAYMENTS_MODE=${PAYMENTS_MODE}`, 'Configure MTN/Airtel collection credentials or keep clearly marked sandbox mode.', 'payments', 2),
+      _readinessFlag(payoutConfigured, 'Payout/disbursement configuration', `PAYMENTS_MODE=${PAYMENTS_MODE}`, 'Configure disbursement credentials or document PSP-led settlement procedure.', 'payments', 2),
+      _readinessFlag(cloudinaryConfigured, 'Persistent evidence/image storage', cloudinaryConfigured ? 'Cloudinary configured' : 'Cloudinary not configured', 'Configure durable private storage for catalogue, KYC and evidence files.', 'data', 1),
+      _readinessFlag(complianceDocs.length >= 8, 'Compliance policy pack available', `${complianceDocs.length} policy documents`, 'Keep policy versions current and export them for PSP/BoZ packs.', 'compliance', 2),
+      _readinessFlag(staff.admin >= 1 && staff.risk_agent >= 1 && staff.compliance_agent >= 1 && (staff.accounts_agent + staff.finance_agent) >= 1, 'Segregated staff roles', `Admin=${staff.admin}, Risk=${staff.risk_agent}, Compliance=${staff.compliance_agent}, Accounts/Finance=${staff.accounts_agent + staff.finance_agent}`, 'Create at least one Risk, Compliance and Accounts/Finance staff account.', 'governance', 2),
+      _readinessFlag(auditLog.length >= 0, 'Audit trail active', `${auditLog.length} audit events`, 'Continue to capture staff actions, approvals and account changes.', 'governance', 1),
+      _readinessFlag(ledgerEntries.length >= 0, 'Ledger/reconciliation trail active', `${ledgerEntries.length} ledger events`, 'Use reconciliation exports and match against PSP statements during pilot.', 'finance', 2),
+      _readinessFlag(pendingCollection === 0 && pendingPayout === 0, 'No unreconciled money events', `${pendingCollection} pending collection checks, ${pendingPayout} pending payout checks`, 'Accounts/Finance should reconcile outstanding items before partner reviews.', 'finance', 1),
+      _readinessFlag(openIncidents === 0, 'No open compliance incidents', `${openIncidents} open incidents`, 'Close or document incident action plans before external demos.', 'operations', 1),
+      _readinessFlag(openDisputes === 0, 'No open disputes', `${openDisputes} open disputes`, 'Resolve or clearly document active cases before PSP/BoZ reviews.', 'risk', 1),
     ];
-    const score = Math.round((controls.filter(c=>c.ok).length / controls.length) * 100);
+    const score = _readinessScore(controls);
+
+    const gaps = controls
+      .filter(c => !c.ok)
+      .map(c => ({ label:c.label, category:c.category, detail:c.detail, action:c.action, weight:c.weight }))
+      .sort((a,b)=> (b.weight||1)-(a.weight||1));
+
     return {
       readinessScore: score,
+      readinessBand: score >= 85 ? 'Strong partner-demo readiness' : (score >= 70 ? 'Moderate readiness' : (score >= 50 ? 'Early readiness' : 'Needs major cleanup')),
       generatedAt: nowIso(),
-      counts,
+      stage: APP_STAGE,
+      paymentsMode: PAYMENTS_MODE,
+      demoMode: DEMO_MODE,
+      database: { ready: dbReady, enabled: dbEnabled(), strict: STRICT_DB_MODE },
+      counts: Object.assign({}, counts, { pendingCollectionReconciliation: pendingCollection, pendingPayoutReconciliation: pendingPayout, openComplianceIncidents: openIncidents, openDisputes }),
+      kycBreakdown: kyc,
+      staffBreakdown: staff,
       controls,
+      gaps,
       policyDocs: complianceDocs.map(d => ({ id:d.id, title:d.title, version:d.version, path:d.path, updatedAt:d.updatedAt })),
+      envSnapshot: {
+        appStage: APP_STAGE || '',
+        paymentMode: PAYMENTS_MODE,
+        publicSignup: ALLOW_PUBLIC_SIGNUP,
+        mtnCollection: _envAny(['MTN_COLLECTION_SUB_KEY','MTN_COLLECTION_APIUSER','MTN_COLLECTION_APIKEY']),
+        mtnDisbursement: _envAny(['MTN_DISBURSEMENT_SUB_KEY','MTN_DISBURSEMENT_APIUSER','MTN_DISBURSEMENT_APIKEY']),
+        airtelCollection: _envAny(['AIRTEL_CLIENT_ID','AIRTEL_CLIENT_SECRET']),
+        callbackSecrets: callbackSecretConfigured,
+        cloudinary: cloudinaryConfigured,
+      },
       recency: {
         lastAuditAt: auditLog.length ? auditLog[auditLog.length-1].timestamp : null,
         lastLedgerAt: ledgerEntries.length ? ledgerEntries[ledgerEntries.length-1].timestamp : null,
@@ -4228,16 +4302,16 @@ app.use((err, req, res, next) => {
     res.json({ ok:true, doc });
   });
   app.get('/api/admin/compliance/overview', requireAuth, (req,res)=> {
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
     res.json(_complianceOverview());
   });
   app.get('/api/admin/compliance/incidents', requireAuth, (req,res)=> {
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
     const limit = Math.max(1, Math.min(500, Number(req.query.limit)||100));
     res.json({ ok:true, incidents: complianceIncidents.slice(-limit).reverse() });
   });
   app.post('/api/admin/compliance/incidents', requireAuth, async (req,res)=> {
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
     const title = String((req.body||{}).title || '').trim();
     if (!title) return res.status(400).json({ error:'title is required' });
     const entry = {
@@ -4256,6 +4330,74 @@ app.use((err, req, res, next) => {
     try { await dbInsertIncident(entry); } catch(e){}
     logAudit(req, 'compliance_incident_create', { incidentId: entry.id, title: entry.title, severity: entry.severity });
     res.json({ ok:true, incident: entry });
+  });
+
+  app.post('/api/admin/compliance/incidents/:incidentId/status', requireAuth, (req,res)=> {
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
+    const id = String(req.params.incidentId || '').trim();
+    const incident = complianceIncidents.find(i => String(i.id) === id);
+    if (!incident) return res.status(404).json({ error:'Incident not found' });
+    const status = String((req.body||{}).status || '').trim().toLowerCase();
+    const allowed = ['open','in_review','monitoring','closed'];
+    if (!allowed.includes(status)) return res.status(400).json({ error:'Invalid status' });
+    incident.status = status;
+    incident.updatedAt = nowIso();
+    incident.updatedBy = req.user.phone;
+    if ((req.body||{}).note) {
+      incident.notes = incident.notes || [];
+      incident.notes.push({ at: incident.updatedAt, by: req.user.phone, note: String((req.body||{}).note).trim() });
+    }
+    logAudit(req, 'compliance_incident_status_update', { incidentId: id, status });
+    res.json({ ok:true, incident });
+  });
+
+  app.get('/api/admin/compliance/users', requireAuth, (req,res)=> {
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
+    const status = String(req.query.status || '').trim().toLowerCase();
+    const role = String(req.query.role || '').trim().toLowerCase();
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit)||100));
+    let rows = users.filter(u => u && u.role !== 'admin');
+    if (status) rows = rows.filter(u => String(u.kycStatus || 'unsubmitted').toLowerCase() === status);
+    if (role) rows = rows.filter(u => String(u.role || '').toLowerCase() === role);
+    if (q) rows = rows.filter(u => `${u.phone||''} ${u.name||''} ${u.businessName||''} ${u.role||''} ${u.kycStatus||''}`.toLowerCase().includes(q));
+    rows = rows.slice(-limit).reverse().map(u => ({
+      id: u.id,
+      phone: u.phone,
+      name: u.name || u.fullName || '',
+      businessName: u.businessName || '',
+      role: u.role,
+      kycLevel: u.kycLevel || 'basic',
+      kycStatus: u.kycStatus || 'unsubmitted',
+      disabled: !!u.disabled,
+      complianceRestricted: !!u.complianceRestricted,
+      restrictionReason: u.restrictionReason || '',
+      restrictedAt: u.restrictedAt || null,
+      createdAt: u.createdAt || null,
+      updatedAt: u.updatedAt || null,
+      hasNrc: !!u.nrc,
+      hasSelfie: !!(u.selfieUrl || u.selfie || u.selfieDataUrl),
+      hasBusinessDocs: !!(u.businessDocUrl || u.businessDocs || u.logoUrl),
+    }));
+    res.json({ ok:true, users: rows });
+  });
+
+  app.post('/api/admin/compliance/users/:phone/restrict', requireAuth, async (req,res)=> {
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
+    const phone = String(req.params.phone || '').trim();
+    const user = findUserByPhone(phone);
+    if (!user) return res.status(404).json({ error:'User not found' });
+    if (user.role === 'admin') return res.status(400).json({ error:'Admin accounts cannot be restricted here' });
+    const restricted = !!(req.body||{}).restricted;
+    const reason = String((req.body||{}).reason || '').trim();
+    user.complianceRestricted = restricted;
+    user.restrictionReason = restricted ? reason : '';
+    user.restrictedAt = restricted ? nowIso() : null;
+    user.restrictedBy = restricted ? req.user.phone : '';
+    user.updatedAt = nowIso();
+    try { if (dbEnabled()) await dbUpsertUser(user); } catch(e){}
+    logAudit(req, 'compliance_user_restriction', { phone:user.phone, restricted, reason });
+    res.json({ ok:true, user:{ phone:user.phone, role:user.role, complianceRestricted:!!user.complianceRestricted, restrictionReason:user.restrictionReason||'' } });
   });
 
 // ---- Step 8A exports (CSV) ----
@@ -4608,14 +4750,14 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
 
 
   app.get('/api/admin/compliance/export', requireAuth, (req,res)=> {
-    if (req.user.role !== 'admin') return res.status(403).json({ error:'Admin only' });
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
     const pkg = {
       exportedAt: nowIso(),
       by: req.user.phone,
       overview: _complianceOverview(),
       incidents: complianceIncidents.slice(-500),
       docs: complianceDocs,
-      notes: 'Partner Demo v1 compliance export package (JSON)'
+      notes: 'Partner Demo v1.3 PSP/BoZ readiness export package (JSON)'
     };
     res.json({ ok:true, package: pkg });
   });
