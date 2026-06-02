@@ -4762,6 +4762,190 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
     res.json({ ok:true, package: pkg });
   });
 
+
+
+  /* ===== TutoPay v1.6: PSP/BoZ Partner Pack backend ===== */
+  function _partnerPackAllowed(role){
+    const r = String(role || '').toLowerCase();
+    return r === 'admin' || isComplianceRole(r) || r === 'compliance_agent' || r === 'compliance_officer';
+  }
+  function _partnerPackGate(req,res,next){
+    if (!req.user || !_partnerPackAllowed(req.user.role)) return res.status(403).json({ error:'Admin/Compliance only' });
+    next();
+  }
+  function _ppMoney(v){
+    const n = Number(v || 0);
+    return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+  }
+  function _txLifecycleStatus(t){
+    const s = String((t && t.status) || '').toLowerCase();
+    if (s === 'completed' || s === 'released' || s === 'seller_paid') return 'completed';
+    if (s === 'disputed' || (t && t.disputeActive)) return 'disputed';
+    if (s === 'pending_payment') return 'pending_payment';
+    if (s === 'pending' || s === 'held' || s === 'in_escrow' || String((t&&t.paymentStatus)||'').toLowerCase() === 'paid') return 'held_or_in_progress';
+    return s || 'created';
+  }
+  function _partnerPackPilotMetrics(){
+    const txs = (transactions || []).map(t => ensureTxReconDefaults(t || {}));
+    const total = txs.length;
+    const completed = txs.filter(t => _txLifecycleStatus(t) === 'completed').length;
+    const disputed = txs.filter(t => _txLifecycleStatus(t) === 'disputed').length;
+    const paid = txs.filter(t => String(t.paymentStatus || '').toLowerCase() === 'paid' || t.paidAt).length;
+    const unreconciledCollections = txs.filter(t => (String(t.paymentStatus || '').toLowerCase() === 'paid' || t.paidAt) && !t.collectionReconciled).length;
+    const unreconciledPayouts = txs.filter(t => (_txLifecycleStatus(t) === 'completed' || (t.disbursement && String(t.disbursement.status||'').toLowerCase()==='successful')) && !t.payoutReconciled).length;
+    const totalValue = _ppMoney(txs.reduce((s,t)=>s+Number(t.amount||0),0));
+    const completedValue = _ppMoney(txs.filter(t=>_txLifecycleStatus(t)==='completed').reduce((s,t)=>s+Number(t.amount||0),0));
+    const buyerPhones = new Set(txs.map(t=>String(t.buyerPhone||t.fromPhone||'').trim()).filter(Boolean));
+    const sellerPhones = new Set(txs.map(t=>String(t.sellerPhone||t.toPhone||'').trim()).filter(Boolean));
+    return {
+      users: {
+        total: users.length,
+        buyers: users.filter(u=>String(u.role||'').toLowerCase()==='buyer').length,
+        sellers: users.filter(u=>String(u.role||'').toLowerCase()==='seller').length,
+        activeBuyers: buyerPhones.size,
+        activeSellers: sellerPhones.size,
+      },
+      transactions: {
+        total,
+        paid,
+        completed,
+        disputed,
+        completionRate: total ? Math.round((completed/total)*100) : 0,
+        disputeRate: total ? Math.round((disputed/total)*100) : 0,
+        totalValue,
+        completedValue,
+        unreconciledCollections,
+        unreconciledPayouts,
+      }
+    };
+  }
+  function _partnerPackRiskControls(){
+    return [
+      'Non-custodial model: licensed PSP/mobile-money/bank partner handles collection, settlement, payout, refund and reversal movement.',
+      'Role separation: admin, risk, accounts/finance and compliance roles operate separately.',
+      'KYC/CDD workflow: user verification levels, manual review, restrictions and limits are supported.',
+      'Issues Desk: disputes are linked to transaction records with evidence, policy actions, SLA handling and maker-checker outcomes.',
+      'Ledger/reconciliation: collection and payout events can be reconciled against partner statements.',
+      'Audit trail: staff account creation, KYC actions, restrictions, incidents, evidence access and financial workflow actions are logged.',
+      'Privacy controls: consent records, data request register, evidence access log and privacy incident register are available.',
+      'Callback security: partner callbacks can be protected using shared callback secrets and idempotency handling.',
+    ];
+  }
+  function _partnerPackPriorityGaps(overview){
+    const controls = Array.isArray(overview.controls) ? overview.controls : [];
+    return controls.filter(c=>!c.ok).sort((a,b)=>(Number(b.weight||1)-Number(a.weight||1))).slice(0,8).map(c=>({ label:c.label, category:c.category, detail:c.detail, action:c.action, weight:c.weight }));
+  }
+  function _buildPartnerPack(req){
+    const overview = _complianceOverview();
+    const pilot = _partnerPackPilotMetrics();
+    const gaps = _partnerPackPriorityGaps(overview);
+    const docs = complianceDocs.map(d=>({ id:d.id, title:d.title, version:d.version, path:d.path, updatedAt:d.updatedAt }));
+    const staff = _staffBreakdown();
+    const kyc = _kycBreakdown();
+    const incidents = (globalThis.__tpComplianceIncidents || []).slice(-200);
+    const openIncidents = incidents.filter(i=>String(i.status||'open').toLowerCase()!=='closed').length;
+    return {
+      ok:true,
+      packageVersion:'1.6-partner-pack',
+      generatedAt: nowIso(),
+      generatedBy: { phone: req.user.phone, role: req.user.role },
+      product: {
+        name:'TutoPay',
+        legalWorkingName:'TutoPay Escrow Services / SafePay Zambia',
+        stage: APP_STAGE,
+        model:'Non-custodial marketplace transaction workflow over licensed PSP rails',
+        oneLine:'TutoPay helps buyers and sellers trade more safely by recording evidence, confirmations, disputes, release/refund decisions and reconciliation while licensed partners move funds.'
+      },
+      regulatoryPositioning: {
+        fundsCustody:'TutoPay does not custody customer funds.',
+        partnerRole:'Licensed PSP/mobile-money/bank partners process collections, settlement, payouts, refunds and reversals.',
+        tutopayRole:'TutoPay manages transaction workflow, verification, evidence capture, delivery/collection confirmation, dispute handling, audit records and reconciliation references.',
+        recommendedLanguage:'TutoPay operates as a non-custodial transaction workflow and trust layer using licensed payment partners for money movement.'
+      },
+      deployment: {
+        appStage: APP_STAGE,
+        demoMode: DEMO_MODE,
+        paymentsMode: PAYMENTS_MODE,
+        publicApiBase: PUBLIC_API_BASE,
+        dbReady,
+        dbEnabled: dbEnabled(),
+        strictDbMode: STRICT_DB_MODE,
+        cloudStorageConfigured: !!(process.env.CLOUDINARY_URL || (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)),
+        callbackSecretConfigured: !!(process.env.MTN_CALLBACK_SECRET || process.env.AIRTEL_CALLBACK_SECRET || process.env.CALLBACK_SHARED_SECRET),
+      },
+      readiness: {
+        score: overview.readinessScore,
+        band: overview.readinessBand,
+        counts: overview.counts,
+        staff,
+        kyc,
+        priorityGaps: gaps,
+        controls: overview.controls,
+      },
+      pilotEvidence: pilot,
+      governanceAndControls: _partnerPackRiskControls(),
+      documents: docs,
+      incidents: { recent: incidents, openCount: openIncidents },
+      exports: [
+        { label:'Full JSON partner pack', endpoint:'/api/admin/partner-pack/export' },
+        { label:'Concept note text', endpoint:'/api/admin/partner-pack/concept-note.txt' },
+        { label:'PSP introduction letter text', endpoint:'/api/admin/partner-pack/psp-letter.txt' },
+        { label:'Readiness checklist CSV', endpoint:'/api/admin/partner-pack/checklist.csv' }
+      ],
+      nextSteps: [
+        'Keep the pilot controlled and documented before any real-money scale-up.',
+        'Get a written PSP/merchant partnership pathway before live public launch.',
+        'Use Postgres/strict DB mode and private evidence storage before production money movement.',
+        'Resolve or document open disputes, incidents and unreconciled money events before partner reviews.',
+        'Prepare formal AML/CFT, data protection, consumer complaints and settlement procedures for legal/PSP review.'
+      ],
+      note:'Generated for PSP, investor and BoZ pre-engagement discussions. Review with legal/compliance advisers before external submission.'
+    };
+  }
+  function _conceptNoteText(pkg){
+    const gaps = (pkg.readiness.priorityGaps || []).map((g,i)=>`${i+1}. ${g.label}: ${g.action}`).join('\n') || 'No major priority gaps returned by the readiness console.';
+    const docs = (pkg.documents || []).map(d=>`- ${d.title} (${d.version})`).join('\n');
+    return `TUTOPAY CONCEPT NOTE\nGenerated: ${pkg.generatedAt}\n\n1. Product Summary\n${pkg.product.oneLine}\n\n2. Regulatory Positioning\n${pkg.regulatoryPositioning.recommendedLanguage}\nFunds custody: ${pkg.regulatoryPositioning.fundsCustody}\nPartner role: ${pkg.regulatoryPositioning.partnerRole}\nTutoPay role: ${pkg.regulatoryPositioning.tutopayRole}\n\n3. Current Readiness\nReadiness score: ${pkg.readiness.score}%\nReadiness band: ${pkg.readiness.band}\nDeployment stage: ${pkg.deployment.appStage}\nPayments mode: ${pkg.deployment.paymentsMode}\nDatabase ready: ${pkg.deployment.dbReady}\nCallback secret configured: ${pkg.deployment.callbackSecretConfigured}\n\n4. Pilot Evidence Snapshot\nRegistered users: ${pkg.pilotEvidence.users.total}\nBuyers: ${pkg.pilotEvidence.users.buyers}\nSellers: ${pkg.pilotEvidence.users.sellers}\nTransactions: ${pkg.pilotEvidence.transactions.total}\nCompleted transactions: ${pkg.pilotEvidence.transactions.completed}\nDisputed transactions: ${pkg.pilotEvidence.transactions.disputed}\nTotal value represented: ZMW ${pkg.pilotEvidence.transactions.totalValue}\n\n5. Key Controls\n${pkg.governanceAndControls.map(x=>'- '+x).join('\n')}\n\n6. Policy Pack\n${docs}\n\n7. Priority Gaps / Action Plan\n${gaps}\n\n8. Requested Engagement\nTutoPay seeks discussion with licensed PSP/payment partners on a controlled pilot model where the partner executes money movement while TutoPay manages the marketplace workflow, verification, evidence, disputes, records and reconciliation references.\n\nNote: This concept note is generated from the live TutoPay partner-pack console and should be reviewed before external submission.\n`;
+  }
+  function _pspLetterText(pkg){
+    return `Dear PSP Partnership Team,\n\nRE: Request for Partnership Discussion - TutoPay Non-Custodial Marketplace Transaction Workflow\n\nI am writing to request a partnership discussion regarding TutoPay, a Zambian marketplace transaction workflow platform designed to help buyers and sellers trade more safely over licensed payment rails.\n\nTutoPay's intended model is non-custodial. Customer funds would be collected, settled, refunded, reversed and/or paid out by a licensed PSP/mobile-money/banking partner. TutoPay would manage the transaction workflow around those rails, including buyer/seller records, evidence capture, collection or delivery confirmation, dispute handling, audit trails, reconciliation references and compliance escalation.\n\nCurrent readiness snapshot:\n- Readiness score: ${pkg.readiness.score}% (${pkg.readiness.band})\n- Deployment stage: ${pkg.deployment.appStage}\n- Payments mode: ${pkg.deployment.paymentsMode}\n- Registered users: ${pkg.pilotEvidence.users.total}\n- Transactions recorded: ${pkg.pilotEvidence.transactions.total}\n- Total transaction value represented: ZMW ${pkg.pilotEvidence.transactions.totalValue}\n\nTutoPay has internal consoles for admin, risk, compliance, accounts/finance reconciliation, privacy/data protection and pilot metrics. The platform also maintains policy documents covering terms, privacy, KYC/CDD, AML/CFT controls, disputes, data retention, incident response and PSP settlement/reconciliation procedures.\n\nI would appreciate an opportunity to present the workflow and discuss how TutoPay could run a controlled pilot using your licensed payment rails, settlement rules, compliance expectations and technical integration requirements.\n\nYours faithfully,\n\nMaxwell Sambo\nFounder / Promoter, TutoPay\n`;
+  }
+
+  app.get('/api/admin/partner-pack/overview', requireAuth, _partnerPackGate, (req,res)=>{
+    const pkg = _buildPartnerPack(req);
+    logAudit(req, 'partner_pack_overview_viewed', { readinessScore: pkg.readiness.score, stage: pkg.deployment.appStage });
+    res.json({ ok:true, generatedAt:pkg.generatedAt, product:pkg.product, deployment:pkg.deployment, readiness:pkg.readiness, pilotEvidence:pkg.pilotEvidence, documents:pkg.documents, exports:pkg.exports, nextSteps:pkg.nextSteps, note:pkg.note });
+  });
+  app.get('/api/admin/partner-pack/export', requireAuth, _partnerPackGate, (req,res)=>{
+    const pkg = _buildPartnerPack(req);
+    logAudit(req, 'partner_pack_exported', { readinessScore: pkg.readiness.score, format:'json' });
+    res.json(pkg);
+  });
+  app.get('/api/admin/partner-pack/concept-note.txt', requireAuth, _partnerPackGate, (req,res)=>{
+    const pkg = _buildPartnerPack(req);
+    logAudit(req, 'partner_pack_concept_note_downloaded', { readinessScore: pkg.readiness.score });
+    res.setHeader('Content-Type','text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-concept-note.txt"');
+    res.end(_conceptNoteText(pkg));
+  });
+  app.get('/api/admin/partner-pack/psp-letter.txt', requireAuth, _partnerPackGate, (req,res)=>{
+    const pkg = _buildPartnerPack(req);
+    logAudit(req, 'partner_pack_psp_letter_downloaded', { readinessScore: pkg.readiness.score });
+    res.setHeader('Content-Type','text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-psp-introduction-letter.txt"');
+    res.end(_pspLetterText(pkg));
+  });
+  app.get('/api/admin/partner-pack/checklist.csv', requireAuth, _partnerPackGate, (req,res)=>{
+    const pkg = _buildPartnerPack(req);
+    const rows = [['category','control','status','detail','action','weight']];
+    (pkg.readiness.controls || []).forEach(c => rows.push([c.category||'', c.label||'', c.ok?'READY':'GAP', c.detail||'', c.action||'', c.weight||1]));
+    const csv = rows.map(r=>r.map(csvEscape).join(',')).join('\n');
+    logAudit(req, 'partner_pack_checklist_downloaded', { readinessScore: pkg.readiness.score });
+    res.setHeader('Content-Type','text/csv');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-readiness-checklist.csv"');
+    res.end(csv);
+  });
+
   // ---- Issues Desk foundation (Step 7A) ----
   const ISSUE_POLICIES = [
     { code:'RISK-01', label:'Request More Evidence', actionType:'request_more_evidence', nextStatus:'awaiting_customer', template:'Please upload clearer proof (photos, chats, receipts, delivery evidence) within the requested timeframe.' },
