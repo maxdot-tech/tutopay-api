@@ -2061,6 +2061,7 @@ app.post("/api/otp/start", requireAuth, (req, res) => {
 // -------- Auth (phone + PIN) --------
 app.post("/api/auth/login", loginLimiter, (req, res) => {
   const { phone, pin, rolePreference, profile } = req.body || {};
+  const pilotInviteCode = String(((req.body || {}).pilotInviteCode || (profile && profile.pilotInviteCode) || "")).trim().toUpperCase();
   if (!phone || !pin) {
     return res.status(400).json({ error: "Phone and PIN are required." });
   }
@@ -2102,6 +2103,15 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
     const allowedRoles = ["buyer", "seller"];
     const role = allowedRoles.includes(wantedRole) ? wantedRole : "buyer";
 
+    let pilotSignupResult = null;
+    if (typeof globalThis.__tpPilotConsumeInviteForSignup === "function") {
+      pilotSignupResult = globalThis.__tpPilotConsumeInviteForSignup({ req, code: pilotInviteCode, role, phone: phoneNorm, profile });
+      if (pilotSignupResult && pilotSignupResult.error) {
+        logAudit(req, "pilot_signup_invite_failed", { phoneTried: phoneNorm, role, code: pilotInviteCode || null, reason: pilotSignupResult.error });
+        return res.status(pilotSignupResult.statusCode || 400).json({ error: pilotSignupResult.error });
+      }
+    }
+
     user = {
       id: uuid(),
       phone: phoneNorm,
@@ -2111,6 +2121,7 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
       kycStatus: "unsubmitted",
       kycHistory: [],
       consents: profile && profile.consents ? profile.consents : {},
+      pilotOnboarding: pilotSignupResult && pilotSignupResult.participant ? pilotSignupResult.participant : null,
     };
     users.push(user);
     if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
@@ -2181,6 +2192,23 @@ if (profile && typeof profile === "object") {
   } catch (e) {}
 }
 
+// Link a pilot invite to an existing account when a valid invite code is submitted during signup.
+if (pilotInviteCode && (!user.pilotOnboarding || !user.pilotOnboarding.inviteCode)) {
+  try {
+    if (typeof globalThis.__tpPilotConsumeInviteForSignup === "function") {
+      const linkResult = globalThis.__tpPilotConsumeInviteForSignup({ req, code: pilotInviteCode, role: user.role, phone: phoneNorm, profile });
+      if (linkResult && linkResult.error) {
+        logAudit(req, "pilot_existing_invite_failed", { phoneTried: phoneNorm, role: user.role, code: pilotInviteCode, reason: linkResult.error });
+        return res.status(linkResult.statusCode || 400).json({ error: linkResult.error });
+      }
+      if (linkResult && linkResult.participant) {
+        user.pilotOnboarding = linkResult.participant;
+        if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
+      }
+    }
+  } catch (e) {}
+}
+
 clearLoginFailures(phoneNorm);
 
 const token = crypto.randomBytes(24).toString("hex");
@@ -2211,6 +2239,7 @@ const token = crypto.randomBytes(24).toString("hex");
       role: user.role,
       kycLevel: getEffectiveKycLevel(user),
       kycStatus: user.kycStatus,
+      pilotOnboarding: user.pilotOnboarding || null,
     },
   });
 });
@@ -5997,6 +6026,310 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     }
     return res.status(400).json({ error:'Attachment is not viewable through this route' });
   });
+})();
+
+
+
+/* ===== TutoPay v1.7: Controlled Pilot Onboarding backend =====
+   Adds invite-code onboarding, participant tracking, feedback capture,
+   and exportable pilot evidence without changing the core payment flow.
+*/
+(function TP_CONTROLLED_PILOT_ONBOARDING_V17(){
+  if (globalThis.__tpControlledPilotOnboardingV17) return;
+  globalThis.__tpControlledPilotOnboardingV17 = true;
+
+  const PILOT_INVITES_REQUIRED = String(process.env.PILOT_INVITES_REQUIRED || "false").toLowerCase() === "true";
+  const PILOT_DEFAULT_MAX_USES = Math.max(1, Number(process.env.PILOT_DEFAULT_INVITE_USES || 1));
+  const pilotInvites = globalThis.__tpPilotInvites || (globalThis.__tpPilotInvites = []);
+  const pilotParticipants = globalThis.__tpPilotParticipants || (globalThis.__tpPilotParticipants = []);
+  const pilotFeedback = globalThis.__tpPilotFeedback || (globalThis.__tpPilotFeedback = []);
+  let pilotDbReady = false;
+  let pilotDbLoaded = false;
+
+  function r(req){ return String((req && req.user && req.user.role) || '').toLowerCase().trim(); }
+  function isPilotStaff(req){ const role = r(req); return role === 'admin' || role === 'risk_agent' || role === 'fraud_agent' || role === 'compliance_agent' || role === 'compliance_officer' || role === 'accounts_agent' || role === 'finance_agent'; }
+  function canWritePilot(req){ const role = r(req); return role === 'admin' || role === 'risk_agent' || role === 'fraud_agent' || role === 'compliance_agent' || role === 'compliance_officer'; }
+  function requirePilotStaff(req,res,next){ if(!req.user) return res.status(401).json({error:'Authentication required'}); if(!isPilotStaff(req)) return res.status(403).json({error:'Pilot staff access required'}); next(); }
+  function requirePilotWrite(req,res,next){ if(!req.user) return res.status(401).json({error:'Authentication required'}); if(!canWritePilot(req)) return res.status(403).json({error:'Admin, Risk or Compliance access required'}); next(); }
+  function clean(v){ return String(v == null ? '' : v).trim(); }
+  function phone(v){ return clean(v); }
+  function code(v){ return clean(v).toUpperCase().replace(/\s+/g,'-'); }
+  function lc(v){ return clean(v).toLowerCase(); }
+  function n(v,d=0){ const x=Number(v); return Number.isFinite(x)?x:d; }
+  function pct(a,b){ b=n(b); return b>0?Math.round((n(a)/b)*100):0; }
+  function arr(x){ return Array.isArray(x) ? x : []; }
+  function csvCell(v){ const s=String(v == null ? '' : v); return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; }
+  function statusOpen(s){ return !['closed','completed','suspended','cancelled','expired','revoked'].includes(lc(s)); }
+
+  function participantName(profile){
+    profile = profile || {};
+    return clean(profile.fullName || profile.displayName || profile.businessName || profile.firstName || '');
+  }
+  function participantArea(profile){ return clean(profile.pilotArea || profile.area || profile.location || profile.marketLocation || ''); }
+  function participantCategory(profile){ return clean(profile.pilotCategory || profile.category || profile.itemCategory || ''); }
+
+  async function pilotDbEnsure(){
+    if (!dbEnabled() || !_pgPool) return false;
+    if (pilotDbReady) return true;
+    await _pgPool.query(`
+      CREATE TABLE IF NOT EXISTS tutopay_pilot_records (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        code TEXT,
+        phone TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data JSONB NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS tutopay_pilot_records_kind_idx ON tutopay_pilot_records(kind);
+      CREATE INDEX IF NOT EXISTS tutopay_pilot_records_code_idx ON tutopay_pilot_records(code);
+      CREATE INDEX IF NOT EXISTS tutopay_pilot_records_phone_idx ON tutopay_pilot_records(phone);
+    `);
+    pilotDbReady = true;
+    return true;
+  }
+  async function pilotDbLoad(force=false){
+    if (!dbEnabled() || !_pgPool) return false;
+    await pilotDbEnsure();
+    if (pilotDbLoaded && !force) return true;
+    const out = await _pgPool.query("SELECT kind, data FROM tutopay_pilot_records ORDER BY updated_at ASC");
+    const inv=[], part=[], fb=[];
+    for (const row of out.rows || []) {
+      if (row.kind === 'invite') inv.push(row.data);
+      else if (row.kind === 'participant') part.push(row.data);
+      else if (row.kind === 'feedback') fb.push(row.data);
+    }
+    if (inv.length) { pilotInvites.length = 0; pilotInvites.push(...inv); }
+    if (part.length) { pilotParticipants.length = 0; pilotParticipants.push(...part); }
+    if (fb.length) { pilotFeedback.length = 0; pilotFeedback.push(...fb); }
+    pilotDbLoaded = true;
+    return true;
+  }
+  async function pilotDbUpsert(kind, obj){
+    if (!obj || !obj.id || !dbEnabled() || !_pgPool) return;
+    await pilotDbEnsure();
+    await _pgPool.query(
+      "INSERT INTO tutopay_pilot_records (id, kind, code, phone, data, updated_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (id) DO UPDATE SET kind=EXCLUDED.kind, code=EXCLUDED.code, phone=EXCLUDED.phone, data=EXCLUDED.data, updated_at=NOW()",
+      [String(obj.id), kind, obj.code || obj.inviteCode || null, obj.phone || obj.userPhone || null, JSON.stringify(obj)]
+    );
+  }
+
+  function findInviteByCode(raw){ const c=code(raw); return pilotInvites.find(i => code(i.code) === c) || null; }
+  function inviteValid(inv, role, userPhone){
+    if (!inv) return { ok:false, error:'Invalid pilot invite code.' };
+    if (lc(inv.status || 'active') !== 'active') return { ok:false, error:'This pilot invite is not active.' };
+    if (inv.expiresAt && Date.now() > Date.parse(inv.expiresAt)) return { ok:false, error:'This pilot invite has expired.' };
+    const maxUses = Math.max(1, n(inv.maxUses, 1));
+    const used = Math.max(0, n(inv.usedCount, 0));
+    const existingForPhone = pilotParticipants.find(p => code(p.inviteCode) === code(inv.code) && phone(p.phone) === phone(userPhone));
+    if (!existingForPhone && used >= maxUses) return { ok:false, error:'This pilot invite has already been used.' };
+    const inviteRole = lc(inv.role || 'any');
+    const wantedRole = lc(role || 'buyer');
+    if (inviteRole !== 'any' && inviteRole !== wantedRole) return { ok:false, error:`This invite is for ${inviteRole} accounts only.` };
+    if (inv.targetPhone && phone(inv.targetPhone) !== phone(userPhone)) return { ok:false, error:'This invite is reserved for a different phone number.' };
+    return { ok:true };
+  }
+  function buildParticipant({ req, invite, role, userPhone, profile }){
+    const existing = pilotParticipants.find(p => phone(p.phone) === phone(userPhone)) || null;
+    const now = nowIso();
+    const base = existing || { id: uuid(), createdAt: now };
+    base.updatedAt = now;
+    base.phone = phone(userPhone);
+    base.role = lc(role || (invite && invite.role) || 'buyer');
+    base.status = lc(base.status || 'active') === 'pending' ? 'active' : (base.status || 'active');
+    base.name = participantName(profile) || base.name || '';
+    base.area = participantArea(profile) || base.area || invite.location || '';
+    base.category = participantCategory(profile) || base.category || invite.category || '';
+    base.businessName = clean((profile || {}).businessName || base.businessName || '');
+    base.inviteId = invite ? invite.id : (base.inviteId || null);
+    base.inviteCode = invite ? code(invite.code) : (base.inviteCode || null);
+    base.consentAccepted = !!((profile || {}).pilotConsentAccepted || base.consentAccepted || (invite && invite.consentAccepted));
+    base.consentAcceptedAt = base.consentAcceptedAt || ((profile || {}).pilotConsentAcceptedAt || now);
+    base.createdBy = base.createdBy || (req && req.user ? req.user.phone : 'self_signup');
+    base.source = base.source || 'invite_signup';
+    return base;
+  }
+
+  function consumeInviteForSignup({ req, code: rawCode, role, phone: userPhone, profile }){
+    const c = code(rawCode || '');
+    if (!c) {
+      if (PILOT_INVITES_REQUIRED) return { error:'A valid pilot invite code is required for this controlled pilot.', statusCode:403 };
+      return { participant:null };
+    }
+    const invite = findInviteByCode(c);
+    const valid = inviteValid(invite, role, userPhone);
+    if (!valid.ok) return { error: valid.error, statusCode:400 };
+    const existed = pilotParticipants.find(p => phone(p.phone) === phone(userPhone));
+    const participant = buildParticipant({ req, invite, role, userPhone, profile });
+    if (!existed) {
+      pilotParticipants.push(participant);
+      invite.usedCount = Math.max(0, n(invite.usedCount, 0)) + 1;
+      invite.updatedAt = nowIso();
+      invite.lastUsedAt = nowIso();
+      invite.lastUsedBy = phone(userPhone);
+    } else {
+      Object.assign(existed, participant);
+    }
+    pilotDbUpsert('invite', invite).catch(()=>{});
+    pilotDbUpsert('participant', participant).catch(()=>{});
+    try { logAudit(req || { ip:null }, 'pilot_invite_consumed', { code:c, phone:phone(userPhone), role, participantId:participant.id }); } catch(_){ }
+    return { participant };
+  }
+  globalThis.__tpPilotConsumeInviteForSignup = consumeInviteForSignup;
+  globalThis.__tpPilotInvitesRequired = () => PILOT_INVITES_REQUIRED;
+
+  function makeInviteCode(role, seq){
+    const prefix = lc(role) === 'seller' ? 'SELLER' : (lc(role) === 'buyer' ? 'BUYER' : 'PILOT');
+    const num = String(seq || (pilotInvites.length + 1)).padStart(3,'0');
+    return `${prefix}-PILOT-${num}`;
+  }
+  function inviteSafe(inv){
+    return {
+      id: inv.id, code: inv.code, role: inv.role || 'any', label: inv.label || '', status: inv.status || 'active',
+      maxUses: n(inv.maxUses, 1), usedCount: n(inv.usedCount, 0), remainingUses: Math.max(0, n(inv.maxUses,1)-n(inv.usedCount,0)),
+      targetPhone: inv.targetPhone || '', category: inv.category || '', location: inv.location || '', expiresAt: inv.expiresAt || null,
+      createdAt: inv.createdAt || null, createdBy: inv.createdBy || '', lastUsedAt: inv.lastUsedAt || null, lastUsedBy: inv.lastUsedBy || null,
+      notes: inv.notes || ''
+    };
+  }
+  function txForPhone(ph){ const p=phone(ph); return transactions.filter(t => phone(t.buyerPhone || t.fromPhone) === p || phone(t.sellerPhone || t.toPhone) === p); }
+  function feedbackForPhone(ph){ const p=phone(ph); return pilotFeedback.filter(f => phone(f.phone || f.userPhone) === p); }
+  function participantSafe(p){
+    const txs = txForPhone(p.phone);
+    const fb = feedbackForPhone(p.phone);
+    return Object.assign({}, p, { txCount: txs.length, feedbackCount: fb.length, totalValue: txs.reduce((s,t)=>s+n(t.amount,0),0), lastTxAt: txs.map(t=>t.createdAt||t.updatedAt||t.paidAt).filter(Boolean).sort().pop() || null, avgFeedback: fb.length ? Math.round(fb.reduce((s,x)=>s+n(x.overallRating || x.trustRating || x.easeRating,0),0) / fb.length * 10)/10 : null });
+  }
+  function allParticipants(){
+    const byPhone = new Map();
+    for (const p of pilotParticipants) byPhone.set(phone(p.phone), Object.assign({}, p));
+    for (const u of users) {
+      if (u && u.pilotOnboarding && u.pilotOnboarding.phone) {
+        const p = Object.assign({}, u.pilotOnboarding, { phone:u.phone, role:u.role, name:(u.profile && (u.profile.displayName || u.profile.fullName || u.profile.businessName)) || u.pilotOnboarding.name || '' });
+        byPhone.set(phone(p.phone), Object.assign(byPhone.get(phone(p.phone)) || {}, p));
+      }
+    }
+    return Array.from(byPhone.values()).map(participantSafe);
+  }
+  function overview(){
+    const participants = allParticipants();
+    const invites = pilotInvites.map(inviteSafe);
+    const sellers = participants.filter(p => lc(p.role)==='seller');
+    const buyers = participants.filter(p => lc(p.role)==='buyer');
+    const active = participants.filter(p => ['active','pending'].includes(lc(p.status || 'active')));
+    const consent = participants.filter(p => !!p.consentAccepted);
+    const phones = new Set(participants.map(p=>phone(p.phone)));
+    const pilotTxs = transactions.filter(t => phones.has(phone(t.buyerPhone || t.fromPhone)) || phones.has(phone(t.sellerPhone || t.toPhone)));
+    const completed = pilotTxs.filter(t => ['completed','released','successful'].includes(lc(t.status || t.pilotStatus || ''))).length;
+    const disputed = pilotTxs.filter(t => t.disputeActive || ['disputed','refund_requested'].includes(lc(t.status || ''))).length;
+    const fb = pilotFeedback.slice();
+    const flags = [
+      { label:'Invite-code onboarding active', ok:invites.length>0, detail:`${invites.length} invite codes created`, action:'Generate buyer and seller pilot invite codes.', weight:2 },
+      { label:'Pilot seller pool started', ok:sellers.length>=1, detail:`${sellers.length} sellers enrolled`, action:'Recruit at least 5 sellers in one high-trust category.', weight:2 },
+      { label:'Pilot buyer pool started', ok:buyers.length>=3, detail:`${buyers.length} buyers enrolled`, action:'Recruit at least 10 controlled buyers.', weight:1 },
+      { label:'Pilot consent captured', ok:participants.length===0 || consent.length===participants.length, detail:`${consent.length}/${participants.length} participants have pilot consent`, action:'Require pilot consent when invite codes are used.', weight:2 },
+      { label:'Pilot transaction evidence exists', ok:pilotTxs.length>0, detail:`${pilotTxs.length} participant-linked transactions`, action:'Run controlled pilot transactions with invited users.', weight:2 },
+      { label:'Feedback evidence collected', ok:fb.length>0 || pilotTxs.length===0, detail:`${fb.length} feedback responses`, action:'Ask participants to submit feedback after transactions.', weight:1 },
+      { label:'Disputes under control', ok:disputed<=Math.max(1, Math.ceil(pilotTxs.length*0.2)), detail:`${disputed} disputed/open issue transactions`, action:'Track and resolve pilot disputes before partner review.', weight:1 },
+    ];
+    const totalWeight = flags.reduce((s,f)=>s+n(f.weight,1),0) || 1;
+    const score = Math.round(flags.filter(f=>f.ok).reduce((s,f)=>s+n(f.weight,1),0)*100/totalWeight);
+    const avgFeedback = fb.length ? Math.round(fb.reduce((s,x)=>s+n(x.overallRating || x.trustRating || x.easeRating,0),0)/fb.length*10)/10 : null;
+    return { ok:true, generatedAt:nowIso(), stage:APP_STAGE, inviteRequired:PILOT_INVITES_REQUIRED, score, band:score>=85?'Pilot onboarding strong':score>=70?'Pilot onboarding moderate':score>=50?'Pilot onboarding early':'Pilot onboarding weak', counts:{ invites:invites.length, activeInvites:invites.filter(i=>i.status==='active').length, participants:participants.length, activeParticipants:active.length, buyers:buyers.length, sellers:sellers.length, consentAccepted:consent.length, feedback:fb.length, participantTransactions:pilotTxs.length, completedTransactions:completed, disputedTransactions:disputed }, feedback:{ total:fb.length, average:avgFeedback, wouldUseAgain:fb.filter(x=>!!x.wouldUseAgain).length, latest:fb.slice(-10).reverse() }, flags, actionPlan:flags.filter(f=>!f.ok).sort((a,b)=>n(b.weight,1)-n(a.weight,1)).map(f=>({ issue:f.label, detail:f.detail, action:f.action })), participants, invites };
+  }
+
+  app.get('/api/pilot/invites/:code/validate', async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const inv = findInviteByCode(req.params.code);
+    const valid = inviteValid(inv, (req.query && req.query.role) || 'any', (req.query && req.query.phone) || '');
+    if (!valid.ok) return res.status(400).json({ ok:false, error:valid.error });
+    res.json({ ok:true, invite:inviteSafe(inv), message:'Pilot invite is valid.' });
+  });
+
+  app.get('/api/pilot/me', requireAuth, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const participants = allParticipants();
+    const me = participants.find(p=>phone(p.phone)===phone(req.user.phone)) || null;
+    res.json({ ok:true, participant:me, feedback: feedbackForPhone(req.user.phone).slice(-10).reverse(), inviteRequired:PILOT_INVITES_REQUIRED });
+  });
+
+  app.post('/api/pilot/feedback', requireAuth, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const body=req.body||{};
+    const participant = allParticipants().find(p=>phone(p.phone)===phone(req.user.phone)) || null;
+    if (!participant) return res.status(403).json({ error:'Pilot feedback is available to invited pilot participants only.' });
+    const entry={ id:uuid(), createdAt:nowIso(), updatedAt:nowIso(), phone:req.user.phone, role:req.user.role, participantId:participant.id || null, transactionId:clean(body.transactionId || body.txId || ''), easeRating:Math.max(1,Math.min(5,n(body.easeRating,0))), trustRating:Math.max(1,Math.min(5,n(body.trustRating,0))), paymentConfidence:Math.max(1,Math.min(5,n(body.paymentConfidence,0))), overallRating:Math.max(1,Math.min(5,n(body.overallRating,0))), wouldUseAgain:!!body.wouldUseAgain, comments:clean(body.comments || body.comment || '').slice(0,2000) };
+    pilotFeedback.push(entry);
+    if (pilotFeedback.length>5000) pilotFeedback.splice(0,pilotFeedback.length-5000);
+    await pilotDbUpsert('feedback', entry).catch(()=>{});
+    logAudit(req, 'pilot_feedback_submitted', { feedbackId:entry.id, phone:req.user.phone, overallRating:entry.overallRating, wouldUseAgain:entry.wouldUseAgain });
+    res.json({ ok:true, feedback:entry });
+  });
+
+  app.get('/api/admin/pilot/onboarding/overview', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); res.json(overview()); });
+  app.get('/api/admin/pilot/invites', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); res.json({ ok:true, invites: pilotInvites.map(inviteSafe).reverse() }); });
+  app.post('/api/admin/pilot/invites', requireAuth, requirePilotWrite, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const body=req.body||{};
+    const role = ['buyer','seller','any'].includes(lc(body.role)) ? lc(body.role) : 'buyer';
+    const custom = code(body.code || '');
+    const c = custom || makeInviteCode(role, pilotInvites.length + 1);
+    if (findInviteByCode(c)) return res.status(400).json({ error:'Invite code already exists.' });
+    const inv={ id:uuid(), code:c, role, label:clean(body.label || `${role} pilot invite`), status:'active', maxUses:Math.max(1,n(body.maxUses,PILOT_DEFAULT_MAX_USES)), usedCount:0, targetPhone:phone(body.targetPhone||''), category:clean(body.category||''), location:clean(body.location||''), expiresAt:body.expiresAt?new Date(body.expiresAt).toISOString():null, notes:clean(body.notes||''), createdAt:nowIso(), updatedAt:nowIso(), createdBy:req.user.phone };
+    pilotInvites.push(inv);
+    await pilotDbUpsert('invite', inv).catch(()=>{});
+    logAudit(req,'pilot_invite_created',{code:inv.code, role:inv.role, maxUses:inv.maxUses});
+    res.json({ ok:true, invite:inviteSafe(inv) });
+  });
+  app.post('/api/admin/pilot/invites/:id/status', requireAuth, requirePilotWrite, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const inv=pilotInvites.find(i=>String(i.id)===String(req.params.id) || code(i.code)===code(req.params.id));
+    if(!inv) return res.status(404).json({ error:'Invite not found' });
+    const status=lc((req.body||{}).status || 'active');
+    if(!['active','paused','revoked','expired'].includes(status)) return res.status(400).json({ error:'Invalid invite status' });
+    inv.status=status; inv.updatedAt=nowIso(); inv.updatedBy=req.user.phone;
+    await pilotDbUpsert('invite', inv).catch(()=>{});
+    logAudit(req,'pilot_invite_status_update',{code:inv.code,status});
+    res.json({ ok:true, invite:inviteSafe(inv) });
+  });
+
+  app.get('/api/admin/pilot/participants', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); res.json({ ok:true, participants: allParticipants().sort((a,b)=>String(b.updatedAt||b.createdAt||'').localeCompare(String(a.updatedAt||a.createdAt||''))) }); });
+  app.post('/api/admin/pilot/participants', requireAuth, requirePilotWrite, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const body=req.body||{}; const ph=phone(body.phone||body.userPhone);
+    if(!ph) return res.status(400).json({ error:'Phone is required.' });
+    const role=['buyer','seller'].includes(lc(body.role))?lc(body.role):'buyer';
+    let p=pilotParticipants.find(x=>phone(x.phone)===ph);
+    if(!p){ p={ id:uuid(), createdAt:nowIso(), phone:ph, source:'staff_added' }; pilotParticipants.push(p); }
+    Object.assign(p,{ updatedAt:nowIso(), role, status:lc(body.status||p.status||'active'), name:clean(body.name||p.name||''), area:clean(body.area||body.location||p.area||''), category:clean(body.category||p.category||''), businessName:clean(body.businessName||p.businessName||''), consentAccepted:!!(body.consentAccepted || p.consentAccepted), consentAcceptedAt:p.consentAcceptedAt || (body.consentAccepted?nowIso():null), createdBy:p.createdBy||req.user.phone, notes:clean(body.notes||p.notes||'') });
+    await pilotDbUpsert('participant', p).catch(()=>{});
+    const user=findUserByPhone(ph); if(user){ user.pilotOnboarding=p; if(dbEnabled()) dbUpsertUser(user).catch(()=>{}); }
+    logAudit(req,'pilot_participant_added',{phone:ph,role,status:p.status});
+    res.json({ ok:true, participant:participantSafe(p) });
+  });
+  app.post('/api/admin/pilot/participants/:id/status', requireAuth, requirePilotWrite, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const id=String(req.params.id||'');
+    const p=pilotParticipants.find(x=>String(x.id)===id || phone(x.phone)===phone(id));
+    if(!p) return res.status(404).json({ error:'Participant not found' });
+    const status=lc((req.body||{}).status || 'active');
+    if(!['pending','active','suspended','completed','withdrawn'].includes(status)) return res.status(400).json({ error:'Invalid participant status' });
+    p.status=status; p.updatedAt=nowIso(); p.statusReason=clean((req.body||{}).reason||''); p.updatedBy=req.user.phone;
+    await pilotDbUpsert('participant', p).catch(()=>{});
+    const user=findUserByPhone(p.phone); if(user){ user.pilotOnboarding=p; if(dbEnabled()) dbUpsertUser(user).catch(()=>{}); }
+    logAudit(req,'pilot_participant_status_update',{phone:p.phone,status});
+    res.json({ ok:true, participant:participantSafe(p) });
+  });
+
+  app.get('/api/admin/pilot/feedback', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); res.json({ ok:true, feedback: pilotFeedback.slice().reverse().slice(0,500) }); });
+  app.post('/api/admin/pilot/feedback', requireAuth, requirePilotWrite, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const body=req.body||{}; const ph=phone(body.phone||body.userPhone);
+    if(!ph) return res.status(400).json({ error:'Phone is required.' });
+    const entry={ id:uuid(), createdAt:nowIso(), updatedAt:nowIso(), phone:ph, role:lc(body.role||''), source:'staff_entered', transactionId:clean(body.transactionId||''), easeRating:n(body.easeRating,0), trustRating:n(body.trustRating,0), paymentConfidence:n(body.paymentConfidence,0), overallRating:n(body.overallRating,0), wouldUseAgain:!!body.wouldUseAgain, comments:clean(body.comments||'').slice(0,2000), createdBy:req.user.phone };
+    pilotFeedback.push(entry); await pilotDbUpsert('feedback',entry).catch(()=>{}); logAudit(req,'pilot_feedback_staff_added',{phone:ph,feedbackId:entry.id}); res.json({ ok:true, feedback:entry });
+  });
+
+  app.get('/api/admin/pilot/onboarding/export', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const o=overview(); logAudit(req,'pilot_onboarding_exported',{participants:o.counts.participants,invites:o.counts.invites}); res.json({ ok:true, title:'TutoPay Controlled Pilot Onboarding Evidence Pack', generatedAt:nowIso(), generatedBy:{phone:req.user.phone,role:req.user.role}, nonCustodialStatement:'TutoPay manages participant onboarding, transaction workflow, evidence, confirmations, disputes, audit records and reconciliation metadata. Customer funds remain processed, held, settled, refunded or reversed by licensed PSP/mobile-money/banking partners.', overview:o, invites:o.invites, participants:o.participants, feedback:pilotFeedback.slice(-1000), nextRecommendedEvidence:['Recruit a balanced pool of buyer and seller participants through invite codes.','Collect pilot consent and feedback from every participant.','Run controlled transactions and reconcile against PSP records.','Export pilot onboarding and pilot metrics packs for PSP/investor discussions.'] }); });
+  app.get('/api/admin/pilot/onboarding.csv', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const rows=[['type','phone_or_code','role','status','name_or_label','area','category','consent','uses_or_tx','feedback_count','created_at']]; for(const i of pilotInvites.map(inviteSafe)) rows.push(['invite',i.code,i.role,i.status,i.label,i.location,i.category,'',`${i.usedCount}/${i.maxUses}`,'',i.createdAt||'']); for(const p of allParticipants()) rows.push(['participant',p.phone,p.role,p.status,p.name||'',p.area||'',p.category||'',p.consentAccepted?'yes':'no',p.txCount||0,p.feedbackCount||0,p.createdAt||'']); res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-onboarding.csv"'); res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n')); });
 })();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
