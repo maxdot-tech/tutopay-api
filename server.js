@@ -3829,12 +3829,87 @@ app.get("/api/admin/users", requireAuth, (req, res) => {
     kycSubmittedAt: u.kycSubmittedAt || null,
     kycReviewedAt: u.kycReviewedAt || null,
     disabled: !!u.disabled,
+    staffAccount: !!u.staffAccount,
+    createdBy: u.createdBy || null,
+    createdAt: u.createdAt || null,
     // profile (optional)
     displayName: u.profile && (u.profile.displayName || u.profile.fullName) ? (u.profile.displayName || u.profile.fullName) : undefined,
     businessName: u.profile && u.profile.businessName ? u.profile.businessName : undefined,
   }));
 
   res.json({ users: list });
+});
+
+// -------- Admin: create internal staff accounts --------
+// Staff accounts are created by an authenticated admin only; they are NOT auto-registered from the public sign-in page.
+app.post("/api/admin/staff", requireAuth, async (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+
+  const body = req.body || {};
+  const phone = normalizePhone(body.phone);
+  const pin = String(body.pin || "").trim();
+  const role = String(body.role || "").trim().toLowerCase();
+  const displayName = String(body.displayName || body.name || "").trim();
+
+  const allowedStaffRoles = ["risk_agent", "accounts_agent", "finance_agent", "compliance_agent"];
+
+  if (!phone) return res.status(400).json({ error: "Staff phone number is required." });
+  if (!/^\d{4}$/.test(pin)) return res.status(400).json({ error: "Staff PIN must be exactly 4 digits." });
+  if (!allowedStaffRoles.includes(role)) {
+    return res.status(400).json({
+      error: "Invalid staff role.",
+      allowedRoles: allowedStaffRoles,
+    });
+  }
+
+  const existing = findUserByPhone(phone);
+  if (existing) {
+    return res.status(409).json({ error: "An account with this phone number already exists." });
+  }
+
+  const staffUser = {
+    id: uuid(),
+    phone,
+    role,
+    pinHash: hashPin(pin),
+    kycLevel: "staff",
+    kycStatus: "verified",
+    disabled: false,
+    staffAccount: true,
+    createdAt: nowIso(),
+    createdBy: req.user.phone,
+    profile: displayName ? { displayName, fullName: displayName } : {},
+    permissions: {
+      internalAccess: true,
+      createdFromAdminConsole: true,
+    },
+  };
+
+  users.push(staffUser);
+  if (dbEnabled()) {
+    try { await dbUpsertUser(staffUser); } catch (e) { console.warn("Could not persist staff user", e.message || e); }
+  }
+
+  logAudit(req, "admin_staff_created", {
+    staffPhone: phone,
+    staffRole: role,
+    displayName: displayName || null,
+    createdBy: req.user.phone,
+  });
+
+  return res.status(201).json({
+    ok: true,
+    user: {
+      id: staffUser.id,
+      phone: staffUser.phone,
+      role: staffUser.role,
+      kycLevel: staffUser.kycLevel,
+      kycStatus: staffUser.kycStatus,
+      disabled: false,
+      displayName: displayName || undefined,
+      staffAccount: true,
+    },
+  });
 });
 
 // Update a user: toggle disabled via query param
