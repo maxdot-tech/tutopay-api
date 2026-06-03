@@ -6460,7 +6460,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const hasTx = !!tx;
     const paid = tx && (['paid','successful','success'].includes(String(tx.paymentStatus || '').toLowerCase()) || !!tx.paidAt);
     const payout = tx && (tx.disbursement || ['completed','released','seller_paid'].includes(String(tx.status || '').toLowerCase()));
-    const disp = tx && (tx.disbursement || {});
+    const disp = (tx && tx.disbursement) || {};
     return [
       { stage:'Collection initiated', status: hasTx ? (tx.paymentRef ? 'evidence present' : 'not evidenced') : 'simulated', reference: hasTx ? (tx.paymentRef || tx.id) : 'SIM-COLLECTION-REF' },
       { stage:'Collection confirmed by PSP callback/requery', status: paid ? 'confirmed' : 'simulated / pending', reference: hasTx ? (tx.paymentMeta && tx.paymentMeta.referenceId || tx.paymentRef || '') : 'SIM-CALLBACK' },
@@ -6482,6 +6482,182 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   app.post('/api/admin/psp-integration/test/settlement-simulation', requireAuth, requirePspStaff, (req,res)=>{ const body=req.body||{}; const txId=clean(body.txId || '',120); const tx = txId ? transactions.find(t => String(t.id) === txId || String(t.paymentRef||'') === txId) : null; if(txId && !tx) return res.status(404).json({ error:'Transaction/reference not found for simulation.' }); const stages=settlementStages(tx); const status = stages.some(s => /pending|not evidenced|not active|not initiated/i.test(String(s.status))) ? 'simulation_with_pending_steps' : 'simulation_complete'; const run=addRun(req,'settlement_simulation',status,{ txId:tx && tx.id || null, stages, tx:safeTxMini(tx), summary: tx ? `Settlement lifecycle simulated for transaction ${tx.id}` : 'Generic settlement lifecycle simulation completed' }); res.json({ ok:true, run, simulation:{ tx:safeTxMini(tx), stages, message:'Simulation only. No transaction, ledger, payout, refund or PSP record was changed.' } }); });
   app.get('/api/admin/psp-integration/report', requireAuth, requirePspStaff, (req,res)=>{ const o=overview(); logAudit(req,'psp_integration_report_exported',{score:o.score, runs:o.recentRuns.length}); res.json({ ok:true, title:'TutoPay PSP Integration Test + Settlement Simulation Report', generatedAt:nowIso(), generatedBy:{phone:req.user.phone, role:req.user.role}, overview:o, recommendedNextSteps:['Configure sandbox keys and callback secrets for the chosen PSP partner.','Run dry-run collection and callback receiver tests before external demos.','Run controlled sandbox transactions and reconcile collections/payouts against PSP statements.','Attach this report to the Partner Pack for PSP/BoZ pre-engagement.'] }); });
   app.get('/api/admin/psp-integration/report.csv', requireAuth, requirePspStaff, (req,res)=>{ const o=overview(); const rows=[['section','item','status','detail','action']]; for(const f of o.flags) rows.push(['readiness',f.label,f.ok?'ready':'gap',f.detail,f.action]); for(const r of o.recentRuns) rows.push(['test_run',r.type,r.status,r.createdAt, r.details && r.details.summary || '']); res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-psp-integration-report.csv"'); res.end(rows.map(r=>r.map(csvCell).join(',')).join('\n')); });
+})();
+
+
+/* ===== TutoPay v1.9: User Trust + Ratings Backend ===== */
+(function TP_TRUST_RATINGS_BACKEND_V19(){
+  function trustStaffAllowed(role){
+    const r = String(role || '').toLowerCase();
+    return r === 'admin' || r === 'risk_agent' || r === 'fraud_agent' || r === 'compliance_agent' || r === 'compliance_officer' || r === 'accounts_agent' || r === 'finance_agent' || r === 'accounts';
+  }
+  function requireTrustStaff(req, res, next){
+    if (!req.user || !trustStaffAllowed(req.user.role)) return res.status(403).json({ error: 'Internal staff access required.' });
+    return next();
+  }
+  function cleanTrust(v, max=500){ return String(v == null ? '' : v).trim().slice(0, max); }
+  function trustPhone(v){ return String(v || '').replace(/\D/g,'').replace(/^260/,'0'); }
+  function trustNum(v, fallback=0){ const n = Number(v); return Number.isFinite(n) ? n : fallback; }
+  function trustMoney(v){ const n = Number(v || 0); return Math.round(n * 100) / 100; }
+  function trustCsv(v){ const s = String(v == null ? '' : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s; }
+  function txBuyer(tx){ return trustPhone(tx && (tx.fromPhone || tx.buyerPhone)); }
+  function txSeller(tx){ return trustPhone(tx && (tx.toPhone || tx.sellerPhone)); }
+  function txIsCompleted(tx){
+    const s = String((tx && tx.status) || '').toLowerCase();
+    const ds = String((tx && tx.disbursement && tx.disbursement.status) || '').toLowerCase();
+    return ['completed','released','seller_paid','closed'].includes(s) || ['successful','success'].includes(ds) || !!(tx && tx.completedAt);
+  }
+  function txIsDisputed(tx){ return !!(tx && (tx.disputeActive || String(tx.status || '').toLowerCase().includes('dispute'))); }
+  function ensureRatings(tx){ if(!tx) return []; if(!Array.isArray(tx.trustRatings)) tx.trustRatings = []; return tx.trustRatings; }
+  function allRatings(){
+    const out = [];
+    for (const tx of (transactions || [])) {
+      for (const r of ensureRatings(tx)) out.push(Object.assign({ txId: tx.id, txAmount: tx.amount || 0, txStatus: tx.status || '' }, r));
+    }
+    return out;
+  }
+  function userByPhoneLoose(ph){ const p = trustPhone(ph); return (users || []).find(u => trustPhone(u && u.phone) === p) || null; }
+  function publicUserLabel(ph){ const u = userByPhoneLoose(ph); return (u && (u.displayName || u.name || u.businessName || u.fullName)) || ''; }
+  function statsForPhone(ph){
+    const p = trustPhone(ph);
+    const related = (transactions || []).filter(tx => txBuyer(tx) === p || txSeller(tx) === p);
+    const completed = related.filter(txIsCompleted);
+    const disputed = related.filter(txIsDisputed);
+    const received = allRatings().filter(r => trustPhone(r.targetPhone) === p);
+    const given = allRatings().filter(r => trustPhone(r.raterPhone) === p);
+    const avg = received.length ? received.reduce((a,r)=>a+trustNum(r.rating,0),0) / received.length : 0;
+    const trustAvg = received.length ? received.reduce((a,r)=>a+trustNum(r.trustLevel || r.rating,0),0) / received.length : 0;
+    const wouldYes = received.filter(r => r.wouldTradeAgain === true || String(r.wouldTradeAgain).toLowerCase() === 'yes').length;
+    const completionRate = related.length ? completed.length / related.length : 0;
+    const disputePenalty = related.length ? Math.min(0.35, disputed.length / related.length) : 0;
+    const tradeAgainRate = received.length ? wouldYes / received.length : 0;
+    let score = 0;
+    if (received.length) score += (avg / 5) * 55;
+    score += completionRate * 25;
+    score += tradeAgainRate * 15;
+    if (completed.length >= 3) score += 5;
+    score = Math.max(0, Math.min(100, Math.round(score - disputePenalty * 30)));
+    const band = score >= 85 ? 'Strong trust record' : score >= 70 ? 'Good trust record' : score >= 50 ? 'Early trust record' : (received.length ? 'Needs more evidence' : 'No rating evidence yet');
+    return {
+      phone: p,
+      role: userByPhoneLoose(p) && userByPhoneLoose(p).role || '',
+      displayName: publicUserLabel(p),
+      score,
+      band,
+      ratingCount: received.length,
+      averageRating: received.length ? Math.round(avg * 10) / 10 : 0,
+      averageTrustLevel: received.length ? Math.round(trustAvg * 10) / 10 : 0,
+      wouldTradeAgainPercent: received.length ? Math.round(tradeAgainRate * 100) : 0,
+      transactions: related.length,
+      completedTransactions: completed.length,
+      disputedTransactions: disputed.length,
+      totalValue: trustMoney(related.reduce((a,t)=>a+trustNum(t.amount,0),0)),
+      completedValue: trustMoney(completed.reduce((a,t)=>a+trustNum(t.amount,0),0)),
+      ratingsGiven: given.length,
+      lastRatingAt: received.slice().sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0))[0]?.createdAt || null
+    };
+  }
+  function safeRating(r){
+    return {
+      id: r.id, txId: r.txId, createdAt: r.createdAt, raterPhone: r.raterPhone, raterRole: r.raterRole,
+      targetPhone: r.targetPhone, targetRole: r.targetRole, rating: r.rating, trustLevel: r.trustLevel,
+      wouldTradeAgain: r.wouldTradeAgain, comment: r.comment || '', txStatus: r.txStatus || '', txAmount: trustMoney(r.txAmount || 0)
+    };
+  }
+  function eligibleForUser(req){
+    const p = trustPhone(req.user && req.user.phone);
+    return (transactions || [])
+      .filter(tx => (txBuyer(tx) === p || txSeller(tx) === p) && txIsCompleted(tx) && !txIsDisputed(tx))
+      .map(tx => {
+        const ratings = ensureRatings(tx);
+        const alreadyRated = ratings.some(r => trustPhone(r.raterPhone) === p);
+        const targetPhone = txBuyer(tx) === p ? txSeller(tx) : txBuyer(tx);
+        return { id: tx.id, itemCode: tx.itemCode || tx.code || (tx.itemSnapshot && tx.itemSnapshot.code) || '', amount: trustMoney(tx.amount || 0), status: tx.status || '', completedAt: tx.completedAt || tx.updatedAt || null, targetPhone, targetRole: txBuyer(tx) === p ? 'seller' : 'buyer', alreadyRated };
+      });
+  }
+  function overviewTrust(){
+    const marketUsers = (users || []).filter(u => ['buyer','seller'].includes(String(u && u.role || '').toLowerCase()));
+    const profiles = marketUsers.map(u => statsForPhone(u.phone)).sort((a,b)=>b.score-a.score || b.ratingCount-a.ratingCount).slice(0,100);
+    const ratings = allRatings().map(safeRating).sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0));
+    const avgScore = profiles.length ? Math.round(profiles.reduce((a,p)=>a+(p.score||0),0)/profiles.length) : 0;
+    const completed = (transactions || []).filter(txIsCompleted).length;
+    const unratedCompleted = eligibleUnratedTransactionsCount();
+    const flags = [
+      { label:'Trust profiles exist', ok: profiles.some(p=>p.ratingCount>0), detail:`${ratings.length} rating records`, action:'Ask buyers/sellers to rate completed transactions.' },
+      { label:'Completed transaction pool exists', ok: completed > 0, detail:`${completed} completed transactions`, action:'Run controlled transactions to create rating opportunities.' },
+      { label:'Unrated completed transactions followed up', ok: unratedCompleted === 0 || ratings.length === 0, detail:`${unratedCompleted} rating opportunities still unused`, action:'Send reminders to users after successful completion.' },
+      { label:'Low-dispute trust base', ok: profiles.filter(p=>p.disputedTransactions>0).length <= Math.max(1, Math.ceil(profiles.length*0.15)), detail:`${profiles.filter(p=>p.disputedTransactions>0).length} profiles have disputes`, action:'Risk team should review repeat disputes and poor ratings.' }
+    ];
+    const score = flags.length ? Math.round(flags.filter(f=>f.ok).length / flags.length * 100) : 0;
+    return { ok:true, generatedAt: nowIso(), score, band: score>=85?'Trust evidence strong':score>=70?'Trust evidence moderate':score>=50?'Trust evidence early':'Trust evidence weak', counts:{ users: marketUsers.length, profiles: profiles.length, ratings: ratings.length, completedTransactions: completed, unratedCompletedTransactions: unratedCompleted, averageTrustScore: avgScore }, profiles, recentRatings: ratings.slice(0,30), flags, note:'Trust scores are internal pilot indicators, not credit scores. They support safer marketplace matching, risk review and pilot evidence.' };
+  }
+  function eligibleUnratedTransactionsCount(){
+    let n = 0;
+    for (const tx of (transactions || [])) {
+      if (!txIsCompleted(tx) || txIsDisputed(tx)) continue;
+      const ratings = ensureRatings(tx);
+      const buyerRated = ratings.some(r => trustPhone(r.raterPhone) === txBuyer(tx));
+      const sellerRated = ratings.some(r => trustPhone(r.raterPhone) === txSeller(tx));
+      if (!buyerRated) n += 1;
+      if (!sellerRated) n += 1;
+    }
+    return n;
+  }
+
+  app.get('/api/trust/me', requireAuth, (req,res)=>{
+    if (!['buyer','seller'].includes(String(req.user.role||'').toLowerCase())) return res.status(403).json({ error:'Buyer/seller account required.' });
+    const p = trustPhone(req.user.phone);
+    const ratings = allRatings();
+    res.json({ ok:true, generatedAt:nowIso(), profile:statsForPhone(p), eligibleTransactions:eligibleForUser(req), receivedRatings:ratings.filter(r=>trustPhone(r.targetPhone)===p).map(safeRating).slice(0,30), givenRatings:ratings.filter(r=>trustPhone(r.raterPhone)===p).map(safeRating).slice(0,30) });
+  });
+
+  app.get('/api/trust/profile/:phone', requireAuth, (req,res)=>{
+    const target = trustPhone(req.params.phone || '');
+    const mine = trustPhone(req.user.phone || '');
+    const isStaff = trustStaffAllowed(req.user.role);
+    const involved = (transactions || []).some(tx => (txBuyer(tx) === mine || txSeller(tx) === mine) && (txBuyer(tx) === target || txSeller(tx) === target));
+    if (!isStaff && !involved && target !== mine) return res.status(403).json({ error:'You can only view trust profiles connected to your transactions.' });
+    res.json({ ok:true, profile:statsForPhone(target) });
+  });
+
+  app.post('/api/trust/rate', requireAuth, async (req,res)=>{
+    const role = String(req.user.role || '').toLowerCase();
+    if (!['buyer','seller'].includes(role)) return res.status(403).json({ error:'Only buyer/seller accounts can rate transactions.' });
+    const body = req.body || {};
+    const txId = cleanTrust(body.txId, 120);
+    const tx = (transactions || []).find(t => String(t.id) === txId);
+    if (!tx) return res.status(404).json({ error:'Transaction not found.' });
+    const me = trustPhone(req.user.phone);
+    const isBuyer = txBuyer(tx) === me && role === 'buyer';
+    const isSeller = txSeller(tx) === me && role === 'seller';
+    if (!isBuyer && !isSeller) return res.status(403).json({ error:'You can only rate your own completed transactions.' });
+    if (!txIsCompleted(tx)) return res.status(400).json({ error:'You can only rate after the transaction is completed.' });
+    if (txIsDisputed(tx)) return res.status(400).json({ error:'Ratings are paused for disputed transactions until review is complete.' });
+    const ratings = ensureRatings(tx);
+    if (ratings.some(r => trustPhone(r.raterPhone) === me)) return res.status(400).json({ error:'You have already rated this transaction.' });
+    const rating = Math.max(1, Math.min(5, Math.round(trustNum(body.rating, 0))));
+    const trustLevel = Math.max(1, Math.min(5, Math.round(trustNum(body.trustLevel || body.rating, rating))));
+    if (!rating) return res.status(400).json({ error:'Rating must be between 1 and 5.' });
+    const targetPhone = isBuyer ? txSeller(tx) : txBuyer(tx);
+    const targetRole = isBuyer ? 'seller' : 'buyer';
+    const rec = { id: uuid(), createdAt: nowIso(), txId: tx.id, raterPhone: me, raterRole: role, targetPhone, targetRole, rating, trustLevel, wouldTradeAgain: !!body.wouldTradeAgain, comment: cleanTrust(body.comment || '', 500) };
+    ratings.push(rec);
+    tx.trustRatings = ratings;
+    tx.trustSummary = { ratingCount: ratings.length, buyerRated: ratings.some(r=>r.raterRole==='buyer'), sellerRated: ratings.some(r=>r.raterRole==='seller'), updatedAt: nowIso() };
+    logAudit(req, 'trust_rating_submitted', { txId: tx.id, targetPhone, targetRole, rating, trustLevel, wouldTradeAgain: rec.wouldTradeAgain });
+    if (dbEnabled()) { try { await dbUpsertTransaction(tx); } catch(_) {} }
+    res.json({ ok:true, rating:safeRating(Object.assign({ txAmount:tx.amount, txStatus:tx.status }, rec)), myProfile:statsForPhone(me), targetProfile:statsForPhone(targetPhone) });
+  });
+
+  app.get('/api/admin/trust/overview', requireAuth, requireTrustStaff, (req,res)=>{ const o=overviewTrust(); logAudit(req,'trust_overview_viewed',{score:o.score, ratings:o.counts.ratings}); res.json(o); });
+  app.get('/api/admin/trust/export.csv', requireAuth, requireTrustStaff, (req,res)=>{
+    const o = overviewTrust();
+    const rows = [['phone','role','display_name','trust_score','band','rating_count','average_rating','would_trade_again_percent','transactions','completed_transactions','disputed_transactions','total_value_zmw','last_rating_at']];
+    for (const p of o.profiles) rows.push([p.phone,p.role,p.displayName,p.score,p.band,p.ratingCount,p.averageRating,p.wouldTradeAgainPercent,p.transactions,p.completedTransactions,p.disputedTransactions,p.totalValue,p.lastRatingAt||'']);
+    res.setHeader('Content-Type','text/csv');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-trust-ratings.csv"');
+    res.end(rows.map(r=>r.map(trustCsv).join(',')).join('\n'));
+  });
 })();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
