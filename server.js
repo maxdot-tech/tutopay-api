@@ -6660,6 +6660,275 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   });
 })();
 
+
+/* ===== TutoPay v2.0: Notifications + Transaction Receipts + Activity Timelines ===== */
+(function TP_NOTIFICATIONS_RECEIPTS_V20(){
+  if (globalThis.__tpNotificationsReceiptsV20) return;
+  globalThis.__tpNotificationsReceiptsV20 = true;
+
+  const notifAcks = globalThis.__tpNotificationAcks || (globalThis.__tpNotificationAcks = []);
+
+  function nrClean(v, max=500){ return String(v == null ? '' : v).trim().slice(0, max); }
+  function nrRole(r){ return String(r || '').toLowerCase(); }
+  function nrPhone(p){ return String(p || '').trim(); }
+  function nrMoney(n){ const x = Number(n || 0); return Number.isFinite(x) ? Math.round(x * 100) / 100 : 0; }
+  function nrDate(v){ try { return v ? new Date(v).toISOString() : null; } catch { return null; } }
+  function nrIsStaff(role){ return nrRole(role) === 'admin' || (typeof isInternalStaffRole === 'function' && isInternalStaffRole(role)); }
+  function nrTxBuyer(tx){ return nrPhone(tx && (tx.fromPhone || tx.buyerPhone || tx.buyer)); }
+  function nrTxSeller(tx){ return nrPhone(tx && (tx.toPhone || tx.sellerPhone || tx.seller)); }
+  function nrItemTitle(tx){ return nrClean((tx && tx.itemSnapshot && (tx.itemSnapshot.title || tx.itemSnapshot.name)) || tx.itemTitle || tx.title || tx.itemCode || 'Transaction', 160); }
+  function nrTxAccess(req, tx){
+    if (!req || !req.user || !tx) return false;
+    if (nrIsStaff(req.user.role)) return true;
+    const me = nrPhone(req.user.phone);
+    return me && (me === nrTxBuyer(tx) || me === nrTxSeller(tx));
+  }
+  function nrCsv(v){ const s=String(v==null?'':v); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }
+  function nrAcked(phone, id){ return notifAcks.some(a => nrPhone(a.phone) === nrPhone(phone) && String(a.id) === String(id)); }
+  function nrAck(phone, id){
+    const p = nrPhone(phone); const k = nrClean(id, 220);
+    if (!p || !k) return null;
+    const old = notifAcks.find(a => nrPhone(a.phone) === p && String(a.id) === k);
+    if (old) { old.readAt = old.readAt || nowIso(); return old; }
+    const rec = { id:k, phone:p, readAt:nowIso() };
+    notifAcks.push(rec);
+    if (notifAcks.length > 10000) notifAcks.splice(0, notifAcks.length - 10000);
+    return rec;
+  }
+  function nrNotif(id, audiencePhone, payload){
+    const rec = Object.assign({
+      id: nrClean(id, 220),
+      audiencePhone: nrPhone(audiencePhone),
+      title: 'TutoPay notification',
+      message: '',
+      severity: 'info',
+      category: 'transaction',
+      txId: null,
+      createdAt: nowIso(),
+      actionLabel: '',
+      actionHint: '',
+    }, payload || {});
+    rec.read = nrAcked(audiencePhone, rec.id);
+    return rec;
+  }
+  function nrTxStage(tx){
+    const s = nrRole(tx && tx.status);
+    if (s === 'pending_payment') return 'Payment pending';
+    if (s === 'pending') return 'Payment confirmed / awaiting seller action';
+    if (s === 'held') return 'Item held for collection';
+    if (s === 'in_transit') return 'Delivery in progress';
+    if (s === 'delivered') return 'Delivered / awaiting buyer confirmation';
+    if (s === 'completed') return 'Completed';
+    if (s === 'disputed') return 'Disputed';
+    if (s === 'refunded') return 'Refunded';
+    return s || 'Recorded';
+  }
+  function nrBaseTxNote(tx){ return `${nrItemTitle(tx)} · K${nrMoney(tx && tx.amount)} · ${nrTxStage(tx)}`; }
+
+  function nrNotificationsFor(req){
+    const role = nrRole(req.user && req.user.role);
+    const me = nrPhone(req.user && req.user.phone);
+    const list = [];
+
+    for (const tx of (transactions || [])) {
+      const buyer = nrTxBuyer(tx); const seller = nrTxSeller(tx);
+      const isBuyer = me && me === buyer;
+      const isSeller = me && me === seller;
+      const staff = nrIsStaff(role);
+      if (!isBuyer && !isSeller && !staff) continue;
+      const txId = tx.id;
+      const stage = nrTxStage(tx);
+
+      if (isSeller && tx.status === 'pending_payment') {
+        list.push(nrNotif(`tx:${txId}:seller:new`, me, { title:'New buyer transaction started', message:`A buyer started a transaction for ${nrBaseTxNote(tx)}. Wait for payment confirmation before holding/releasing the item.`, severity:'info', category:'transaction', txId, createdAt:tx.createdAt||nowIso(), actionLabel:'Open transaction' }));
+      }
+      if ((isBuyer || isSeller) && tx.paymentStatus === 'paid') {
+        list.push(nrNotif(`tx:${txId}:payment:confirmed:${isBuyer?'buyer':'seller'}`, me, { title:'Payment confirmed on partner rail', message:`Payment is marked paid for ${nrBaseTxNote(tx)}. TutoPay is tracking workflow status; licensed partner rails handle the funds.`, severity:'ok', category:'payment', txId, createdAt:tx.paidAt||tx.createdAt||nowIso(), actionLabel:'View receipt' }));
+      }
+      if (isBuyer && ['held','in_transit','delivered'].includes(nrRole(tx.status))) {
+        list.push(nrNotif(`tx:${txId}:buyer:action-needed:${tx.status}`, me, { title:'Transaction update', message:`${stage}: ${nrBaseTxNote(tx)}. Confirm only after you have received/collected the item, or raise an issue if something is wrong.`, severity:tx.status==='delivered'?'warn':'info', category:'transaction', txId, createdAt:tx.updatedAt||tx.holdStartedAt||tx.transitStartedAt||nowIso(), actionLabel:'View timeline' }));
+      }
+      if (isSeller && tx.status === 'completed') {
+        list.push(nrNotif(`tx:${txId}:seller:completed`, me, { title:'Buyer confirmed completion', message:`The buyer has confirmed completion for ${nrBaseTxNote(tx)}. Finance/accounts can now review payout/reconciliation evidence.`, severity:'ok', category:'settlement', txId, createdAt:tx.completedAt||nowIso(), actionLabel:'View receipt' }));
+      }
+      if ((isBuyer || isSeller) && tx.status === 'completed') {
+        const ratings = Array.isArray(tx.trustRatings) ? tx.trustRatings : [];
+        const alreadyRated = ratings.some(r => nrPhone(r.raterPhone) === me);
+        if (!alreadyRated) list.push(nrNotif(`tx:${txId}:rating:request:${isBuyer?'buyer':'seller'}`, me, { title:'Rate this completed trade', message:`Please rate your transaction experience for ${nrBaseTxNote(tx)}. This helps build TutoPay trust evidence during the pilot.`, severity:'info', category:'trust', txId, createdAt:tx.completedAt||nowIso(), actionLabel:'Rate transaction' }));
+      }
+      if ((isBuyer || isSeller) && tx.disputeActive) {
+        list.push(nrNotif(`tx:${txId}:dispute:active:${isBuyer?'buyer':'seller'}`, me, { title:'Dispute/issue active', message:`An issue is active on ${nrBaseTxNote(tx)}. Normal release/refund actions may be frozen until review is complete.`, severity:'warn', category:'dispute', txId, createdAt:(tx.dispute && tx.dispute.openedAt)||nowIso(), actionLabel:'View issue' }));
+      }
+
+      if (staff) {
+        if (tx.disputeActive && ['admin','risk_agent','fraud_agent','compliance_agent','compliance_officer'].includes(role)) {
+          list.push(nrNotif(`staff:${role}:tx:${txId}:open-dispute`, me, { title:'Open dispute needs review', message:`Open issue: ${nrBaseTxNote(tx)}. Risk/compliance should review evidence and update the case.`, severity:'warn', category:'staff_alert', txId, createdAt:(tx.dispute && tx.dispute.openedAt)||nowIso(), actionLabel:'Open issues desk' }));
+        }
+        if (tx.paymentStatus === 'paid' && !tx.collectionReconciled && ['admin','accounts_agent','accounts','finance_agent'].includes(role)) {
+          list.push(nrNotif(`staff:${role}:tx:${txId}:collection-unreconciled`, me, { title:'Collection needs reconciliation', message:`Paid collection not reconciled: ${nrBaseTxNote(tx)}. Match against PSP statement/reference.`, severity:'warn', category:'reconciliation', txId, createdAt:tx.paidAt||tx.createdAt||nowIso(), actionLabel:'Open accounts/finance' }));
+        }
+        if (tx.status === 'completed' && !tx.payoutReconciled && ['admin','finance_agent','accounts_agent','accounts'].includes(role)) {
+          list.push(nrNotif(`staff:${role}:tx:${txId}:payout-unreconciled`, me, { title:'Payout/settlement needs finance review', message:`Completed transaction still needs payout/settlement reconciliation: ${nrBaseTxNote(tx)}.`, severity:'warn', category:'settlement', txId, createdAt:tx.completedAt||nowIso(), actionLabel:'Open finance console' }));
+        }
+      }
+    }
+
+    if (['admin','compliance_agent','compliance_officer'].includes(role)) {
+      for (const u of (users || [])) {
+        const st = nrRole(u.kycStatus || u.kycReviewStatus);
+        if (['pending','submitted','under_review'].includes(st)) {
+          list.push(nrNotif(`kyc:${u.phone}:pending`, me, { title:'KYC pending review', message:`User ${nrPhone(u.phone)} has KYC status ${st}. Compliance should review before higher limits or pilot scale-up.`, severity:'info', category:'kyc', txId:null, createdAt:u.kycSubmittedAt||u.updatedAt||u.createdAt||nowIso(), actionLabel:'Open compliance' }));
+        }
+        if (u.complianceRestricted || u.restrictedForCompliance) {
+          list.push(nrNotif(`compliance:${u.phone}:restricted`, me, { title:'Restricted user under review', message:`User ${nrPhone(u.phone)} is restricted for compliance review. Keep restrictions documented and resolved.`, severity:'warn', category:'compliance', txId:null, createdAt:u.restrictedAt||u.updatedAt||nowIso(), actionLabel:'Open compliance' }));
+        }
+      }
+    }
+
+    list.sort((a,b)=>String(b.createdAt||'').localeCompare(String(a.createdAt||'')));
+    return list;
+  }
+
+  function nrTimeline(tx){
+    const rows = [];
+    const add = (at, label, detail, source='system') => { if (at || label) rows.push({ at: nrDate(at) || nowIso(), label, detail:nrClean(detail, 400), source }); };
+    add(tx.createdAt, 'Transaction created', `Buyer ${nrTxBuyer(tx)} started transaction with seller ${nrTxSeller(tx)} for K${nrMoney(tx.amount)}.`, 'transaction');
+    if (tx.paymentRef) add((tx.paymentMeta && tx.paymentMeta.initiatedAt) || tx.createdAt, 'Payment initiated', `Provider/reference: ${tx.paymentProvider || 'partner rail'} / ${tx.paymentRef}.`, 'payment');
+    if (tx.paidAt || tx.paymentStatus === 'paid') add(tx.paidAt || tx.createdAt, 'Payment confirmed', 'Collection/payment is marked confirmed by demo/sandbox/callback/re-query evidence.', 'payment');
+    if (tx.holdStartedAt) add(tx.holdStartedAt, 'Seller held item', `Hold expires: ${tx.holdExpiresAt || 'not set'}.`, 'workflow');
+    if (tx.transitStartedAt) add(tx.transitStartedAt, 'Delivery started', tx.deliveryPoint ? `Delivery point: ${tx.deliveryPoint}` : '', 'workflow');
+    if (tx.status === 'delivered') add(tx.updatedAt || tx.transitStartedAt || nowIso(), 'Seller marked delivered', 'Awaiting buyer confirmation.', 'workflow');
+    if (tx.completedAt || tx.status === 'completed') add(tx.completedAt || tx.updatedAt || nowIso(), 'Transaction completed', 'Buyer confirmed collection/delivery. Release/payout workflow can be reviewed.', 'workflow');
+    if (tx.dispute && tx.dispute.openedAt) add(tx.dispute.openedAt, 'Dispute/issue opened', `${tx.dispute.type || 'issue'} · ${tx.dispute.reasonText || tx.dispute.reasonCode || ''}`, 'dispute');
+    if (tx.dispute && tx.dispute.resolvedAt) add(tx.dispute.resolvedAt, 'Dispute/issue resolved', tx.dispute.status || '', 'dispute');
+    if (tx.disbursement && tx.disbursement.initiatedAt) add(new Date(Number(tx.disbursement.initiatedAt)).toISOString(), 'Payout initiated', `Reference: ${tx.disbursement.referenceId || ''}`, 'payout');
+    if (tx.disbursement && tx.disbursement.completedAt) add(new Date(Number(tx.disbursement.completedAt)).toISOString(), 'Payout completed', `Reference: ${tx.disbursement.referenceId || ''}`, 'payout');
+
+    for (const le of (ledgerEntries || []).filter(e => String(e.txId) === String(tx.id))) {
+      add(le.timestamp, `Ledger: ${le.eventType}`, `${le.provider || ''}${le.reference ? ' · ref '+le.reference : ''}${le.notes ? ' · '+le.notes : ''}`, 'ledger');
+    }
+    const seen = new Set();
+    return rows.sort((a,b)=>String(a.at).localeCompare(String(b.at))).filter(r=>{ const k=`${r.at}|${r.label}|${r.detail}`; if(seen.has(k)) return false; seen.add(k); return true; });
+  }
+
+  function nrReceipt(tx){
+    const timeline = nrTimeline(tx);
+    const status = nrTxStage(tx);
+    const receiptNo = `TP-RCPT-${String(tx.id || '').slice(0,8).toUpperCase()}`;
+    const issuedAt = nowIso();
+    const buyer = nrTxBuyer(tx); const seller = nrTxSeller(tx);
+    const item = nrItemTitle(tx);
+    const amount = nrMoney(tx.amount);
+    const nonCustodialNote = 'TutoPay records the transaction workflow, evidence, confirmations, disputes, receipts and reconciliation metadata. Customer funds are processed, held, settled, refunded or reversed by licensed PSP/mobile-money/banking partners.';
+    const text = [
+      'TUTOPAY TRANSACTION RECEIPT',
+      `Receipt No: ${receiptNo}`,
+      `Issued At: ${issuedAt}`,
+      `Transaction ID: ${tx.id}`,
+      `Status: ${status}`,
+      `Buyer: ${buyer}`,
+      `Seller: ${seller}`,
+      `Item: ${item}`,
+      `Amount: ZMW ${amount}`,
+      `Payment Rail/Provider: ${tx.paymentProvider || 'licensed partner rail'}`,
+      `Payment Reference: ${tx.paymentRef || 'not assigned'}`,
+      `Payment Status: ${tx.paymentStatus || 'unknown'}`,
+      `Created: ${tx.createdAt || ''}`,
+      `Paid/Confirmed: ${tx.paidAt || ''}`,
+      `Completed: ${tx.completedAt || ''}`,
+      `Collection Reconciled: ${tx.collectionReconciled ? 'Yes' : 'No'}`,
+      `Payout Reconciled: ${tx.payoutReconciled ? 'Yes' : 'No'}`,
+      '',
+      'Timeline:',
+      ...timeline.map(t => `- ${t.at} | ${t.label}${t.detail ? ' | '+t.detail : ''}`),
+      '',
+      `Non-custodial note: ${nonCustodialNote}`,
+    ].join('\n');
+    return { receiptNo, issuedAt, txId:tx.id, status, buyerPhone:buyer, sellerPhone:seller, item, amount, currency:tx.currency || 'ZMW', paymentProvider:tx.paymentProvider || 'licensed_partner', paymentRef:tx.paymentRef || null, paymentStatus:tx.paymentStatus || '', createdAt:tx.createdAt || null, paidAt:tx.paidAt || null, completedAt:tx.completedAt || null, collectionReconciled:!!tx.collectionReconciled, payoutReconciled:!!tx.payoutReconciled, nonCustodialNote, timeline, text };
+  }
+
+  function nrStaffOverview(req){
+    const all = nrNotificationsFor(req);
+    const unread = all.filter(n=>!n.read);
+    const byCat = all.reduce((m,n)=>{m[n.category]=(m[n.category]||0)+1; return m;},{});
+    const txs = transactions || [];
+    return {
+      ok:true,
+      generatedAt:nowIso(),
+      user:{phone:req.user.phone, role:req.user.role},
+      counts:{total:all.length, unread:unread.length, openDisputes:txs.filter(t=>t.disputeActive).length, unreconciledCollections:txs.filter(t=>t.paymentStatus==='paid'&&!t.collectionReconciled).length, unreconciledPayouts:txs.filter(t=>t.status==='completed'&&!t.payoutReconciled).length},
+      byCategory:byCat,
+      alerts:all.slice(0,100),
+      note:'Notifications are generated from live transaction, KYC, dispute, rating and reconciliation records. Receipts are evidence records, not proof that TutoPay held funds.'
+    };
+  }
+
+  app.get('/api/notifications', requireAuth, (req,res)=>{
+    const all = nrNotificationsFor(req);
+    const unreadOnly = String((req.query && req.query.unread) || '') === '1';
+    const limit = Math.max(1, Math.min(200, Number((req.query && req.query.limit) || 80)));
+    res.json({ ok:true, generatedAt:nowIso(), unreadCount:all.filter(n=>!n.read).length, notifications:(unreadOnly?all.filter(n=>!n.read):all).slice(0,limit) });
+  });
+
+  app.post('/api/notifications/:id/read', requireAuth, (req,res)=>{
+    const rec = nrAck(req.user.phone, req.params.id);
+    logAudit(req, 'notification_mark_read', { id:req.params.id });
+    res.json({ ok:true, ack:rec });
+  });
+
+  app.post('/api/notifications/read-all', requireAuth, (req,res)=>{
+    const all = nrNotificationsFor(req);
+    all.forEach(n => nrAck(req.user.phone, n.id));
+    logAudit(req, 'notification_mark_all_read', { count:all.length });
+    res.json({ ok:true, count:all.length });
+  });
+
+  app.get('/api/transactions/:id/timeline', requireAuth, (req,res)=>{
+    const tx = (transactions || []).find(t => String(t.id) === String(req.params.id));
+    if (!tx) return res.status(404).json({ error:'Transaction not found' });
+    if (!nrTxAccess(req, tx)) return res.status(403).json({ error:'Not allowed to view this transaction timeline.' });
+    res.json({ ok:true, txId:tx.id, status:nrTxStage(tx), timeline:nrTimeline(tx) });
+  });
+
+  app.get('/api/transactions/:id/receipt', requireAuth, (req,res)=>{
+    const tx = (transactions || []).find(t => String(t.id) === String(req.params.id));
+    if (!tx) return res.status(404).json({ error:'Transaction not found' });
+    if (!nrTxAccess(req, tx)) return res.status(403).json({ error:'Not allowed to view this transaction receipt.' });
+    const receipt = nrReceipt(tx);
+    logAudit(req, 'transaction_receipt_viewed', { txId:tx.id, receiptNo:receipt.receiptNo });
+    res.json({ ok:true, receipt });
+  });
+
+  app.get('/api/transactions/:id/receipt.txt', requireAuth, (req,res)=>{
+    const tx = (transactions || []).find(t => String(t.id) === String(req.params.id));
+    if (!tx) return res.status(404).send('Transaction not found');
+    if (!nrTxAccess(req, tx)) return res.status(403).send('Not allowed to view this transaction receipt.');
+    const receipt = nrReceipt(tx);
+    logAudit(req, 'transaction_receipt_txt_downloaded', { txId:tx.id, receiptNo:receipt.receiptNo });
+    res.setHeader('Content-Type','text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${receipt.receiptNo}.txt"`);
+    res.end(receipt.text);
+  });
+
+  app.get('/api/admin/notifications/overview', requireAuth, (req,res)=>{
+    if (!nrIsStaff(req.user.role)) return res.status(403).json({ error:'Internal staff only' });
+    const o = nrStaffOverview(req);
+    logAudit(req, 'notifications_overview_viewed', { unread:o.counts.unread, total:o.counts.total });
+    res.json(o);
+  });
+
+  app.get('/api/admin/notifications/export.csv', requireAuth, (req,res)=>{
+    if (!nrIsStaff(req.user.role)) return res.status(403).json({ error:'Internal staff only' });
+    const o = nrStaffOverview(req);
+    const rows = [['id','created_at','severity','category','tx_id','title','message','read']];
+    for (const n of o.alerts) rows.push([n.id,n.createdAt,n.severity,n.category,n.txId||'',n.title,n.message,n.read?'yes':'no']);
+    res.setHeader('Content-Type','text/csv');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-notifications-alerts.csv"');
+    res.end(rows.map(r=>r.map(nrCsv).join(',')).join('\n'));
+  });
+})();
+
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`TutoPay API running on port ${PORT} [stage=${APP_STAGE}]`);
 });
