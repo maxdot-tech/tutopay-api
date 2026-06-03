@@ -6332,6 +6332,158 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   app.get('/api/admin/pilot/onboarding.csv', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const rows=[['type','phone_or_code','role','status','name_or_label','area','category','consent','uses_or_tx','feedback_count','created_at']]; for(const i of pilotInvites.map(inviteSafe)) rows.push(['invite',i.code,i.role,i.status,i.label,i.location,i.category,'',`${i.usedCount}/${i.maxUses}`,'',i.createdAt||'']); for(const p of allParticipants()) rows.push(['participant',p.phone,p.role,p.status,p.name||'',p.area||'',p.category||'',p.consentAccepted?'yes':'no',p.txCount||0,p.feedbackCount||0,p.createdAt||'']); res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-onboarding.csv"'); res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n')); });
 })();
 
+
+/* ===== TutoPay v1.8: PSP Integration Test Console + Settlement Simulation backend ===== */
+(function TP_PSP_INTEGRATION_BACKEND_V18(){
+  const pspTestRuns = [];
+
+  function pspRoleAllowed(role){
+    const r = String(role || '').toLowerCase();
+    return r === 'admin' || r === 'accounts_agent' || r === 'accounts' || r === 'finance_agent' || r === 'compliance_agent' || r === 'compliance_officer';
+  }
+  function requirePspStaff(req, res, next){
+    if (!req.user || !pspRoleAllowed(req.user.role)) return res.status(403).json({ error: 'Admin, Accounts, Finance or Compliance access required.' });
+    return next();
+  }
+  function clean(v, max=500){ return String(v == null ? '' : v).trim().slice(0, max); }
+  function num(v, fallback=0){ const n = Number(v); return Number.isFinite(n) ? n : fallback; }
+  function money(v){ const n = Number(v || 0); return Math.round(n * 100) / 100; }
+  function boolEnv(name){ return !!String(process.env[name] || '').trim(); }
+  function statusText(ok){ return ok ? 'configured' : 'missing'; }
+  function csvCell(v){ const s=String(v == null ? '' : v); return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; }
+  function latestRuns(limit=15){ return pspTestRuns.slice().reverse().slice(0, limit); }
+  function safeTxMini(tx){
+    if(!tx) return null;
+    ensureTxReconDefaults(tx);
+    return {
+      id: tx.id,
+      itemCode: tx.itemCode || tx.code || '',
+      amount: money(tx.amount),
+      currency: tx.currency || MOMO_CURRENCY || 'ZMW',
+      buyerPhone: tx.buyerPhone || tx.fromPhone || '',
+      sellerPhone: tx.sellerPhone || tx.toPhone || '',
+      status: tx.status || '',
+      paymentStatus: tx.paymentStatus || '',
+      paymentProvider: tx.paymentProvider || '',
+      paymentRef: tx.paymentRef || '',
+      collectionReconciled: !!tx.collectionReconciled,
+      payoutReconciled: !!tx.payoutReconciled,
+      disbursementStatus: tx.disbursement && tx.disbursement.status || '',
+      createdAt: tx.createdAt || tx.startedAt || null,
+      updatedAt: tx.updatedAt || tx.reconUpdatedAt || null
+    };
+  }
+  function txTimeMs(t){ return Date.parse(t.updatedAt || t.createdAt || t.startedAt || t.paidAt || 0) || 0; }
+  function envOverview(){
+    const mtnCollection = boolEnv('MTN_COLLECTION_SUB_KEY') && boolEnv('MTN_COLLECTION_APIUSER') && boolEnv('MTN_COLLECTION_APIKEY');
+    const mtnDisbursement = boolEnv('MTN_DISBURSEMENT_SUB_KEY') && boolEnv('MTN_DISBURSEMENT_APIUSER') && boolEnv('MTN_DISBURSEMENT_APIKEY');
+    const airtelCollection = boolEnv('AIRTEL_CLIENT_ID') && boolEnv('AIRTEL_CLIENT_SECRET');
+    const callbackSecret = !!(String(MTN_CALLBACK_SECRET || '').trim() || String(AIRTEL_CALLBACK_SECRET || '').trim() || String(process.env.CALLBACK_SHARED_SECRET || '').trim());
+    const publicHttps = !!PUBLIC_API_BASE && /^https:\/\//i.test(String(PUBLIC_API_BASE));
+    const strictDb = !!STRICT_DB_MODE;
+    const railMode = String(PAYMENTS_MODE || 'demo').toLowerCase();
+    return {
+      appStage: APP_STAGE || 'unset',
+      demoMode: !!DEMO_MODE,
+      paymentsMode: railMode,
+      currency: MOMO_CURRENCY || 'ZMW',
+      publicApiBase: PUBLIC_API_BASE || '',
+      publicApiHttps: publicHttps,
+      dbReady: !!dbReady,
+      dbEnabled: dbEnabled(),
+      strictDbMode: strictDb,
+      callbackUrls: {
+        mtnCollection: `${PUBLIC_API_BASE}/api/callbacks/mtn/collection`,
+        mtnDisbursement: `${PUBLIC_API_BASE}/api/callbacks/mtn/disbursement`,
+        airtelCollection: `${PUBLIC_API_BASE}/api/callbacks/airtel/collection`
+      },
+      railStatus: {
+        mtnCollection: { ready: mtnCollection, status: statusText(mtnCollection), baseUrl: MOMO_BASE_URL || '', subscriptionKey: statusText(boolEnv('MTN_COLLECTION_SUB_KEY')), apiUser: statusText(boolEnv('MTN_COLLECTION_APIUSER')), apiKey: statusText(boolEnv('MTN_COLLECTION_APIKEY')) },
+        mtnDisbursement: { ready: mtnDisbursement, status: statusText(mtnDisbursement), baseUrl: MOMO_BASE_URL || '', subscriptionKey: statusText(boolEnv('MTN_DISBURSEMENT_SUB_KEY')), apiUser: statusText(boolEnv('MTN_DISBURSEMENT_APIUSER')), apiKey: statusText(boolEnv('MTN_DISBURSEMENT_APIKEY')) },
+        airtelCollection: { ready: airtelCollection, status: statusText(airtelCollection), baseUrl: AIRTEL_BASE_URL || '', clientId: statusText(boolEnv('AIRTEL_CLIENT_ID')), clientSecret: statusText(boolEnv('AIRTEL_CLIENT_SECRET')), country: AIRTEL_COUNTRY || 'ZM', currency: AIRTEL_CURRENCY || 'ZMW' },
+        callbackSecurity: { ready: callbackSecret, status: callbackSecret ? 'protected' : 'missing secret', mtnSecret: statusText(!!String(MTN_CALLBACK_SECRET || '').trim()), airtelSecret: statusText(!!String(AIRTEL_CALLBACK_SECRET || '').trim()), sharedSecret: statusText(boolEnv('CALLBACK_SHARED_SECRET')) }
+      }
+    };
+  }
+  function financeSnapshot(){
+    const txs = (transactions || []).map(t => ensureTxReconDefaults(t || {}));
+    const paid = txs.filter(t => ['paid','successful','success'].includes(String(t.paymentStatus || '').toLowerCase()) || !!t.paidAt);
+    const completed = txs.filter(t => ['completed','released','seller_paid'].includes(String(t.status || '').toLowerCase()) || ['successful','success'].includes(String(t.disbursement && t.disbursement.status || '').toLowerCase()));
+    const unreconciledCollections = paid.filter(t => !t.collectionReconciled).length;
+    const unreconciledPayouts = completed.filter(t => !t.payoutReconciled).length;
+    const totalValue = txs.reduce((a,t)=>a+num(t.amount,0),0);
+    const paidValue = paid.reduce((a,t)=>a+num(t.amount,0),0);
+    const completedValue = completed.reduce((a,t)=>a+num(t.amount,0),0);
+    const recent = txs.slice().sort((a,b)=>txTimeMs(b)-txTimeMs(a)).slice(0,10).map(safeTxMini);
+    return { transactions: txs.length, paid: paid.length, completed: completed.length, totalValue: money(totalValue), paidValue: money(paidValue), completedValue: money(completedValue), unreconciledCollections, unreconciledPayouts, ledgerEvents: ledgerEntries.length, recentTransactions: recent };
+  }
+  function readinessFlags(){
+    const env = envOverview();
+    const fin = financeSnapshot();
+    const flags = [
+      { key:'public_https', label:'HTTPS public API base', ok:!!env.publicApiHttps, detail:env.publicApiBase || 'unset', action:'Set PUBLIC_API_BASE to your HTTPS API domain.' },
+      { key:'callback_secret', label:'Callback security configured', ok:!!env.railStatus.callbackSecurity.ready, detail:env.railStatus.callbackSecurity.status, action:'Set MTN_CALLBACK_SECRET/AIRTEL_CALLBACK_SECRET or CALLBACK_SHARED_SECRET.' },
+      { key:'collection_config', label:'At least one collection rail configured', ok:!!(env.railStatus.mtnCollection.ready || env.railStatus.airtelCollection.ready || env.paymentsMode === 'demo'), detail:`Mode=${env.paymentsMode}; MTN=${env.railStatus.mtnCollection.status}; Airtel=${env.railStatus.airtelCollection.status}`, action:'Configure MTN/Airtel sandbox credentials or keep demo mode clearly labelled.' },
+      { key:'disbursement_config', label:'Payout/disbursement path configured or documented', ok:!!(env.railStatus.mtnDisbursement.ready || env.paymentsMode === 'demo'), detail:`MTN disbursement=${env.railStatus.mtnDisbursement.status}`, action:'Configure disbursement credentials or use documented PSP-led settlement procedure.' },
+      { key:'database', label:'Database/startup readiness', ok:!!(env.dbReady && (env.dbEnabled || !env.strictDbMode)), detail:`dbReady=${env.dbReady}; dbEnabled=${env.dbEnabled}; strict=${env.strictDbMode}`, action:'Use Postgres + STRICT_DB_MODE=true before live money movement.' },
+      { key:'ledger', label:'Ledger/reconciliation activity', ok:!!(fin.ledgerEvents > 0 || fin.transactions === 0), detail:`${fin.ledgerEvents} ledger events; ${fin.transactions} transactions`, action:'Run controlled transactions and reconcile them against PSP statements.' },
+      { key:'unreconciled', label:'No unreconciled PSP money events', ok:fin.unreconciledCollections === 0 && fin.unreconciledPayouts === 0, detail:`${fin.unreconciledCollections} collection and ${fin.unreconciledPayouts} payout checks pending`, action:'Accounts/Finance should reconcile outstanding payment events.' },
+      { key:'test_runs', label:'PSP test run history exists', ok:pspTestRuns.length > 0, detail:`${pspTestRuns.length} test/simulation events`, action:'Run at least one config, callback and settlement simulation.' }
+    ];
+    return flags;
+  }
+  function score(flags){ if(!flags.length) return 0; return Math.round(flags.filter(f=>f.ok).length / flags.length * 100); }
+  function overview(){
+    const flags = readinessFlags();
+    const sc = score(flags);
+    return {
+      ok:true,
+      generatedAt: nowIso(),
+      score: sc,
+      band: sc >= 85 ? 'PSP test posture strong' : sc >= 70 ? 'PSP test posture moderate' : sc >= 50 ? 'PSP test posture early' : 'PSP test posture weak',
+      nonCustodialStatement:'TutoPay does not hold customer funds. Licensed PSP/mobile-money/bank partners execute collection, settlement, payout, refund and reversal movement; TutoPay tracks workflow, references, callbacks, evidence and reconciliation metadata.',
+      environment: envOverview(),
+      finance: financeSnapshot(),
+      flags,
+      gaps: flags.filter(f=>!f.ok).map(f=>({ label:f.label, detail:f.detail, action:f.action })),
+      recentRuns: latestRuns(20)
+    };
+  }
+  function addRun(req, type, status, details){
+    const run = { id: uuid(), createdAt: nowIso(), type: clean(type,80), status: clean(status,40), actorPhone: req.user && req.user.phone, actorRole: req.user && req.user.role, details: details || {} };
+    pspTestRuns.push(run);
+    if (pspTestRuns.length > 500) pspTestRuns.splice(0, pspTestRuns.length - 500);
+    logAudit(req, 'psp_integration_test_run', { type: run.type, status: run.status, runId: run.id, detailSummary: run.details && run.details.summary });
+    return run;
+  }
+  function settlementStages(tx){
+    const hasTx = !!tx;
+    const paid = tx && (['paid','successful','success'].includes(String(tx.paymentStatus || '').toLowerCase()) || !!tx.paidAt);
+    const payout = tx && (tx.disbursement || ['completed','released','seller_paid'].includes(String(tx.status || '').toLowerCase()));
+    const disp = tx && (tx.disbursement || {});
+    return [
+      { stage:'Collection initiated', status: hasTx ? (tx.paymentRef ? 'evidence present' : 'not evidenced') : 'simulated', reference: hasTx ? (tx.paymentRef || tx.id) : 'SIM-COLLECTION-REF' },
+      { stage:'Collection confirmed by PSP callback/requery', status: paid ? 'confirmed' : 'simulated / pending', reference: hasTx ? (tx.paymentMeta && tx.paymentMeta.referenceId || tx.paymentRef || '') : 'SIM-CALLBACK' },
+      { stage:'Workflow hold active', status: paid && !['completed','refunded','cancelled'].includes(String(tx.status||'').toLowerCase()) ? 'active' : (hasTx ? String(tx.status || 'not active') : 'simulated hold') },
+      { stage:'Release/refund decision', status: hasTx ? (tx.decision || tx.releaseStatus || tx.status || 'not decided') : 'simulated release decision' },
+      { stage:'Payout/refund instruction to licensed partner', status: payout ? (disp.status || 'instruction evidenced') : 'simulated / not initiated', reference: disp.referenceId || '' },
+      { stage:'Payout/refund confirmed', status: ['successful','success'].includes(String(disp.status || '').toLowerCase()) ? 'confirmed' : 'simulated / pending', reference: disp.referenceId || '' },
+      { stage:'Collection reconciled by Accounts', status: hasTx ? (tx.collectionReconciled ? 'reconciled' : 'pending reconciliation') : 'simulated reconciled' },
+      { stage:'Payout reconciled by Finance', status: hasTx ? (tx.payoutReconciled ? 'reconciled' : 'pending reconciliation') : 'simulated reconciled' }
+    ];
+  }
+
+  app.get('/api/admin/psp-integration/overview', requireAuth, requirePspStaff, (req,res)=>{ const o=overview(); logAudit(req, 'psp_integration_overview_viewed', { score:o.score }); res.json(o); });
+  app.post('/api/admin/psp-integration/test/config', requireAuth, requirePspStaff, (req,res)=>{ const o=overview(); const run=addRun(req,'configuration_check', o.gaps.length ? 'gaps_found' : 'passed', { score:o.score, gaps:o.gaps, summary:`PSP config check score ${o.score}%` }); res.json({ ok:true, run, overview:o }); });
+  app.post('/api/admin/psp-integration/test/callback', requireAuth, requirePspStaff, (req,res)=>{ const body=req.body||{}; const provider=clean(body.provider || 'mtn',30).toLowerCase(); const env=envOverview(); const url = provider === 'airtel' ? env.callbackUrls.airtelCollection : (provider === 'mtn_disbursement' ? env.callbackUrls.mtnDisbursement : env.callbackUrls.mtnCollection); const protectedRoute = !!env.railStatus.callbackSecurity.ready; const run=addRun(req,'callback_receiver_test','simulated_pass',{ provider, callbackUrl:url, protectedRoute, summary:`Callback receiver route mapped for ${provider}` }); res.json({ ok:true, run, callback:{ provider, callbackUrl:url, protectedRoute, message:'Synthetic callback receiver test passed. No external provider was called and no money moved.' } }); });
+  app.post('/api/admin/psp-integration/test/collection-dry-run', requireAuth, requirePspStaff, (req,res)=>{ const body=req.body||{}; const provider=clean(body.provider || 'mtn',30).toLowerCase(); const amount=money(num(body.amount, 1)); const phone=clean(body.phone || '0970000000',30); const reference=`TP-DRY-${Date.now()}`; const env=envOverview(); const ready = provider === 'airtel' ? env.railStatus.airtelCollection.ready : env.railStatus.mtnCollection.ready; const payload = provider === 'airtel' ? { provider:'airtel', subscriber:{ country:AIRTEL_COUNTRY, currency:AIRTEL_CURRENCY, msisdn: airtelMsisdnFromPhone(phone) }, transaction:{ amount:String(amount), currency:AIRTEL_CURRENCY, id:reference } } : { provider:'mtn', amount:String(amount), currency:MOMO_CURRENCY, externalId:reference, payer:{ partyIdType:'MSISDN', partyId:String(phone).replace(/\D/g,'') }, callbackUrl:MOMO_CALLBACK_URL };
+    const run=addRun(req,'collection_dry_run', ready ? 'ready' : 'config_gap', { provider, ready, amount, phone, reference, payload, summary:`Collection dry-run for ${provider}: ${ready?'ready':'missing config'}` });
+    res.json({ ok:true, run, dryRun:{ provider, ready, reference, amount, currency: provider==='airtel' ? AIRTEL_CURRENCY : MOMO_CURRENCY, payloadPreview:payload, message:'Dry-run only. This did not call MTN/Airtel and did not request money from the phone.' } }); });
+  app.post('/api/admin/psp-integration/test/settlement-simulation', requireAuth, requirePspStaff, (req,res)=>{ const body=req.body||{}; const txId=clean(body.txId || '',120); const tx = txId ? transactions.find(t => String(t.id) === txId || String(t.paymentRef||'') === txId) : null; if(txId && !tx) return res.status(404).json({ error:'Transaction/reference not found for simulation.' }); const stages=settlementStages(tx); const status = stages.some(s => /pending|not evidenced|not active|not initiated/i.test(String(s.status))) ? 'simulation_with_pending_steps' : 'simulation_complete'; const run=addRun(req,'settlement_simulation',status,{ txId:tx && tx.id || null, stages, tx:safeTxMini(tx), summary: tx ? `Settlement lifecycle simulated for transaction ${tx.id}` : 'Generic settlement lifecycle simulation completed' }); res.json({ ok:true, run, simulation:{ tx:safeTxMini(tx), stages, message:'Simulation only. No transaction, ledger, payout, refund or PSP record was changed.' } }); });
+  app.get('/api/admin/psp-integration/report', requireAuth, requirePspStaff, (req,res)=>{ const o=overview(); logAudit(req,'psp_integration_report_exported',{score:o.score, runs:o.recentRuns.length}); res.json({ ok:true, title:'TutoPay PSP Integration Test + Settlement Simulation Report', generatedAt:nowIso(), generatedBy:{phone:req.user.phone, role:req.user.role}, overview:o, recommendedNextSteps:['Configure sandbox keys and callback secrets for the chosen PSP partner.','Run dry-run collection and callback receiver tests before external demos.','Run controlled sandbox transactions and reconcile collections/payouts against PSP statements.','Attach this report to the Partner Pack for PSP/BoZ pre-engagement.'] }); });
+  app.get('/api/admin/psp-integration/report.csv', requireAuth, requirePspStaff, (req,res)=>{ const o=overview(); const rows=[['section','item','status','detail','action']]; for(const f of o.flags) rows.push(['readiness',f.label,f.ok?'ready':'gap',f.detail,f.action]); for(const r of o.recentRuns) rows.push(['test_run',r.type,r.status,r.createdAt, r.details && r.details.summary || '']); res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-psp-integration-report.csv"'); res.end(rows.map(r=>r.map(csvCell).join(',')).join('\n')); });
+})();
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`TutoPay API running on port ${PORT} [stage=${APP_STAGE}]`);
 });
