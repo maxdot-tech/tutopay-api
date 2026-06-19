@@ -6999,3 +6999,267 @@ process.on('SIGINT', () => {
   console.log('[SYS] SIGINT received, closing server...');
   server.close(() => process.exit(0));
 });
+/* =======================================================================
+   TutoPay Request-First + Negotiated Discount Flow v13
+   APPEND THIS BLOCK AT THE VERY END OF server.js, then redeploy Railway.
+
+   Works with tutopay-request-discount-flow-v13.js.
+
+   Adds:
+   - PATCH /api/items/:id/pricing
+   - GET   /api/public/item/:id/pricing
+   - POST  /api/requests/:id/discount-offer
+   - POST  /api/requests/:id/discount-response
+   - GET   /api/requests/:id/negotiation
+
+   It is intentionally additive and pilot-safe. It does not replace PSP/gateway logic.
+   ======================================================================= */
+try {
+  const TP_NEGOTIATION_LIMIT = 3;
+
+  function tpV13NowIso() {
+    try { if (typeof nowIso === "function") return nowIso(); } catch (_) {}
+    return new Date().toISOString();
+  }
+
+  function tpV13Uuid(prefix) {
+    try { if (typeof uuid === "function") return uuid(); } catch (_) {}
+    return String(prefix || "id") + "_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2);
+  }
+
+  function tpV13Clean(v, max) {
+    return String(v == null ? "" : v).trim().slice(0, max || 300);
+  }
+
+  function tpV13Role(req) {
+    return String(req && req.user ? req.user.role || "" : "").toLowerCase();
+  }
+
+  function tpV13IsStaff(req) {
+    const r = tpV13Role(req);
+    try { if (typeof isInternalStaffRole === "function" && isInternalStaffRole(r)) return true; } catch (_) {}
+    return ["admin", "accounts_agent", "accounts", "finance_agent", "risk_agent", "fraud_agent", "compliance_agent", "compliance_officer"].includes(r);
+  }
+
+  function tpV13FindItem(idOrCode) {
+    const key = String(idOrCode || "");
+    let item = null;
+    try { if (typeof findItem === "function") item = findItem(key); } catch (_) {}
+    if (!item) {
+      try { item = (Array.isArray(items) ? items : []).find((x) => String(x.id || "") === key || String(x.code || x.itemCode || "") === key); } catch (_) {}
+    }
+    return item || null;
+  }
+
+  function tpV13FindRequest(id) {
+    const key = String(id || "");
+    try { return (Array.isArray(requests) ? requests : []).find((x) => String(x.id || "") === key) || null; } catch (_) {}
+    return null;
+  }
+
+  function tpV13PublicPricing(item) {
+    const p = item && (item.pricingTerms || item.pricing || {});
+    return {
+      mode: tpV13Clean((p && p.mode) || item.pricingMode || item.discountType || "fixed", 40),
+      discountPercent: Number((p && p.discountPercent) || item.discountPercent || 0),
+      discountMinQty: Number((p && p.discountMinQty) || item.discountMinQty || 1),
+      negotiableLevel: tpV13Clean((p && p.negotiableLevel) || item.negotiableLevel || "", 40),
+      updatedAt: (p && p.updatedAt) || item.pricingUpdatedAt || null
+    };
+  }
+
+  function tpV13SaveItem(item) {
+    try { if (typeof dbUpsertItem === "function") dbUpsertItem(item).catch(() => {}); } catch (_) {}
+  }
+
+  function tpV13SaveRequest(rq) {
+    try { if (typeof dbUpsertRequest === "function") dbUpsertRequest(rq).catch(() => {}); } catch (_) {}
+  }
+
+  function tpV13Notify(phone, payload) {
+    try {
+      if (typeof createNotification === "function") {
+        createNotification(phone, payload);
+      }
+    } catch (_) {}
+  }
+
+  app.patch("/api/items/:id/pricing", requireAuth, (req, res) => {
+    const item = tpV13FindItem(req.params.id);
+    if (!item) return res.status(404).json({ error: "Item not found." });
+
+    const isOwner = tpV13Role(req) === "seller" && String(req.user.phone || "") === String(item.sellerPhone || "");
+    const isAdmin = tpV13Role(req) === "admin";
+    if (!isOwner && !isAdmin) return res.status(403).json({ error: "Only the seller or admin can update item pricing terms." });
+
+    const mode = tpV13Clean(req.body && req.body.mode || "fixed", 40);
+    const discountPercent = Math.max(0, Math.min(90, Number(req.body && req.body.discountPercent || 0)));
+    const discountMinQty = Math.max(1, Number(req.body && req.body.discountMinQty || 1));
+    const negotiableLevel = tpV13Clean(req.body && req.body.negotiableLevel || "", 40);
+
+    item.pricingTerms = {
+      mode: ["fixed", "percent", "negotiable"].includes(mode) ? mode : "fixed",
+      discountPercent,
+      discountMinQty,
+      negotiableLevel: ["", "slight", "high"].includes(negotiableLevel) ? negotiableLevel : "",
+      updatedAt: tpV13NowIso()
+    };
+
+    // Also keep flat fields for old frontend code.
+    item.pricingMode = item.pricingTerms.mode;
+    item.discountPercent = item.pricingTerms.discountPercent;
+    item.discountMinQty = item.pricingTerms.discountMinQty;
+    item.negotiableLevel = item.pricingTerms.negotiableLevel;
+    item.pricingUpdatedAt = item.pricingTerms.updatedAt;
+
+    tpV13SaveItem(item);
+    try { if (typeof logAudit === "function") logAudit(req, "item_pricing_terms_updated", { itemCode: item.code, pricingTerms: item.pricingTerms }); } catch (_) {}
+    res.json({ ok: true, item });
+  });
+
+  app.get("/api/public/item/:id/pricing", (req, res) => {
+    const item = tpV13FindItem(req.params.id);
+    if (!item) return res.status(404).json({ error: "Item not found." });
+    res.json({ ok: true, itemCode: item.code || req.params.id, pricingTerms: tpV13PublicPricing(item) });
+  });
+
+  app.post("/api/requests/:id/discount-offer", requireAuth, (req, res) => {
+    const rq = tpV13FindRequest(req.params.id);
+    if (!rq) return res.status(404).json({ error: "Request not found." });
+
+    const isSeller = tpV13Role(req) === "seller" && String(req.user.phone || "") === String(rq.toPhone || "");
+    const isAdmin = tpV13Role(req) === "admin";
+    if (!isSeller && !isAdmin) return res.status(403).json({ error: "Only the seller or admin can send a discount offer." });
+
+    const originalAmount = Number(req.body && req.body.originalAmount || 0);
+    const discountAmount = Number(req.body && req.body.discountAmount || 0);
+    if (!originalAmount || originalAmount <= 0) return res.status(400).json({ error: "Enter valid original amount." });
+    if (discountAmount < 0 || discountAmount >= originalAmount) return res.status(400).json({ error: "Discount must be less than the original amount." });
+
+    const finalAmount = Math.max(0, Number(req.body && req.body.finalAmount || (originalAmount - discountAmount)));
+    const prev = rq.discountOffer || {};
+    const offer = {
+      id: tpV13Clean(req.body && req.body.id || "", 120) || tpV13Uuid("offer"),
+      requestId: rq.id,
+      originalAmount,
+      discountAmount,
+      finalAmount,
+      note: tpV13Clean(req.body && req.body.note || "", 500),
+      status: "pending",
+      counterAttempts: Number(prev.counterAttempts || 0),
+      counters: Array.isArray(prev.counters) ? prev.counters : [],
+      createdAt: tpV13NowIso(),
+      createdBy: req.user.phone || "",
+      updatedAt: tpV13NowIso()
+    };
+
+    rq.discountOffer = offer;
+    rq.status = "discount_offer_pending";
+    rq.updatedAt = tpV13NowIso();
+    tpV13SaveRequest(rq);
+
+    tpV13Notify(rq.fromPhone, {
+      type: "discount_offer",
+      title: "Seller sent a discount offer",
+      message: `Seller offered final amount K${finalAmount}`,
+      requestId: rq.id,
+      itemCode: rq.itemCode
+    });
+
+    try { if (typeof logAudit === "function") logAudit(req, "request_discount_offer_sent", { requestId: rq.id, finalAmount }); } catch (_) {}
+    res.status(201).json({ ok: true, request: rq, discountOffer: offer });
+  });
+
+  app.post("/api/requests/:id/discount-response", requireAuth, (req, res) => {
+    const rq = tpV13FindRequest(req.params.id);
+    if (!rq) return res.status(404).json({ error: "Request not found." });
+
+    const isBuyer = tpV13Role(req) === "buyer" && String(req.user.phone || "") === String(rq.fromPhone || "");
+    const isAdmin = tpV13Role(req) === "admin";
+    if (!isBuyer && !isAdmin) return res.status(403).json({ error: "Only the buyer or admin can respond to this offer." });
+
+    const offer = rq.discountOffer;
+    if (!offer) return res.status(404).json({ error: "No discount offer found on this request." });
+
+    const action = tpV13Clean(req.body && req.body.action || "", 40).toLowerCase();
+    if (!["accept", "counter", "decline", "refund"].includes(action)) return res.status(400).json({ error: "Invalid discount response action." });
+
+    if (action === "accept") {
+      offer.status = "accepted";
+      offer.acceptedAt = tpV13NowIso();
+      offer.acceptedBy = req.user.phone || "";
+      rq.status = "buyer_accepted_discount";
+      rq.agreedAmount = Number(offer.finalAmount || 0);
+    }
+
+    if (action === "counter") {
+      if (Number(offer.counterAttempts || 0) >= TP_NEGOTIATION_LIMIT) {
+        return res.status(409).json({ error: "Counter-offer limit reached.", negotiationLimitReached: true });
+      }
+      const counterAmount = Number(req.body && req.body.counterAmount || 0);
+      if (!counterAmount || counterAmount <= 0) return res.status(400).json({ error: "Enter valid counter-offer amount." });
+
+      offer.counterAttempts = Number(offer.counterAttempts || 0) + 1;
+      offer.counters = Array.isArray(offer.counters) ? offer.counters : [];
+      offer.counters.push({
+        amount: counterAmount,
+        by: req.user.phone || "",
+        at: tpV13NowIso()
+      });
+      offer.status = offer.counterAttempts >= TP_NEGOTIATION_LIMIT ? "counter_limit_reached" : "countered";
+      offer.lastCounterAmount = counterAmount;
+      rq.status = offer.status === "counter_limit_reached" ? "negotiation_limit_reached" : "buyer_countered_discount";
+    }
+
+    if (action === "decline") {
+      offer.status = "declined";
+      offer.declinedAt = tpV13NowIso();
+      offer.declinedBy = req.user.phone || "";
+      rq.status = "discount_declined";
+    }
+
+    if (action === "refund") {
+      offer.status = "refund_requested";
+      offer.refundRequestedAt = tpV13NowIso();
+      offer.refundRequestedBy = req.user.phone || "";
+      rq.status = "refund_requested_after_negotiation";
+    }
+
+    offer.updatedAt = tpV13NowIso();
+    rq.discountOffer = offer;
+    rq.updatedAt = tpV13NowIso();
+    tpV13SaveRequest(rq);
+
+    tpV13Notify(rq.toPhone, {
+      type: "discount_response",
+      title: "Buyer responded to discount offer",
+      message: `Buyer response: ${action}`,
+      requestId: rq.id,
+      itemCode: rq.itemCode
+    });
+
+    try { if (typeof logAudit === "function") logAudit(req, "request_discount_response", { requestId: rq.id, action, status: rq.status }); } catch (_) {}
+    res.json({ ok: true, request: rq, discountOffer: offer, negotiationLimitReached: Number(offer.counterAttempts || 0) >= TP_NEGOTIATION_LIMIT });
+  });
+
+  app.get("/api/requests/:id/negotiation", requireAuth, (req, res) => {
+    const rq = tpV13FindRequest(req.params.id);
+    if (!rq) return res.status(404).json({ error: "Request not found." });
+
+    const owns = String(req.user.phone || "") === String(rq.fromPhone || "") || String(req.user.phone || "") === String(rq.toPhone || "");
+    if (!owns && !tpV13IsStaff(req)) return res.status(403).json({ error: "Not allowed." });
+
+    res.json({
+      ok: true,
+      requestId: rq.id,
+      status: rq.status,
+      agreedAmount: rq.agreedAmount || null,
+      discountOffer: rq.discountOffer || null,
+      counterLimit: TP_NEGOTIATION_LIMIT
+    });
+  });
+
+  console.log("[TutoPay] Request-First + Negotiated Discount Flow v13 server addon loaded");
+} catch (e) {
+  console.error("[TutoPay] Request-First + Negotiated Discount Flow v13 addon failed:", e && e.message ? e.message : e);
+}
