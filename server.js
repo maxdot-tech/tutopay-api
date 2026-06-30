@@ -7263,3 +7263,361 @@ try {
 } catch (e) {
   console.error("[TutoPay] Request-First + Negotiated Discount Flow v13 addon failed:", e && e.message ? e.message : e);
 }
+
+
+/* =======================================================================
+   TutoPay Canonical Negotiation Core v14.3.0
+   -----------------------------------------------------------------------
+   Stable shared source of truth for 3-round buyer/seller negotiation.
+   Stores negotiation state directly on the request record (rq.negotiation),
+   so the frontend no longer has to infer logic from helper text, table cells,
+   or browser localStorage.
+   ======================================================================= */
+try {
+  const TP_NEG_LIMIT_V143 = 3;
+
+  function tp143NowIso() {
+    try { if (typeof nowIso === "function") return nowIso(); } catch (_) {}
+    return new Date().toISOString();
+  }
+
+  function tp143Role(req) {
+    return String(req && req.user ? req.user.role || "" : "").toLowerCase();
+  }
+
+  function tp143FindRequest(id) {
+    const key = String(id || "");
+    try { return (Array.isArray(requests) ? requests : []).find((x) => String(x.id || "") === key) || null; } catch (_) {}
+    return null;
+  }
+
+  function tp143SaveRequest(rq) {
+    rq.updatedAt = tp143NowIso();
+    try { if (typeof dbUpsertRequest === "function") dbUpsertRequest(rq).catch(() => {}); } catch (_) {}
+  }
+
+  function tp143Notify(phone, payload) {
+    try { if (typeof createNotification === "function") createNotification(phone, payload); } catch (_) {}
+  }
+
+  function tp143MoneyAmount(v) {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Number(n.toFixed(2)) : 0;
+  }
+
+  function tp143BaseAmount(rq) {
+    const candidates = [
+      rq && rq.reply && rq.reply.price,
+      rq && rq.itemSnapshot && rq.itemSnapshot.price,
+      rq && rq.amount,
+      rq && rq.price,
+    ];
+    for (const c of candidates) {
+      const n = tp143MoneyAmount(c);
+      if (n > 0) return n;
+    }
+    return 0;
+  }
+
+  function tp143EnsureNegotiation(rq) {
+    if (!rq.negotiation || typeof rq.negotiation !== "object" || !Array.isArray(rq.negotiation.history)) {
+      rq.negotiation = {
+        version: "v14.3.0",
+        status: "not_started",
+        round: 0,
+        maxRounds: TP_NEG_LIMIT_V143,
+        baseAmount: tp143BaseAmount(rq) || null,
+        lockedAmount: null,
+        paymentAmount: null,
+        history: [],
+        lastAction: null,
+        cancellationsAfterAcceptance: 0,
+        updatedAt: tp143NowIso(),
+      };
+    }
+
+    const neg = rq.negotiation;
+    neg.version = "v14.3.0";
+    neg.maxRounds = TP_NEG_LIMIT_V143;
+    if (!Array.isArray(neg.history)) neg.history = [];
+    if (!neg.baseAmount) neg.baseAmount = tp143BaseAmount(rq) || null;
+    neg.history = neg.history.slice(0, TP_NEG_LIMIT_V143).map((row, idx) => ({
+      round: Number(row.round || idx + 1),
+      sellerOffer: row.sellerOffer != null ? tp143MoneyAmount(row.sellerOffer) : null,
+      sellerAt: row.sellerAt || null,
+      buyerCounter: row.buyerCounter != null ? tp143MoneyAmount(row.buyerCounter) : null,
+      buyerAt: row.buyerAt || null,
+      sellerDecision: row.sellerDecision || null,
+      sellerDecisionAt: row.sellerDecisionAt || null,
+    }));
+    neg.round = Math.max(0, ...neg.history.map((r) => Number(r.round || 0)));
+    return neg;
+  }
+
+  function tp143LatestRow(neg) {
+    if (!neg || !Array.isArray(neg.history) || !neg.history.length) return null;
+    return neg.history[neg.history.length - 1];
+  }
+
+  function tp143SetLast(neg, actor, action, amount, extra) {
+    neg.lastAction = Object.assign({
+      actor,
+      action,
+      amount: amount != null ? Number(amount) : null,
+      at: tp143NowIso(),
+    }, extra || {});
+    neg.updatedAt = tp143NowIso();
+  }
+
+  function tp143CanView(req, rq) {
+    const role = tp143Role(req);
+    const phone = String(req.user && req.user.phone || "");
+    if (role === "admin") return true;
+    try { if (typeof isInternalStaffRole === "function" && isInternalStaffRole(role)) return true; } catch (_) {}
+    return phone === String(rq.fromPhone || "") || phone === String(rq.toPhone || "");
+  }
+
+  function tp143Actor(req, rq) {
+    const role = tp143Role(req);
+    const phone = String(req.user && req.user.phone || "");
+    if (role === "admin") return "admin";
+    if (role === "seller" && phone === String(rq.toPhone || "")) return "seller";
+    if (role === "buyer" && phone === String(rq.fromPhone || "")) return "buyer";
+    return "";
+  }
+
+  function tp143NormalizeAction(action, actor) {
+    let a = String(action || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+    const sellerMap = {
+      offer: "seller_offer",
+      send_offer: "seller_offer",
+      discount_offer: "seller_offer",
+      new_offer: "seller_decline_with_offer",
+      decline_new_offer: "seller_decline_with_offer",
+      decline_with_offer: "seller_decline_with_offer",
+      decline_with_new_offer: "seller_decline_with_offer",
+      accept: "seller_accept_counter",
+      accept_counter: "seller_accept_counter",
+      decline: "seller_decline_counter",
+      decline_counter: "seller_decline_counter",
+    };
+    const buyerMap = {
+      counter: "buyer_counter",
+      counter_offer: "buyer_counter",
+      decline_with_counter: "buyer_counter",
+      decline_with_counter_offer: "buyer_counter",
+      accept: "buyer_accept_seller_offer",
+      accept_offer: "buyer_accept_seller_offer",
+      accept_seller_offer: "buyer_accept_seller_offer",
+      abort: "buyer_abort",
+      cancel: "buyer_abort",
+      start_payment: "buyer_start_payment",
+      payment_started: "buyer_start_payment",
+      cancel_after_accept: "buyer_cancel_after_accept",
+    };
+    if (actor === "seller" || actor === "admin") a = sellerMap[a] || a;
+    if (actor === "buyer" || actor === "admin") a = buyerMap[a] || a;
+    return a;
+  }
+
+  app.post("/api/requests/:id/negotiation/action", requireAuth, (req, res) => {
+    try {
+      const rq = tp143FindRequest(req.params.id);
+      if (!rq) return res.status(404).json({ error: "Request not found." });
+
+      const actor = tp143Actor(req, rq);
+      if (!actor) return res.status(403).json({ error: "Not allowed on this request." });
+
+      const neg = tp143EnsureNegotiation(rq);
+      let action = tp143NormalizeAction(req.body && req.body.action, actor);
+      const amount = tp143MoneyAmount(
+        (req.body && (req.body.amount ?? req.body.offerAmount ?? req.body.counterAmount ?? req.body.finalAmount))
+      );
+      const note = String((req.body && req.body.note) || "").trim().slice(0, 500);
+      const now = tp143NowIso();
+      let row = tp143LatestRow(neg);
+
+      if (action === "seller_offer") {
+        if (actor !== "seller" && actor !== "admin") return res.status(403).json({ error: "Only seller can send an offer." });
+        if (!amount) return res.status(400).json({ error: "Enter valid offer amount." });
+        if (neg.history.length >= TP_NEG_LIMIT_V143 && (!row || row.sellerOffer)) return res.status(409).json({ error: "Seller offer limit reached." });
+        if (neg.history.length && !["not_started", "aborted", "buyer_aborted", "discount_declined"].includes(String(neg.status || ""))) {
+          return res.status(409).json({ error: "Use decline with new offer after a buyer counter." });
+        }
+        row = { round: 1, sellerOffer: amount, sellerAt: now, buyerCounter: null, buyerAt: null };
+        neg.history = [row];
+        neg.round = 1;
+        neg.status = "seller_offer_pending";
+        neg.lockedAmount = null;
+        neg.paymentAmount = null;
+        tp143SetLast(neg, "seller", "seller_offer", amount, { round: 1, note });
+        rq.status = "negotiation_seller_offer_pending";
+      }
+
+      else if (action === "buyer_counter") {
+        if (actor !== "buyer" && actor !== "admin") return res.status(403).json({ error: "Only buyer can counter." });
+        if (!amount) return res.status(400).json({ error: "Enter valid counter-offer amount." });
+        row = tp143LatestRow(neg);
+        if (!row || !row.sellerOffer) return res.status(409).json({ error: "No active seller offer to counter." });
+
+        // If seller declined a previous counter without a new offer, allow buyer to use the next row with the same seller offer.
+        if (row.buyerCounter && String(neg.status || "") === "seller_declined_counter_no_offer") {
+          if (neg.history.length >= TP_NEG_LIMIT_V143) return res.status(409).json({ error: "Counter-offer limit reached." });
+          const nextRound = neg.history.length + 1;
+          row = { round: nextRound, sellerOffer: row.sellerOffer, sellerAt: now, buyerCounter: null, buyerAt: null, carriedSellerOffer: true };
+          neg.history.push(row);
+        }
+
+        if (row.buyerCounter) return res.status(409).json({ error: "This seller offer already has a buyer counter." });
+        row.buyerCounter = amount;
+        row.buyerAt = now;
+        row.sellerDecision = null;
+        row.sellerDecisionAt = null;
+        neg.round = Number(row.round || neg.history.length);
+        neg.status = neg.round >= TP_NEG_LIMIT_V143 ? "final_counter_pending" : "buyer_counter_pending";
+        neg.lockedAmount = null;
+        neg.paymentAmount = null;
+        tp143SetLast(neg, "buyer", neg.status === "final_counter_pending" ? "buyer_final_counter" : "buyer_counter", amount, { round: neg.round, note });
+        rq.status = "negotiation_buyer_counter_pending";
+      }
+
+      else if (action === "seller_decline_with_offer") {
+        if (actor !== "seller" && actor !== "admin") return res.status(403).json({ error: "Only seller can decline with new offer." });
+        if (!amount) return res.status(400).json({ error: "Enter valid new seller offer." });
+        row = tp143LatestRow(neg);
+        if (!row || !row.buyerCounter) return res.status(409).json({ error: "No buyer counter to decline." });
+        const currentRound = Number(row.round || neg.history.length || 1);
+        if (currentRound >= TP_NEG_LIMIT_V143) return res.status(409).json({ error: "Final seller offer already reached. Accept or decline only." });
+        row.sellerDecision = "declined_with_new_offer";
+        row.sellerDecisionAt = now;
+        const nextRound = currentRound + 1;
+        const next = { round: nextRound, sellerOffer: amount, sellerAt: now, buyerCounter: null, buyerAt: null };
+        neg.history.push(next);
+        neg.round = nextRound;
+        neg.status = "seller_offer_pending";
+        neg.lockedAmount = null;
+        neg.paymentAmount = null;
+        tp143SetLast(neg, "seller", nextRound >= TP_NEG_LIMIT_V143 ? "seller_final_offer" : "seller_decline_with_new_offer", amount, { round: nextRound, previousCounter: row.buyerCounter, note });
+        rq.status = "negotiation_seller_offer_pending";
+      }
+
+      else if (action === "seller_accept_counter") {
+        if (actor !== "seller" && actor !== "admin") return res.status(403).json({ error: "Only seller can accept counter." });
+        row = tp143LatestRow(neg);
+        if (!row || !row.buyerCounter) return res.status(409).json({ error: "No buyer counter to accept." });
+        row.sellerDecision = "accepted_counter";
+        row.sellerDecisionAt = now;
+        neg.round = Number(row.round || neg.history.length);
+        neg.status = "seller_accepted_counter";
+        neg.lockedAmount = Number(row.buyerCounter);
+        neg.paymentAmount = Number(row.buyerCounter);
+        rq.agreedAmount = Number(row.buyerCounter);
+        rq.negotiatedPaymentAmount = Number(row.buyerCounter);
+        tp143SetLast(neg, "seller", neg.round >= TP_NEG_LIMIT_V143 ? "seller_accepted_final_counter" : "seller_accepted_counter", row.buyerCounter, { round: neg.round, note });
+        rq.status = "negotiation_seller_accepted_counter";
+      }
+
+      else if (action === "seller_decline_counter") {
+        if (actor !== "seller" && actor !== "admin") return res.status(403).json({ error: "Only seller can decline counter." });
+        row = tp143LatestRow(neg);
+        if (!row || !row.buyerCounter) return res.status(409).json({ error: "No buyer counter to decline." });
+        row.sellerDecision = "declined_counter";
+        row.sellerDecisionAt = now;
+        neg.round = Number(row.round || neg.history.length);
+        if (neg.round >= TP_NEG_LIMIT_V143) {
+          neg.status = "seller_declined_final_counter";
+          neg.lockedAmount = null;
+          neg.paymentAmount = null;
+          tp143SetLast(neg, "seller", "seller_declined_final_counter", row.buyerCounter, { round: neg.round, sellerFinalOffer: row.sellerOffer, note });
+          rq.status = "negotiation_seller_declined_final_counter";
+        } else {
+          neg.status = "seller_declined_counter_no_offer";
+          neg.lockedAmount = null;
+          neg.paymentAmount = null;
+          tp143SetLast(neg, "seller", "seller_declined_counter_no_offer", row.buyerCounter, { round: neg.round, sellerOffer: row.sellerOffer, note });
+          rq.status = "negotiation_seller_declined_counter";
+        }
+      }
+
+      else if (action === "buyer_accept_seller_offer") {
+        if (actor !== "buyer" && actor !== "admin") return res.status(403).json({ error: "Only buyer can accept seller offer." });
+        row = tp143LatestRow(neg);
+        if (!row || !row.sellerOffer) return res.status(409).json({ error: "No seller offer to accept." });
+        neg.round = Number(row.round || neg.history.length);
+        neg.status = "buyer_accepted_seller_offer";
+        neg.lockedAmount = Number(row.sellerOffer);
+        neg.paymentAmount = Number(row.sellerOffer);
+        rq.agreedAmount = Number(row.sellerOffer);
+        rq.negotiatedPaymentAmount = Number(row.sellerOffer);
+        tp143SetLast(neg, "buyer", "buyer_accepted_seller_offer", row.sellerOffer, { round: neg.round, note });
+        rq.status = "negotiation_buyer_accepted_seller_offer";
+      }
+
+      else if (action === "buyer_start_payment") {
+        if (actor !== "buyer" && actor !== "admin") return res.status(403).json({ error: "Only buyer can start payment." });
+        const locked = tp143MoneyAmount(neg.paymentAmount || neg.lockedAmount || rq.agreedAmount || 0);
+        if (!locked) return res.status(409).json({ error: "No agreed amount is locked for payment." });
+        neg.status = "buyer_started_payment";
+        neg.paymentAmount = locked;
+        rq.agreedAmount = locked;
+        rq.negotiatedPaymentAmount = locked;
+        tp143SetLast(neg, "buyer", "buyer_started_payment", locked, { round: neg.round, note });
+        rq.status = "negotiation_buyer_started_payment";
+      }
+
+      else if (action === "buyer_cancel_after_accept") {
+        if (actor !== "buyer" && actor !== "admin") return res.status(403).json({ error: "Only buyer can cancel." });
+        neg.cancellationsAfterAcceptance = Number(neg.cancellationsAfterAcceptance || 0) + 1;
+        neg.status = "buyer_cancelled_after_acceptance";
+        neg.lockedAmount = null;
+        neg.paymentAmount = null;
+        tp143SetLast(neg, "buyer", "buyer_cancelled_after_acceptance", null, { round: neg.round, cancellationsAfterAcceptance: neg.cancellationsAfterAcceptance, note });
+        rq.status = "negotiation_buyer_cancelled_after_acceptance";
+      }
+
+      else if (action === "buyer_abort") {
+        if (actor !== "buyer" && actor !== "admin") return res.status(403).json({ error: "Only buyer can abort." });
+        neg.status = "buyer_aborted";
+        neg.lockedAmount = null;
+        neg.paymentAmount = null;
+        tp143SetLast(neg, "buyer", "buyer_aborted", null, { round: neg.round, note });
+        rq.status = "negotiation_buyer_aborted";
+      }
+
+      else {
+        return res.status(400).json({ error: "Invalid negotiation action." });
+      }
+
+      rq.negotiation = neg;
+      tp143SaveRequest(rq);
+
+      const notifyPhone = actor === "buyer" ? rq.toPhone : rq.fromPhone;
+      tp143Notify(notifyPhone, {
+        type: "negotiation_update",
+        title: "Negotiation updated",
+        message: `Negotiation action: ${neg.lastAction && neg.lastAction.action ? neg.lastAction.action : action}`,
+        requestId: rq.id,
+        itemCode: rq.itemCode,
+        status: neg.status,
+      });
+
+      try { if (typeof logAudit === "function") logAudit(req, "request_negotiation_action", { requestId: rq.id, action, status: neg.status, round: neg.round }); } catch (_) {}
+      return res.json({ ok: true, request: rq, negotiation: neg });
+    } catch (err) {
+      console.error("[TutoPay] negotiation action error:", err);
+      return res.status(500).json({ error: "Negotiation action failed." });
+    }
+  });
+
+  app.get("/api/requests/:id/negotiation-v143", requireAuth, (req, res) => {
+    const rq = tp143FindRequest(req.params.id);
+    if (!rq) return res.status(404).json({ error: "Request not found." });
+    if (!tp143CanView(req, rq)) return res.status(403).json({ error: "Not allowed." });
+    const neg = tp143EnsureNegotiation(rq);
+    return res.json({ ok: true, requestId: rq.id, status: neg.status, negotiation: neg });
+  });
+
+  console.log("[TutoPay] Canonical Negotiation Core v14.3.0 loaded");
+} catch (e) {
+  console.error("[TutoPay] Canonical Negotiation Core v14.3.0 failed:", e && e.message ? e.message : e);
+}
