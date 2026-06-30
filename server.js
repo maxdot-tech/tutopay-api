@@ -2529,6 +2529,123 @@ app.post("/api/admin/kyc/:phone/review", requireAuth, (req, res) => {
   });
 });
 
+
+// ===== Canonical item pricing / discount rules (v14.3.1) =====
+function tpPricingCleanText(v, max = 180) {
+  return String(v == null ? "" : v).trim().slice(0, max);
+}
+
+function tpPricingMode(raw) {
+  const m = String(raw || "fixed").trim().toUpperCase();
+  if (m === "SD" || m === "SOLID" || m === "SOLID_DISCOUNT") return "SD";
+  if (m === "DMP" || m === "MULTIPLE" || m === "MULTI") return "DMP";
+  if (m === "N" || m === "NEGOTIABLE") return "N";
+  return "fixed";
+}
+
+function tpPricingKind(raw) {
+  const k = String(raw || "percent").trim().toLowerCase();
+  return k === "amount" || k === "fixed" || k === "kwacha" ? "amount" : "percent";
+}
+
+function tpPricingDiscountedPrice(basePrice, rules, qty = 1) {
+  const base = Number(basePrice || 0);
+  if (!Number.isFinite(base) || base <= 0) return 0;
+  const r = rules || {};
+  const mode = tpPricingMode(r.mode || r.pricingMode || r.discountMode);
+  if (mode !== "SD" && mode !== "DMP") return base;
+  if (mode === "DMP") {
+    const minQty = Math.max(2, Number(r.dmpMinQty || r.discountMinQty || 2) || 2);
+    if ((Number(qty || 1) || 1) < minQty) return base;
+  }
+  const kind = tpPricingKind(r.discountKind || r.type);
+  const val = Math.max(0, Number(r.discountValue || r.discountPercent || r.discountAmount || 0) || 0);
+  let finalPrice = base;
+  if (kind === "amount") finalPrice = base - val;
+  else finalPrice = base - (base * Math.min(val, 95) / 100);
+  return Math.max(0, Number(finalPrice.toFixed(2)));
+}
+
+function tpPricingRulesFromBody(body, basePrice) {
+  const b = body || {};
+  const mode = tpPricingMode(b.pricingMode || b.mode || b.discountMode);
+  const discountKind = tpPricingKind(b.discountKind || b.discountType || b.type);
+  const discountValue = Math.max(0, Number(b.discountValue || b.discountPercent || b.discountAmount || 0) || 0);
+  const dmpMinQty = Math.max(2, Number(b.dmpMinQty || b.discountMinQty || 2) || 2);
+  const note = tpPricingCleanText(b.pricingNote || b.discountNote || b.sellerPricingNote || "", 180);
+  const rules = {
+    mode,
+    discountKind,
+    discountValue,
+    dmpMinQty,
+    note,
+    updatedAt: (typeof nowIso === "function" ? nowIso() : new Date().toISOString())
+  };
+  rules.discountPricePreview = tpPricingDiscountedPrice(basePrice, rules, dmpMinQty);
+  return rules;
+}
+
+function tpApplyPricingRulesToItem(item, rules) {
+  if (!item || !rules) return item;
+  item.pricingRules = { ...rules };
+  item.pricingTerms = { ...rules }; // backward-compatible public name
+  item.pricingMode = rules.mode;
+  item.discountKind = rules.discountKind;
+  item.discountValue = rules.discountValue;
+  item.dmpMinQty = rules.dmpMinQty;
+  item.pricingNote = rules.note;
+  item.discountPricePreview = rules.discountPricePreview;
+  item.pricingUpdatedAt = rules.updatedAt;
+  return item;
+}
+
+function tpItemPricingRules(item) {
+  if (!item) return tpPricingRulesFromBody({ mode: "fixed" }, 0);
+  return item.pricingRules || item.pricingTerms || tpPricingRulesFromBody({
+    mode: item.pricingMode || "fixed",
+    discountKind: item.discountKind || "percent",
+    discountValue: item.discountValue || item.discountPercent || 0,
+    dmpMinQty: item.dmpMinQty || item.discountMinQty || 2,
+    pricingNote: item.pricingNote || ""
+  }, item.price);
+}
+
+function tpPricingSnapshotForItem(item, qty = 1) {
+  const base = Number(item && item.price || 0) || 0;
+  const rules = tpItemPricingRules(item);
+  const mode = tpPricingMode(rules.mode);
+  const minQty = Math.max(2, Number(rules.dmpMinQty || 2) || 2);
+  const discountEligible = mode === "SD" || (mode === "DMP" && (Number(qty || 1) || 1) >= minQty);
+  const discountPrice = discountEligible ? tpPricingDiscountedPrice(base, rules, qty) : base;
+  return {
+    basePrice: base,
+    mode,
+    discountKind: rules.discountKind || "percent",
+    discountValue: Number(rules.discountValue || 0) || 0,
+    dmpMinQty: minQty,
+    discountEligible,
+    discountPrice,
+    negotiable: mode === "N",
+    note: rules.note || "",
+    capturedAt: (typeof nowIso === "function" ? nowIso() : new Date().toISOString())
+  };
+}
+
+function tpPricingMaxQuoteForRequest(rq) {
+  const snap = rq && rq.itemPricingSnapshot;
+  if (!snap) return 0;
+  const mode = tpPricingMode(snap.mode);
+  if (mode === "SD" || (mode === "DMP" && snap.discountEligible)) return Number(snap.discountPrice || 0) || 0;
+  return 0;
+}
+
+function tpPricingNegotiationAllowed(rq) {
+  const snap = rq && rq.itemPricingSnapshot;
+  if (snap && tpPricingMode(snap.mode) === "N") return true;
+  if (rq && rq.negotiation && Array.isArray(rq.negotiation.history) && rq.negotiation.history.length) return true; // legacy continuity
+  return false;
+}
+
 // -------- Items --------
 app.get("/api/items", (req, res) => {
   // Ensure images are served as /uploads files (not giant base64 blobs)
@@ -2639,6 +2756,9 @@ const cache = new Map();
     condition: condition || "used",
     category: req.body && req.body.category ? String(req.body.category) : "",
   };
+
+  // v14.3.1: seller-controlled discount / negotiation rules; default is fixed price.
+  tpApplyPricingRulesToItem(item, tpPricingRulesFromBody(req.body || {}, Number(price)));
 
   items.push(item);
   try { await dbUpsertItem(item); } catch (e) { console.error("[items] dbUpsertItem failed:", e && e.message ? e.message : e); }
@@ -3693,7 +3813,7 @@ app.get("/api/requests", requireAuth, (req, res) => {
 });
 
 app.post("/api/requests", requireAuth, (req, res) => {
-  const { fromPhone, toPhone, itemCode, quantity, itemSnapshot } = req.body || {};
+  const { fromPhone, toPhone, itemCode, quantity, qty, itemSnapshot } = req.body || {};
 
     if (req.user.role !== "buyer" && req.user.role !== "admin") {
     return res.status(403).json({ error: "Only buyers can create requests." });
@@ -3713,14 +3833,16 @@ app.post("/api/requests", requireAuth, (req, res) => {
 
   // Try live catalogue first, fall back to snapshot sent from frontend
   const item = findItem(itemCode);
+  const requestedQty = Math.max(1, Number(quantity != null ? quantity : qty) || 1);
   const snapSource = item || itemSnapshot || null;
+  const itemPricingSnapshot = snapSource ? tpPricingSnapshotForItem(snapSource, requestedQty) : null;
 
   const reqObj = {
     id: uuid(),
     fromPhone,
     toPhone,
     itemCode,
-    quantity: Number(quantity) || 1,
+    quantity: requestedQty,
     status: "open",
     createdAt: nowIso(),
     repliedAt: null,
@@ -3735,8 +3857,13 @@ app.post("/api/requests", requireAuth, (req, res) => {
           imageUrls: Array.isArray(snapSource.imageUrls)
             ? snapSource.imageUrls
             : (snapSource.imageUrl ? [snapSource.imageUrl] : []),
+          pricingRules: snapSource.pricingRules || snapSource.pricingTerms || null,
+          pricingMode: snapSource.pricingMode || (snapSource.pricingRules && snapSource.pricingRules.mode) || "fixed",
         }
       : null,
+    itemPricingSnapshot,
+    negotiationAllowed: itemPricingSnapshot ? itemPricingSnapshot.negotiable : false,
+    notesThread: [],
   };
 
   requests.push(reqObj);
@@ -3794,6 +3921,12 @@ function handleRequestReply(req, res) {
       message: message || "",
     };
 
+    // v14.3.1: SD/DMP quotes cannot exceed the seller's own advertised discount price.
+    const maxQuote = tpPricingMaxQuoteForRequest(rq);
+    if (reply.price != null && maxQuote > 0 && Number(reply.price) > maxQuote) {
+      return res.status(400).json({ error: `This request is discount-locked. Quote cannot be higher than K${maxQuote}.` });
+    }
+
     const updated = {
       ...r,
       reply,
@@ -3816,6 +3949,30 @@ function handleRequestReply(req, res) {
 app.post("/api/requests/:id/reply", requireAuth, handleRequestReply);
 app.patch("/api/requests/:id/reply", requireAuth, handleRequestReply);
 
+
+
+// v14.3.1: limited short request notes between buyer and seller (3 each)
+app.post("/api/requests/:id/note", requireAuth, async (req, res) => {
+  const rq = (Array.isArray(requests) ? requests : []).find((x) => String(x.id || "") === String(req.params.id || ""));
+  if (!rq) return res.status(404).json({ error: "Request not found." });
+  const role = String(req.user && req.user.role || "").toLowerCase();
+  const isBuyer = role === "buyer" && String(req.user.phone || "") === String(rq.fromPhone || "");
+  const isSeller = role === "seller" && String(req.user.phone || "") === String(rq.toPhone || "");
+  const isAdmin = role === "admin";
+  if (!isBuyer && !isSeller && !isAdmin) return res.status(403).json({ error: "Only the request buyer/seller can add notes." });
+  const actor = isSeller ? "seller" : (isBuyer ? "buyer" : "admin");
+  const text = tpPricingCleanText(req.body && req.body.text || "", 180);
+  if (!text) return res.status(400).json({ error: "Enter a short note." });
+  rq.notesThread = Array.isArray(rq.notesThread) ? rq.notesThread : [];
+  const used = rq.notesThread.filter((n) => String(n.actor || "") === actor).length;
+  if (actor !== "admin" && used >= 3) return res.status(409).json({ error: "Note limit reached. Each side can send up to 3 short notes." });
+  const note = { id: uuid(), actor, phone: req.user.phone || "", text, at: nowIso() };
+  rq.notesThread.push(note);
+  rq.updatedAt = nowIso();
+  if (dbEnabled()) { dbUpsertRequest(rq).catch(() => {}); }
+  try { if (typeof createNotification === "function") createNotification(actor === "buyer" ? rq.toPhone : rq.fromPhone, { type: "request_note", title: "New request note", message: text, requestId: rq.id, itemCode: rq.itemCode }); } catch (_) {}
+  res.status(201).json({ ok: true, request: rq, note });
+});
 
 // -------- Phone normalisation helper for public routes --------
 function normalizePhone(phone) {
@@ -7058,13 +7215,15 @@ try {
   }
 
   function tpV13PublicPricing(item) {
-    const p = item && (item.pricingTerms || item.pricing || {});
+    const rules = tpItemPricingRules(item);
     return {
-      mode: tpV13Clean((p && p.mode) || item.pricingMode || item.discountType || "fixed", 40),
-      discountPercent: Number((p && p.discountPercent) || item.discountPercent || 0),
-      discountMinQty: Number((p && p.discountMinQty) || item.discountMinQty || 1),
-      negotiableLevel: tpV13Clean((p && p.negotiableLevel) || item.negotiableLevel || "", 40),
-      updatedAt: (p && p.updatedAt) || item.pricingUpdatedAt || null
+      mode: tpPricingMode(rules.mode),
+      discountKind: rules.discountKind || "percent",
+      discountValue: Number(rules.discountValue || 0) || 0,
+      dmpMinQty: Number(rules.dmpMinQty || 2) || 2,
+      note: rules.note || "",
+      discountPricePreview: tpPricingDiscountedPrice(item && item.price, rules, Number(rules.dmpMinQty || 2) || 2),
+      updatedAt: rules.updatedAt || item.pricingUpdatedAt || null
     };
   }
 
@@ -7092,29 +7251,33 @@ try {
     const isAdmin = tpV13Role(req) === "admin";
     if (!isOwner && !isAdmin) return res.status(403).json({ error: "Only the seller or admin can update item pricing terms." });
 
-    const mode = tpV13Clean(req.body && req.body.mode || "fixed", 40);
-    const discountPercent = Math.max(0, Math.min(90, Number(req.body && req.body.discountPercent || 0)));
-    const discountMinQty = Math.max(1, Number(req.body && req.body.discountMinQty || 1));
-    const negotiableLevel = tpV13Clean(req.body && req.body.negotiableLevel || "", 40);
-
-    item.pricingTerms = {
-      mode: ["fixed", "percent", "negotiable"].includes(mode) ? mode : "fixed",
-      discountPercent,
-      discountMinQty,
-      negotiableLevel: ["", "slight", "high"].includes(negotiableLevel) ? negotiableLevel : "",
-      updatedAt: tpV13NowIso()
-    };
-
-    // Also keep flat fields for old frontend code.
-    item.pricingMode = item.pricingTerms.mode;
-    item.discountPercent = item.pricingTerms.discountPercent;
-    item.discountMinQty = item.pricingTerms.discountMinQty;
-    item.negotiableLevel = item.pricingTerms.negotiableLevel;
-    item.pricingUpdatedAt = item.pricingTerms.updatedAt;
+    const rules = tpPricingRulesFromBody(req.body || {}, Number(item.price || 0));
+    tpApplyPricingRulesToItem(item, rules);
 
     tpV13SaveItem(item);
-    try { if (typeof logAudit === "function") logAudit(req, "item_pricing_terms_updated", { itemCode: item.code, pricingTerms: item.pricingTerms }); } catch (_) {}
-    res.json({ ok: true, item });
+    try { if (typeof logAudit === "function") logAudit(req, "item_pricing_terms_updated", { itemCode: item.code, pricingRules: item.pricingRules }); } catch (_) {}
+    res.json({ ok: true, item, pricingRules: item.pricingRules });
+  });
+
+  app.post("/api/items/bulk-pricing", requireAuth, async (req, res) => {
+    const role = tpV13Role(req);
+    if (role !== "seller" && role !== "admin") return res.status(403).json({ error: "Only seller or admin can apply bulk pricing." });
+    const sellerPhone = role === "admin" && req.body && req.body.sellerPhone ? String(req.body.sellerPhone) : String(req.user.phone || "");
+    const excludeUnavailable = String((req.body || {}).excludeUnavailable || "true").toLowerCase() !== "false";
+    const sellerItems = (Array.isArray(items) ? items : []).filter((it) => {
+      if (String(it.sellerPhone || "") !== sellerPhone) return false;
+      if (excludeUnavailable && String(it.availability || "available") !== "available") return false;
+      return true;
+    });
+    let updated = 0;
+    for (const item of sellerItems) {
+      const rules = tpPricingRulesFromBody(req.body || {}, Number(item.price || 0));
+      tpApplyPricingRulesToItem(item, rules);
+      updated++;
+      try { await dbUpsertItem(item); } catch (_) {}
+    }
+    try { if (typeof logAudit === "function") logAudit(req, "bulk_item_pricing_terms_updated", { sellerPhone, updated, mode: (req.body || {}).mode || (req.body || {}).pricingMode }); } catch (_) {}
+    res.json({ ok: true, updated, items: sellerItems });
   });
 
   app.get("/api/public/item/:id/pricing", (req, res) => {
@@ -7130,6 +7293,7 @@ try {
     const isSeller = tpV13Role(req) === "seller" && String(req.user.phone || "") === String(rq.toPhone || "");
     const isAdmin = tpV13Role(req) === "admin";
     if (!isSeller && !isAdmin) return res.status(403).json({ error: "Only the seller or admin can send a discount offer." });
+    if (!tpPricingNegotiationAllowed(rq)) return res.status(409).json({ error: "This item is not marked negotiable. Enable N on the item to negotiate." });
 
     const originalAmount = Number(req.body && req.body.originalAmount || 0);
     const discountAmount = Number(req.body && req.body.discountAmount || 0);
@@ -7434,6 +7598,9 @@ try {
         (req.body && (req.body.amount ?? req.body.offerAmount ?? req.body.counterAmount ?? req.body.finalAmount))
       );
       const note = String((req.body && req.body.note) || "").trim().slice(0, 500);
+      if (!tpPricingNegotiationAllowed(rq) && !["buyer_abort"].includes(action)) {
+        return res.status(409).json({ error: "Negotiation is locked for this item. Seller must enable Negotiable (N) first." });
+      }
       const now = tp143NowIso();
       let row = tp143LatestRow(neg);
 
