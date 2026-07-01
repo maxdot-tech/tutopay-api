@@ -6642,11 +6642,12 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 })();
 
 
-/* ===== TutoPay v1.9: User Trust + Ratings Backend ===== */
-(function TP_TRUST_RATINGS_BACKEND_V19(){
+
+/* ===== TutoPay v14.4.0: User Ratings + Trust/Risk Intelligence Backend ===== */
+(function TP_TRUST_RATINGS_BACKEND_V1440(){
   function trustStaffAllowed(role){
     const r = String(role || '').toLowerCase();
-    return r === 'admin' || r === 'risk_agent' || r === 'fraud_agent' || r === 'compliance_agent' || r === 'compliance_officer' || r === 'accounts_agent' || r === 'finance_agent' || r === 'accounts';
+    return ['admin','risk_agent','fraud_agent','compliance_agent','compliance_officer','accounts_agent','finance_agent','accounts'].includes(r);
   }
   function requireTrustStaff(req, res, next){
     if (!req.user || !trustStaffAllowed(req.user.role)) return res.status(403).json({ error: 'Internal staff access required.' });
@@ -6656,6 +6657,9 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   function trustPhone(v){ return String(v || '').replace(/\D/g,'').replace(/^260/,'0'); }
   function trustNum(v, fallback=0){ const n = Number(v); return Number.isFinite(n) ? n : fallback; }
   function trustMoney(v){ const n = Number(v || 0); return Math.round(n * 100) / 100; }
+  function clamp(n, min, max){ n = trustNum(n, min); return Math.max(min, Math.min(max, n)); }
+  function clampStar(n){ return Math.round(clamp(n, 1, 5)); }
+  function pct(n){ return Math.round(clamp(n, 0, 1) * 100); }
   function trustCsv(v){ const s = String(v == null ? '' : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s; }
   function txBuyer(tx){ return trustPhone(tx && (tx.fromPhone || tx.buyerPhone)); }
   function txSeller(tx){ return trustPhone(tx && (tx.toPhone || tx.sellerPhone)); }
@@ -6665,6 +6669,10 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     return ['completed','released','seller_paid','closed'].includes(s) || ['successful','success'].includes(ds) || !!(tx && tx.completedAt);
   }
   function txIsDisputed(tx){ return !!(tx && (tx.disputeActive || String(tx.status || '').toLowerCase().includes('dispute'))); }
+  function txIsCancelled(tx){
+    const s = String((tx && tx.status) || '').toLowerCase();
+    return s.includes('cancel') || s.includes('abort') || !!(tx && (tx.cancelledAt || tx.abortedAt));
+  }
   function ensureRatings(tx){ if(!tx) return []; if(!Array.isArray(tx.trustRatings)) tx.trustRatings = []; return tx.trustRatings; }
   function allRatings(){
     const out = [];
@@ -6675,49 +6683,122 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   }
   function userByPhoneLoose(ph){ const p = trustPhone(ph); return (users || []).find(u => trustPhone(u && u.phone) === p) || null; }
   function publicUserLabel(ph){ const u = userByPhoneLoose(ph); return (u && (u.displayName || u.name || u.businessName || u.fullName)) || ''; }
-  function statsForPhone(ph){
-    const p = trustPhone(ph);
+  function computeKycLevel(user){
+    if (!user) return { level:'none', score:0, label:'No KYC record' };
+    const status = String(user.kycStatus || '').toLowerCase();
+    const level = String(user.kycLevel || 'basic').toLowerCase();
+    if (status !== 'verified') return { level: level || 'basic', score: level === 'full' ? 8 : level === 'enhanced' ? 6 : 3, label:`KYC ${status || 'unsubmitted'}` };
+    if (level === 'full') return { level:'full', score:15, label:'Full KYC verified' };
+    if (level === 'enhanced') return { level:'enhanced', score:12, label:'Enhanced KYC verified' };
+    return { level:'basic', score:8, label:'Basic KYC verified' };
+  }
+  function criteriaAvg(r){
+    const keys = ['itemAccuracy','communication','handover','paymentSeriousness','cooperation','reliability'];
+    const vals = keys.map(k=>trustNum(r && r[k], 0)).filter(v=>v>0);
+    return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : trustNum(r && (r.trustLevel || r.rating), 0);
+  }
+  function roleBehaviorFor(p){
     const related = (transactions || []).filter(tx => txBuyer(tx) === p || txSeller(tx) === p);
     const completed = related.filter(txIsCompleted);
     const disputed = related.filter(txIsDisputed);
+    const cancelled = related.filter(txIsCancelled);
+    const cancellations = cancelled.length;
+    const disputeRate = related.length ? disputed.length / related.length : 0;
+    const cancellationRate = related.length ? cancellations / related.length : 0;
+    return { related, completed, disputed, cancelled, disputeRate, cancellationRate };
+  }
+  function bandForScore(score){
+    if (score >= 85) return { riskBand:'Green', band:'Strong trust record', recommendation:'Recommended user. Normal trading allowed.' };
+    if (score >= 70) return { riskBand:'Light Green', band:'Good trust record', recommendation:'Good user. Monitor normal marketplace behaviour.' };
+    if (score >= 50) return { riskBand:'Yellow', band:'Early / watch record', recommendation:'Allow trading but keep standard monitoring active.' };
+    if (score >= 35) return { riskBand:'Orange', band:'Review advised', recommendation:'Risk review advised before higher-value transactions.' };
+    return { riskBand:'Red', band:'Restricted / weak evidence', recommendation:'Limit exposure and review before enabling higher-risk actions.' };
+  }
+  function kycRecommendationFor(user, completed, totalValue, score, disputedCount){
+    const k = computeKycLevel(user);
+    if (disputedCount >= 2) return 'Risk-led KYC review recommended because of repeat disputes.';
+    if (totalValue >= 10000 && k.level !== 'full') return 'Upgrade to full KYC before higher-value pilot trading.';
+    if (completed >= 5 && k.level === 'basic') return 'Upgrade to enhanced KYC; user has meaningful pilot activity.';
+    if (score >= 80 && k.level !== 'full') return 'Eligible for KYC upgrade consideration after admin review.';
+    return k.label;
+  }
+  function sanctionRecommendationFor(profileBase){
+    const { score, disputedTransactions, cancellationRate, ratingCount, averageRating } = profileBase;
+    if (disputedTransactions >= 3 || score < 30) return 'Escalate to risk/compliance review; consider temporary restriction.';
+    if (ratingCount >= 2 && averageRating > 0 && averageRating < 2.5) return 'Issue warning and monitor next transactions.';
+    if (cancellationRate >= 0.35) return 'Limit negotiation privileges if cancellations continue.';
+    if (score < 50) return 'Soft watchlist only; avoid automatic punishment.';
+    return 'No sanction recommended.';
+  }
+  function statsForPhone(ph){
+    const p = trustPhone(ph);
+    const user = userByPhoneLoose(p);
+    const { related, completed, disputed, cancelled, disputeRate, cancellationRate } = roleBehaviorFor(p);
     const received = allRatings().filter(r => trustPhone(r.targetPhone) === p);
     const given = allRatings().filter(r => trustPhone(r.raterPhone) === p);
     const avg = received.length ? received.reduce((a,r)=>a+trustNum(r.rating,0),0) / received.length : 0;
-    const trustAvg = received.length ? received.reduce((a,r)=>a+trustNum(r.trustLevel || r.rating,0),0) / received.length : 0;
+    const criteria = received.length ? received.reduce((a,r)=>a+criteriaAvg(r),0)/received.length : 0;
     const wouldYes = received.filter(r => r.wouldTradeAgain === true || String(r.wouldTradeAgain).toLowerCase() === 'yes').length;
     const completionRate = related.length ? completed.length / related.length : 0;
-    const disputePenalty = related.length ? Math.min(0.35, disputed.length / related.length) : 0;
     const tradeAgainRate = received.length ? wouldYes / received.length : 0;
+    const kyc = computeKycLevel(user);
+
+    // 100-point pilot trust score.
     let score = 0;
-    if (received.length) score += (avg / 5) * 55;
-    score += completionRate * 25;
-    score += tradeAgainRate * 15;
-    if (completed.length >= 3) score += 5;
-    score = Math.max(0, Math.min(100, Math.round(score - disputePenalty * 30)));
-    const band = score >= 85 ? 'Strong trust record' : score >= 70 ? 'Good trust record' : score >= 50 ? 'Early trust record' : (received.length ? 'Needs more evidence' : 'No rating evidence yet');
-    return {
+    score += received.length ? (avg / 5) * 22 : 0;                         // user feedback
+    score += received.length ? (criteria / 5) * 18 : 0;                    // detailed criteria
+    score += completionRate * 18;                                          // completed workflow evidence
+    score += Math.min(17, completed.length * 2.5);                         // volume evidence, capped
+    score += tradeAgainRate * 10;                                          // future-trade confidence
+    score += kyc.score;                                                    // KYC confidence
+    score -= Math.min(20, disputeRate * 45);                               // dispute risk
+    score -= Math.min(15, cancellationRate * 30);                          // cancellation/abort risk
+    score = Math.max(0, Math.min(100, Math.round(score)));
+    const band = bandForScore(score);
+
+    const base = {
       phone: p,
-      role: userByPhoneLoose(p) && userByPhoneLoose(p).role || '',
+      role: (user && user.role) || '',
       displayName: publicUserLabel(p),
       score,
-      band,
+      band: band.band,
+      riskBand: band.riskBand,
+      recommendation: band.recommendation,
       ratingCount: received.length,
       averageRating: received.length ? Math.round(avg * 10) / 10 : 0,
-      averageTrustLevel: received.length ? Math.round(trustAvg * 10) / 10 : 0,
-      wouldTradeAgainPercent: received.length ? Math.round(tradeAgainRate * 100) : 0,
+      averageCriteria: received.length ? Math.round(criteria * 10) / 10 : 0,
+      wouldTradeAgainPercent: received.length ? pct(tradeAgainRate) : 0,
       transactions: related.length,
       completedTransactions: completed.length,
       disputedTransactions: disputed.length,
+      cancelledTransactions: cancelled.length,
+      disputeRatePercent: pct(disputeRate),
+      cancellationRatePercent: pct(cancellationRate),
+      cancellationRate,
       totalValue: trustMoney(related.reduce((a,t)=>a+trustNum(t.amount,0),0)),
       completedValue: trustMoney(completed.reduce((a,t)=>a+trustNum(t.amount,0),0)),
       ratingsGiven: given.length,
+      kycLevel: kyc.level,
+      kycStatus: (user && user.kycStatus) || 'none',
+      kycLabel: kyc.label,
       lastRatingAt: received.slice().sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0))[0]?.createdAt || null
     };
+    base.kycRecommendation = kycRecommendationFor(user, base.completedTransactions, base.completedValue, score, base.disputedTransactions);
+    base.sanctionRecommendation = sanctionRecommendationFor(base);
+    base.badges = [];
+    if (base.kycStatus === 'verified') base.badges.push('Verified');
+    if (base.score >= 80) base.badges.push('Trusted');
+    if (base.completedTransactions >= 5) base.badges.push('Active trader');
+    if (base.disputedTransactions === 0 && base.completedTransactions >= 3) base.badges.push('Low dispute');
+    if (base.averageRating >= 4.5 && base.ratingCount >= 3) base.badges.push('Highly rated');
+    return base;
   }
   function safeRating(r){
     return {
       id: r.id, txId: r.txId, createdAt: r.createdAt, raterPhone: r.raterPhone, raterRole: r.raterRole,
       targetPhone: r.targetPhone, targetRole: r.targetRole, rating: r.rating, trustLevel: r.trustLevel,
+      itemAccuracy: r.itemAccuracy || null, communication: r.communication || null, handover: r.handover || null,
+      paymentSeriousness: r.paymentSeriousness || null, cooperation: r.cooperation || null, reliability: r.reliability || null,
       wouldTradeAgain: r.wouldTradeAgain, comment: r.comment || '', txStatus: r.txStatus || '', txAmount: trustMoney(r.txAmount || 0)
     };
   }
@@ -6732,22 +6813,6 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
         return { id: tx.id, itemCode: tx.itemCode || tx.code || (tx.itemSnapshot && tx.itemSnapshot.code) || '', amount: trustMoney(tx.amount || 0), status: tx.status || '', completedAt: tx.completedAt || tx.updatedAt || null, targetPhone, targetRole: txBuyer(tx) === p ? 'seller' : 'buyer', alreadyRated };
       });
   }
-  function overviewTrust(){
-    const marketUsers = (users || []).filter(u => ['buyer','seller'].includes(String(u && u.role || '').toLowerCase()));
-    const profiles = marketUsers.map(u => statsForPhone(u.phone)).sort((a,b)=>b.score-a.score || b.ratingCount-a.ratingCount).slice(0,100);
-    const ratings = allRatings().map(safeRating).sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0));
-    const avgScore = profiles.length ? Math.round(profiles.reduce((a,p)=>a+(p.score||0),0)/profiles.length) : 0;
-    const completed = (transactions || []).filter(txIsCompleted).length;
-    const unratedCompleted = eligibleUnratedTransactionsCount();
-    const flags = [
-      { label:'Trust profiles exist', ok: profiles.some(p=>p.ratingCount>0), detail:`${ratings.length} rating records`, action:'Ask buyers/sellers to rate completed transactions.' },
-      { label:'Completed transaction pool exists', ok: completed > 0, detail:`${completed} completed transactions`, action:'Run controlled transactions to create rating opportunities.' },
-      { label:'Unrated completed transactions followed up', ok: unratedCompleted === 0 || ratings.length === 0, detail:`${unratedCompleted} rating opportunities still unused`, action:'Send reminders to users after successful completion.' },
-      { label:'Low-dispute trust base', ok: profiles.filter(p=>p.disputedTransactions>0).length <= Math.max(1, Math.ceil(profiles.length*0.15)), detail:`${profiles.filter(p=>p.disputedTransactions>0).length} profiles have disputes`, action:'Risk team should review repeat disputes and poor ratings.' }
-    ];
-    const score = flags.length ? Math.round(flags.filter(f=>f.ok).length / flags.length * 100) : 0;
-    return { ok:true, generatedAt: nowIso(), score, band: score>=85?'Trust evidence strong':score>=70?'Trust evidence moderate':score>=50?'Trust evidence early':'Trust evidence weak', counts:{ users: marketUsers.length, profiles: profiles.length, ratings: ratings.length, completedTransactions: completed, unratedCompletedTransactions: unratedCompleted, averageTrustScore: avgScore }, profiles, recentRatings: ratings.slice(0,30), flags, note:'Trust scores are internal pilot indicators, not credit scores. They support safer marketplace matching, risk review and pilot evidence.' };
-  }
   function eligibleUnratedTransactionsCount(){
     let n = 0;
     for (const tx of (transactions || [])) {
@@ -6759,6 +6824,27 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
       if (!sellerRated) n += 1;
     }
     return n;
+  }
+  function overviewTrust(){
+    const marketUsers = (users || []).filter(u => ['buyer','seller'].includes(String(u && u.role || '').toLowerCase()));
+    const profiles = marketUsers.map(u => statsForPhone(u.phone)).sort((a,b)=>b.score-a.score || b.ratingCount-a.ratingCount).slice(0,150);
+    const ratings = allRatings().map(safeRating).sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0));
+    const avgScore = profiles.length ? Math.round(profiles.reduce((a,p)=>a+(p.score||0),0)/profiles.length) : 0;
+    const completed = (transactions || []).filter(txIsCompleted).length;
+    const unratedCompleted = eligibleUnratedTransactionsCount();
+    const riskCounts = profiles.reduce((a,p)=>{ a[p.riskBand] = (a[p.riskBand]||0)+1; return a; }, {});
+    const kycUpgradeCandidates = profiles.filter(p => /upgrade|full kyc|enhanced/i.test(p.kycRecommendation || '')).slice(0,50);
+    const sanctionCandidates = profiles.filter(p => !/^No sanction/i.test(p.sanctionRecommendation || '')).slice(0,50);
+    const flags = [
+      { label:'Trust profiles exist', ok: profiles.some(p=>p.ratingCount>0), detail:`${ratings.length} rating records`, action:'Ask buyers/sellers to rate completed transactions.' },
+      { label:'Completed transaction pool exists', ok: completed > 0, detail:`${completed} completed transactions`, action:'Run controlled transactions to create rating opportunities.' },
+      { label:'Unrated completed transactions followed up', ok: unratedCompleted === 0 || ratings.length === 0, detail:`${unratedCompleted} rating opportunities still unused`, action:'Send reminders to users after successful completion.' },
+      { label:'Risk bands generated', ok: profiles.length > 0, detail:`Green ${riskCounts.Green||0}, Yellow ${riskCounts.Yellow||0}, Orange ${riskCounts.Orange||0}, Red ${riskCounts.Red||0}`, action:'Use risk bands as internal review support, not automatic punishment.' },
+      { label:'KYC upgrade analysis active', ok: true, detail:`${kycUpgradeCandidates.length} KYC upgrade candidate(s)`, action:'Review active/high-value users for enhanced or full KYC.' },
+      { label:'Sanction ladder active', ok: true, detail:`${sanctionCandidates.length} user(s) needing warning/review`, action:'Apply soft warning → watchlist → temporary limits → suspension only after review.' }
+    ];
+    const score = flags.length ? Math.round(flags.filter(f=>f.ok).length / flags.length * 100) : 0;
+    return { ok:true, generatedAt: nowIso(), score, band: score>=85?'Trust evidence strong':score>=70?'Trust evidence moderate':score>=50?'Trust evidence early':'Trust evidence weak', counts:{ users: marketUsers.length, profiles: profiles.length, ratings: ratings.length, completedTransactions: completed, unratedCompletedTransactions: unratedCompleted, averageTrustScore: avgScore, green:riskCounts.Green||0, yellow:riskCounts.Yellow||0, orange:riskCounts.Orange||0, red:riskCounts.Red||0, kycUpgradeCandidates:kycUpgradeCandidates.length, sanctionCandidates:sanctionCandidates.length }, profiles, recentRatings: ratings.slice(0,40), flags, kycUpgradeCandidates, sanctionCandidates, note:'Trust scores are internal pilot indicators, not credit scores. They support safer marketplace matching, risk review, KYC upgrades, recommendations and proportionate sanctions.' };
   }
 
   app.get('/api/trust/me', requireAuth, (req,res)=>{
@@ -6792,27 +6878,47 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if (txIsDisputed(tx)) return res.status(400).json({ error:'Ratings are paused for disputed transactions until review is complete.' });
     const ratings = ensureRatings(tx);
     if (ratings.some(r => trustPhone(r.raterPhone) === me)) return res.status(400).json({ error:'You have already rated this transaction.' });
-    const rating = Math.max(1, Math.min(5, Math.round(trustNum(body.rating, 0))));
-    const trustLevel = Math.max(1, Math.min(5, Math.round(trustNum(body.trustLevel || body.rating, rating))));
+
+    const rating = clampStar(body.rating);
     if (!rating) return res.status(400).json({ error:'Rating must be between 1 and 5.' });
     const targetPhone = isBuyer ? txSeller(tx) : txBuyer(tx);
     const targetRole = isBuyer ? 'seller' : 'buyer';
-    const rec = { id: uuid(), createdAt: nowIso(), txId: tx.id, raterPhone: me, raterRole: role, targetPhone, targetRole, rating, trustLevel, wouldTradeAgain: !!body.wouldTradeAgain, comment: cleanTrust(body.comment || '', 500) };
+
+    const rec = {
+      id: uuid(),
+      createdAt: nowIso(),
+      txId: tx.id,
+      raterPhone: me,
+      raterRole: role,
+      targetPhone,
+      targetRole,
+      rating,
+      trustLevel: clampStar(body.trustLevel || body.rating),
+      wouldTradeAgain: !!body.wouldTradeAgain,
+      comment: cleanTrust(body.comment || '', 500),
+      itemAccuracy: isBuyer ? clampStar(body.itemAccuracy || body.accuracy || rating) : null,
+      communication: clampStar(body.communication || rating),
+      handover: clampStar(body.handover || body.delivery || rating),
+      paymentSeriousness: isSeller ? clampStar(body.paymentSeriousness || rating) : null,
+      cooperation: isSeller ? clampStar(body.cooperation || body.collectionCooperation || rating) : null,
+      reliability: clampStar(body.reliability || rating)
+    };
     ratings.push(rec);
     tx.trustRatings = ratings;
     tx.trustSummary = { ratingCount: ratings.length, buyerRated: ratings.some(r=>r.raterRole==='buyer'), sellerRated: ratings.some(r=>r.raterRole==='seller'), updatedAt: nowIso() };
-    logAudit(req, 'trust_rating_submitted', { txId: tx.id, targetPhone, targetRole, rating, trustLevel, wouldTradeAgain: rec.wouldTradeAgain });
+    logAudit(req, 'trust_rating_submitted', { txId: tx.id, targetPhone, targetRole, rating, trustLevel: rec.trustLevel, wouldTradeAgain: rec.wouldTradeAgain });
     if (dbEnabled()) { try { await dbUpsertTransaction(tx); } catch(_) {} }
     res.json({ ok:true, rating:safeRating(Object.assign({ txAmount:tx.amount, txStatus:tx.status }, rec)), myProfile:statsForPhone(me), targetProfile:statsForPhone(targetPhone) });
   });
 
   app.get('/api/admin/trust/overview', requireAuth, requireTrustStaff, (req,res)=>{ const o=overviewTrust(); logAudit(req,'trust_overview_viewed',{score:o.score, ratings:o.counts.ratings}); res.json(o); });
+
   app.get('/api/admin/trust/export.csv', requireAuth, requireTrustStaff, (req,res)=>{
     const o = overviewTrust();
-    const rows = [['phone','role','display_name','trust_score','band','rating_count','average_rating','would_trade_again_percent','transactions','completed_transactions','disputed_transactions','total_value_zmw','last_rating_at']];
-    for (const p of o.profiles) rows.push([p.phone,p.role,p.displayName,p.score,p.band,p.ratingCount,p.averageRating,p.wouldTradeAgainPercent,p.transactions,p.completedTransactions,p.disputedTransactions,p.totalValue,p.lastRatingAt||'']);
+    const rows = [['phone','role','display_name','trust_score','risk_band','band','rating_count','average_rating','average_criteria','would_trade_again_percent','transactions','completed_transactions','disputed_transactions','cancelled_transactions','dispute_rate_percent','cancellation_rate_percent','kyc_level','kyc_status','kyc_recommendation','sanction_recommendation','recommendation','badges','total_value_zmw','last_rating_at']];
+    for (const p of o.profiles) rows.push([p.phone,p.role,p.displayName,p.score,p.riskBand,p.band,p.ratingCount,p.averageRating,p.averageCriteria,p.wouldTradeAgainPercent,p.transactions,p.completedTransactions,p.disputedTransactions,p.cancelledTransactions,p.disputeRatePercent,p.cancellationRatePercent,p.kycLevel,p.kycStatus,p.kycRecommendation,p.sanctionRecommendation,p.recommendation,(p.badges||[]).join('|'),p.totalValue,p.lastRatingAt||'']);
     res.setHeader('Content-Type','text/csv');
-    res.setHeader('Content-Disposition','attachment; filename="tutopay-trust-ratings.csv"');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-trust-risk-ratings.csv"');
     res.end(rows.map(r=>r.map(trustCsv).join(',')).join('\n'));
   });
 })();
