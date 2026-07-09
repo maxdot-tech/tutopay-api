@@ -6349,7 +6349,98 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     };
   }
   function txForPhone(ph){ const p=phone(ph); return transactions.filter(t => phone(t.buyerPhone || t.fromPhone) === p || phone(t.sellerPhone || t.toPhone) === p); }
-  function feedbackForPhone(ph){ const p=phone(ph); return pilotFeedback.filter(f => phone(f.phone || f.userPhone) === p); }
+  function transactionRatingFeedback(){
+    const out = [];
+    for (const tx of (transactions || [])) {
+      const ratings = Array.isArray(tx && tx.trustRatings) ? tx.trustRatings : [];
+      for (const r of ratings) {
+        if (!r) continue;
+        out.push({
+          id: r.id || `${tx.id || 'tx'}-${r.raterPhone || 'rater'}-${r.createdAt || ''}`,
+          source: 'transaction_rating',
+          createdAt: r.createdAt || tx.completedAt || tx.updatedAt || tx.createdAt || nowIso(),
+          updatedAt: r.createdAt || tx.updatedAt || '',
+          phone: phone(r.raterPhone || ''),
+          role: r.raterRole || '',
+          participantId: null,
+          transactionId: tx.id || '',
+          itemCode: tx.itemCode || tx.code || '',
+          buyerPhone: phone(tx.buyerPhone || tx.fromPhone || ''),
+          sellerPhone: phone(tx.sellerPhone || tx.toPhone || ''),
+          targetPhone: phone(r.targetPhone || ''),
+          targetRole: r.targetRole || '',
+          easeRating: n(r.rating || 0,0),
+          trustRating: n(r.trustLevel || r.rating || 0,0),
+          paymentConfidence: n(r.paymentSeriousness || r.reliability || r.rating || 0,0),
+          overallRating: n(r.rating || 0,0),
+          communication: n(r.communication || 0,0),
+          reliability: n(r.reliability || 0,0),
+          itemAccuracy: n(r.itemAccuracy || 0,0),
+          handover: n(r.handover || 0,0),
+          cooperation: n(r.cooperation || 0,0),
+          paymentSeriousness: n(r.paymentSeriousness || 0,0),
+          wouldUseAgain: !!(r.wouldTradeAgain === true || String(r.wouldTradeAgain).toLowerCase() === 'yes'),
+          comments: clean(r.comment || ''),
+          amount: n(tx.amount || 0,0),
+          txStatus: tx.status || ''
+        });
+      }
+    }
+    return out;
+  }
+  function allPilotFeedback(){
+    const seen = new Set();
+    const rows = [];
+    for (const f of (pilotFeedback || [])) {
+      if (!f) continue;
+      const id = String(f.id || `${f.phone || f.userPhone || ''}-${f.createdAt || ''}-${f.transactionId || ''}`);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      rows.push(Object.assign({ source:'pilot_feedback' }, f));
+    }
+    for (const f of transactionRatingFeedback()) {
+      const id = String(f.id || `${f.phone}-${f.transactionId}-${f.createdAt}`);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      rows.push(f);
+    }
+    return rows.sort((a,b)=>String(b.createdAt||'').localeCompare(String(a.createdAt||'')));
+  }
+  function feedbackForPhone(ph){ const p=phone(ph); return allPilotFeedback().filter(f => phone(f.phone || f.userPhone || f.raterPhone) === p); }
+  function transactionResultRows(){
+    return (transactions || []).map(tx => {
+      const ratings = Array.isArray(tx && tx.trustRatings) ? tx.trustRatings : [];
+      const buyerRating = ratings.find(r => lc(r.raterRole) === 'buyer') || ratings.find(r => phone(r.raterPhone) === phone(tx.buyerPhone || tx.fromPhone));
+      const sellerRating = ratings.find(r => lc(r.raterRole) === 'seller') || ratings.find(r => phone(r.raterPhone) === phone(tx.sellerPhone || tx.toPhone));
+      const completed = ['completed','released','seller_paid','successful'].includes(lc(tx.status || tx.pilotStatus || '')) || !!tx.completedAt;
+      return {
+        txId: tx.id || '',
+        itemCode: tx.itemCode || tx.code || '',
+        buyerPhone: phone(tx.buyerPhone || tx.fromPhone || ''),
+        sellerPhone: phone(tx.sellerPhone || tx.toPhone || ''),
+        amount: n(tx.amount || 0,0),
+        currency: tx.currency || 'ZMW',
+        status: tx.status || '',
+        paymentStatus: tx.paymentStatus || '',
+        completed: completed ? 'yes' : 'no',
+        disputeActive: tx.disputeActive ? 'yes' : 'no',
+        createdAt: tx.createdAt || '',
+        paidAt: tx.paidAt || '',
+        completedAt: tx.completedAt || tx.releasedAt || '',
+        buyerRated: buyerRating ? 'yes' : 'no',
+        buyerRating: buyerRating ? n(buyerRating.rating || 0,0) : '',
+        buyerTrust: buyerRating ? n(buyerRating.trustLevel || buyerRating.rating || 0,0) : '',
+        buyerWouldTradeAgain: buyerRating ? (!!buyerRating.wouldTradeAgain ? 'yes' : 'no') : '',
+        buyerComment: buyerRating ? clean(buyerRating.comment || '') : '',
+        sellerRated: sellerRating ? 'yes' : 'no',
+        sellerRating: sellerRating ? n(sellerRating.rating || 0,0) : '',
+        sellerTrust: sellerRating ? n(sellerRating.trustLevel || sellerRating.rating || 0,0) : '',
+        sellerWouldTradeAgain: sellerRating ? (!!sellerRating.wouldTradeAgain ? 'yes' : 'no') : '',
+        sellerComment: sellerRating ? clean(sellerRating.comment || '') : '',
+        feedbackCount: ratings.length
+      };
+    }).sort((a,b)=>String(b.createdAt||b.completedAt||'').localeCompare(String(a.createdAt||a.completedAt||'')));
+  }
   function participantSafe(p){
     const txs = txForPhone(p.phone);
     const fb = feedbackForPhone(p.phone);
@@ -6377,7 +6468,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const pilotTxs = transactions.filter(t => phones.has(phone(t.buyerPhone || t.fromPhone)) || phones.has(phone(t.sellerPhone || t.toPhone)));
     const completed = pilotTxs.filter(t => ['completed','released','successful'].includes(lc(t.status || t.pilotStatus || ''))).length;
     const disputed = pilotTxs.filter(t => t.disputeActive || ['disputed','refund_requested'].includes(lc(t.status || ''))).length;
-    const fb = pilotFeedback.slice();
+    const fb = allPilotFeedback();
     const flags = [
       { label:'Invite-code onboarding active', ok:invites.length>0, detail:`${invites.length} invite codes created`, action:'Generate buyer and seller pilot invite codes.', weight:2 },
       { label:'Pilot seller pool started', ok:sellers.length>=1, detail:`${sellers.length} sellers enrolled`, action:'Recruit at least 5 sellers in one high-trust category.', weight:2 },
@@ -6405,7 +6496,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     await pilotDbLoad().catch(()=>{});
     const participants = allParticipants();
     const me = participants.find(p=>phone(p.phone)===phone(req.user.phone)) || null;
-    res.json({ ok:true, participant:me, feedback: feedbackForPhone(req.user.phone).slice(-10).reverse(), inviteRequired:PILOT_INVITES_REQUIRED });
+    res.json({ ok:true, participant:me, feedback: feedbackForPhone(req.user.phone).slice(0,10), inviteRequired:PILOT_INVITES_REQUIRED });
   });
 
   app.post('/api/pilot/feedback', requireAuth, async (req,res)=>{
@@ -6476,7 +6567,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     res.json({ ok:true, participant:participantSafe(p) });
   });
 
-  app.get('/api/admin/pilot/feedback', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); res.json({ ok:true, feedback: pilotFeedback.slice().reverse().slice(0,500) }); });
+  app.get('/api/admin/pilot/feedback', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); res.json({ ok:true, feedback: allPilotFeedback().slice(0,500) }); });
   app.post('/api/admin/pilot/feedback', requireAuth, requirePilotWrite, async (req,res)=>{
     await pilotDbLoad().catch(()=>{});
     const body=req.body||{}; const ph=phone(body.phone||body.userPhone);
@@ -6485,7 +6576,24 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     pilotFeedback.push(entry); await pilotDbUpsert('feedback',entry).catch(()=>{}); logAudit(req,'pilot_feedback_staff_added',{phone:ph,feedbackId:entry.id}); res.json({ ok:true, feedback:entry });
   });
 
-  app.get('/api/admin/pilot/onboarding/export', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const o=overview(); logAudit(req,'pilot_onboarding_exported',{participants:o.counts.participants,invites:o.counts.invites}); res.json({ ok:true, title:'TutoPay Controlled Pilot Onboarding Evidence Pack', generatedAt:nowIso(), generatedBy:{phone:req.user.phone,role:req.user.role}, nonCustodialStatement:'TutoPay manages participant onboarding, transaction workflow, evidence, confirmations, disputes, audit records and reconciliation metadata. Customer funds remain processed, held, settled, refunded or reversed by licensed PSP/mobile-money/banking partners.', overview:o, invites:o.invites, participants:o.participants, feedback:pilotFeedback.slice(-1000), nextRecommendedEvidence:['Recruit a balanced pool of buyer and seller participants through invite codes.','Collect pilot consent and feedback from every participant.','Run controlled transactions and reconcile against PSP records.','Export pilot onboarding and pilot metrics packs for PSP/investor discussions.'] }); });
+  app.get('/api/admin/pilot/onboarding/export', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const o=overview(); logAudit(req,'pilot_onboarding_exported',{participants:o.counts.participants,invites:o.counts.invites}); res.json({ ok:true, title:'TutoPay Controlled Pilot Onboarding Evidence Pack', generatedAt:nowIso(), generatedBy:{phone:req.user.phone,role:req.user.role}, nonCustodialStatement:'TutoPay manages participant onboarding, transaction workflow, evidence, confirmations, disputes, audit records and reconciliation metadata. Customer funds remain processed, held, settled, refunded or reversed by licensed PSP/mobile-money/banking partners.', overview:o, invites:o.invites, participants:o.participants, feedback:allPilotFeedback().slice(0,1000), transactionResults:transactionResultRows().slice(0,2000), nextRecommendedEvidence:['Recruit a balanced pool of buyer and seller participants through invite codes.','Collect pilot consent and feedback from every participant.','Run controlled transactions and reconcile against PSP records.','Export pilot onboarding and pilot metrics packs for PSP/investor discussions.'] }); });
+
+  app.get('/api/admin/pilot/results.csv', requireAuth, requirePilotStaff, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const rows=[['tx_id','item_code','buyer_phone','seller_phone','amount','currency','status','payment_status','completed','dispute_active','created_at','paid_at','completed_at','buyer_rated','buyer_rating','buyer_trust','buyer_would_trade_again','buyer_comment','seller_rated','seller_rating','seller_trust','seller_would_trade_again','seller_comment','feedback_count']];
+    for(const r of transactionResultRows()) rows.push([r.txId,r.itemCode,r.buyerPhone,r.sellerPhone,r.amount,r.currency,r.status,r.paymentStatus,r.completed,r.disputeActive,r.createdAt,r.paidAt,r.completedAt,r.buyerRated,r.buyerRating,r.buyerTrust,r.buyerWouldTradeAgain,r.buyerComment,r.sellerRated,r.sellerRating,r.sellerTrust,r.sellerWouldTradeAgain,r.sellerComment,r.feedbackCount]);
+    res.setHeader('Content-Type','text/csv');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-transaction-results.csv"');
+    res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n'));
+  });
+  app.get('/api/admin/pilot/feedback.csv', requireAuth, requirePilotStaff, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const rows=[['source','time','phone','role','transaction_id','target_phone','target_role','overall_rating','trust_rating','payment_confidence','communication','reliability','would_use_again','comment']];
+    for(const f of allPilotFeedback()) rows.push([f.source||'pilot_feedback',f.createdAt||'',f.phone||'',f.role||'',f.transactionId||'',f.targetPhone||'',f.targetRole||'',f.overallRating||'',f.trustRating||'',f.paymentConfidence||'',f.communication||'',f.reliability||'',f.wouldUseAgain?'yes':'no',f.comments||'']);
+    res.setHeader('Content-Type','text/csv');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-feedback.csv"');
+    res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n'));
+  });
   app.get('/api/admin/pilot/onboarding.csv', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const rows=[['type','phone_or_code','role','status','name_or_label','area','category','consent','uses_or_tx','feedback_count','created_at']]; for(const i of pilotInvites.map(inviteSafe)) rows.push(['invite',i.code,i.role,i.status,i.label,i.location,i.category,'',`${i.usedCount}/${i.maxUses}`,'',i.createdAt||'']); for(const p of allParticipants()) rows.push(['participant',p.phone,p.role,p.status,p.name||'',p.area||'',p.category||'',p.consentAccepted?'yes':'no',p.txCount||0,p.feedbackCount||0,p.createdAt||'']); res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-onboarding.csv"'); res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n')); });
 })();
 
