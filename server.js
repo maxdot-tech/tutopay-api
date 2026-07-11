@@ -1609,13 +1609,16 @@ function normalizePublicProfile(rawProfile, phone) {
   const selfieUrl = (typeof src.selfieUrl === 'string' && src.selfieUrl && !src.selfieUrl.startsWith('data:image')) ? src.selfieUrl : selfieDataUrl;
   const logoUrl = (typeof src.logoUrl === 'string' && src.logoUrl && !src.logoUrl.startsWith('data:image')) ? src.logoUrl : logoDataUrl;
 
-  const displayName = String(src.displayName || '').trim();
+  const firstName = String(src.firstName || '').trim();
+  const lastName = String(src.lastName || '').trim();
+  const fullName = String(src.fullName || [firstName, lastName].filter(Boolean).join(' ') || '').trim();
+  const displayName = String(src.displayName || fullName || firstName || '').trim();
   const businessName = String(src.businessName || '').trim();
+  const email = String(src.email || '').trim();
+  const accountKind = String(src.accountKind || '').trim();
 
-  // Normalize older alias field names
-  // In some older clients, businessName might be stored as merchantType or similar; ignore here.
-
-  return { phone: phoneSafe, displayName, businessName, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
+  // Normalize older alias field names.
+  return { phone: phoneSafe, firstName, lastName, fullName, displayName, businessName, email, accountKind, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
 }
 
 function publicProfileResponseForUser(user) {
@@ -1727,8 +1730,25 @@ setInterval(() => {
 }, 60 * 1000).unref?.();
 
 
+function tpAuthDigits(v) {
+  return String(v == null ? '' : v).replace(/\D/g, '');
+}
+function tpAuthLocalPhone(v) {
+  let d = tpAuthDigits(v);
+  // Older records/inputs may have been kept as 26097XXXXXXX. For matching only, convert to 097XXXXXXX.
+  if (d.length === 12 && d.startsWith('260')) d = '0' + d.slice(3);
+  return d;
+}
+function tpAuthStrictTen(v) {
+  const d = tpAuthDigits(v);
+  return d.length === 10 ? d : '';
+}
 function findUserByPhone(phone) {
-  return users.find((u) => u.phone === phone);
+  const want = tpAuthLocalPhone(phone);
+  return users.find((u) => {
+    if (!u) return false;
+    return String(u.phone || '') === String(phone || '') || tpAuthLocalPhone(u.phone) === want;
+  });
 }
 function ensureUserKycDefaults(user) {
   if (!user || typeof user !== "object") return user;
@@ -2059,6 +2079,96 @@ app.post("/api/otp/start", requireAuth, (req, res) => {
 });
 
 // -------- Auth (phone + PIN) --------
+app.post("/api/auth/signup", loginLimiter, (req, res) => {
+  const { phone, pin, rolePreference, profile } = req.body || {};
+  const pilotInviteCode = String(((req.body || {}).pilotInviteCode || (profile && profile.pilotInviteCode) || "")).trim().toUpperCase();
+
+  const phoneNorm = tpAuthStrictTen(phone);
+  if (!phoneNorm) {
+    return res.status(400).json({ error: "Phone number must be exactly 10 digits, for example 0977123456." });
+  }
+  if (!pin || !/^\d{4}$/.test(String(pin))) {
+    return res.status(400).json({ error: "PIN must be exactly 4 digits." });
+  }
+
+  const wantedRole = String(rolePreference || "").trim().toLowerCase();
+  if (isInternalStaffRole(wantedRole) || wantedRole === "admin") {
+    logAudit(req, "auth_signup_blocked", { reason: "staff_public_signup_blocked", phoneTried: phoneNorm, rolePreference: wantedRole });
+    return res.status(403).json({ error: "Staff accounts cannot be created from the public create-account form." });
+  }
+  if (!ALLOW_PUBLIC_SIGNUP) {
+    logAudit(req, "auth_signup_blocked", { reason: "public_signup_disabled", phoneTried: phoneNorm });
+    return res.status(403).json({ error: "Sign-up is disabled on this environment." });
+  }
+
+  let user = findUserByPhone(phoneNorm);
+  if (user) {
+    logAudit(req, "auth_signup_blocked", { reason: "account_exists", phoneTried: phoneNorm, role: user.role });
+    return res.status(409).json({ error: "An account already exists for this number. Please use Sign in instead." });
+  }
+
+  const allowedRoles = ["buyer", "seller"];
+  const role = allowedRoles.includes(wantedRole) ? wantedRole : "buyer";
+
+  let pilotSignupResult = null;
+  if (typeof globalThis.__tpPilotConsumeInviteForSignup === "function") {
+    pilotSignupResult = globalThis.__tpPilotConsumeInviteForSignup({ req, code: pilotInviteCode, role, phone: phoneNorm, profile });
+    if (pilotSignupResult && pilotSignupResult.error) {
+      logAudit(req, "pilot_signup_invite_failed", { phoneTried: phoneNorm, role, code: pilotInviteCode || null, reason: pilotSignupResult.error });
+      return res.status(pilotSignupResult.statusCode || 400).json({ error: pilotSignupResult.error });
+    }
+  }
+
+  const normalizedProfile = normalizePublicProfile(profile || {}, phoneNorm);
+  user = {
+    id: uuid(),
+    phone: phoneNorm,
+    role,
+    pinHash: hashPin(pin),
+    kycLevel: "basic",
+    kycStatus: "unsubmitted",
+    kycHistory: [],
+    profile: normalizedProfile,
+    consents: profile && profile.consents ? profile.consents : {},
+    pilotOnboarding: pilotSignupResult && pilotSignupResult.participant ? pilotSignupResult.participant : null,
+  };
+  users.push(user);
+  if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
+  logAudit(req, "auth_signup_success", { phone: user.phone, role: user.role, firstName: normalizedProfile.firstName || null });
+
+  clearLoginFailures(phoneNorm);
+  const token = crypto.randomBytes(24).toString("hex");
+  sessions.set(token, {
+    id: user.id,
+    phone: user.phone,
+    role: user.role,
+    kycLevel: getEffectiveKycLevel(user),
+    kycStatus: user.kycStatus,
+    expiresAt: Date.now() + SESSION_TTL_MS,
+  });
+  if (dbEnabled()) { dbUpsertSession(token, sessions.get(token)).catch(()=>{}); }
+
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  return res.json({
+    token,
+    expiresAt,
+    user: {
+      id: user.id,
+      phone: user.phone,
+      role: user.role,
+      kycLevel: getEffectiveKycLevel(user),
+      kycStatus: user.kycStatus,
+      pilotOnboarding: user.pilotOnboarding || null,
+      profile: normalizedProfile,
+      firstName: normalizedProfile.firstName || "",
+      lastName: normalizedProfile.lastName || "",
+      fullName: normalizedProfile.fullName || "",
+      displayName: normalizedProfile.displayName || "",
+      businessName: normalizedProfile.businessName || "",
+    },
+  });
+});
+
 app.post("/api/auth/login", loginLimiter, (req, res) => {
   const { phone, pin, rolePreference, profile } = req.body || {};
   const pilotInviteCode = String(((req.body || {}).pilotInviteCode || (profile && profile.pilotInviteCode) || "")).trim().toUpperCase();
@@ -2066,7 +2176,7 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
     return res.status(400).json({ error: "Phone and PIN are required." });
   }
 
-  const phoneNorm = String(phone).trim();
+  const phoneNorm = tpAuthLocalPhone(phone) || String(phone).trim();
   const lockState = getLoginAttemptState(phoneNorm);
   if (lockState && lockState.lockedUntil && Date.now() < lockState.lockedUntil) {
     const retryAfterSec = Math.max(1, Math.ceil((lockState.lockedUntil - Date.now()) / 1000));
@@ -2080,7 +2190,7 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
   if ((!user) && rolePreference === "admin" && SEED_STAFF_ADMIN) {
     const adminPhone = String(DEMO_ADMIN_PHONE || "").trim();
     const pinOk = String(pin) === String(DEMO_ADMIN_PIN);
-    if (String(phoneNorm).trim() === adminPhone && pinOk) {
+    if (tpAuthLocalPhone(phoneNorm) === tpAuthLocalPhone(adminPhone) && pinOk) {
       ensureAdminUserSeed();
       user = findUserByPhone(adminPhone);
     }
@@ -2088,48 +2198,12 @@ app.post("/api/auth/login", loginLimiter, (req, res) => {
 
 
   if (!user) {
-    const wantedRole = String(rolePreference || "").trim().toLowerCase();
-    if (isInternalStaffRole(wantedRole) || wantedRole === "admin") {
-      logAudit(req, "auth_login_failed", { reason: "staff_autoreg_blocked", phoneTried: phoneNorm, rolePreference: wantedRole });
-      return res.status(403).json({ error: "Staff accounts cannot be created from the public sign-in page." });
-    }
-
-    // Controlled onboarding: auto-register new public users as buyer/seller only.
-    if (!ALLOW_PUBLIC_SIGNUP) {
-      logAudit(req, "auth_login_failed", { reason: "public_signup_disabled", phoneTried: phoneNorm });
-      return res.status(403).json({ error: "Sign-up is disabled on this environment." });
-    }
-
-    const allowedRoles = ["buyer", "seller"];
-    const role = allowedRoles.includes(wantedRole) ? wantedRole : "buyer";
-
-    let pilotSignupResult = null;
-    if (typeof globalThis.__tpPilotConsumeInviteForSignup === "function") {
-      pilotSignupResult = globalThis.__tpPilotConsumeInviteForSignup({ req, code: pilotInviteCode, role, phone: phoneNorm, profile });
-      if (pilotSignupResult && pilotSignupResult.error) {
-        logAudit(req, "pilot_signup_invite_failed", { phoneTried: phoneNorm, role, code: pilotInviteCode || null, reason: pilotSignupResult.error });
-        return res.status(pilotSignupResult.statusCode || 400).json({ error: pilotSignupResult.error });
-      }
-    }
-
-    user = {
-      id: uuid(),
-      phone: phoneNorm,
-      role,
-      pinHash: hashPin(pin),
-      kycLevel: "basic",
-      kycStatus: "unsubmitted",
-      kycHistory: [],
-      consents: profile && profile.consents ? profile.consents : {},
-      pilotOnboarding: pilotSignupResult && pilotSignupResult.participant ? pilotSignupResult.participant : null,
-    };
-    users.push(user);
-    if (dbEnabled()) { dbUpsertUser(user).catch(() => {}); }
-    console.log("Created public user:", user.phone, user.role);
+    logAudit(req, "auth_login_failed", { reason: "account_not_found", phoneTried: phoneNorm });
+    return res.status(404).json({ error: "No account found for this number. Please create an account first." });
   } else {
     ensureUserKycDefaults(user);
     // Hardening: if an admin bootstrap phone is configured, restrict bootstrap admin access to it.
-    if (DEMO_ADMIN_PHONE && user.role === "admin" && user.phone !== DEMO_ADMIN_PHONE) {
+    if (DEMO_ADMIN_PHONE && user.role === "admin" && tpAuthLocalPhone(user.phone) !== tpAuthLocalPhone(DEMO_ADMIN_PHONE)) {
       logAudit(req, "auth_login_failed", { reason: "admin_phone_mismatch", phoneTried: phoneNorm });
       return res.status(403).json({ error: "Admin access is restricted." });
     }
@@ -2240,6 +2314,12 @@ const token = crypto.randomBytes(24).toString("hex");
       kycLevel: getEffectiveKycLevel(user),
       kycStatus: user.kycStatus,
       pilotOnboarding: user.pilotOnboarding || null,
+      profile: user.profile ? normalizePublicProfile(user.profile, user.phone) : null,
+      firstName: user.profile ? normalizePublicProfile(user.profile, user.phone).firstName : "",
+      lastName: user.profile ? normalizePublicProfile(user.profile, user.phone).lastName : "",
+      fullName: user.profile ? normalizePublicProfile(user.profile, user.phone).fullName : "",
+      displayName: user.profile ? normalizePublicProfile(user.profile, user.phone).displayName : "",
+      businessName: user.profile ? normalizePublicProfile(user.profile, user.phone).businessName : "",
     },
   });
 });
