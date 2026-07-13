@@ -3641,6 +3641,7 @@ app.post("/api/transactions/:id/dispute", requireAuth, (req, res) => {
       type === "escrow_refund"
         ? new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString()
         : null,
+    previousTxStatus: tx.status || null,
   };
 
   tx.disputeActive = true;
@@ -6118,14 +6119,28 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if (!doc) return { err:'Evidence file not found', tx };
     return { tx, doc };
   }
-  function serveEvidenceDoc(req,res,doc){
+  async function serveEvidenceDoc(req,res,doc){
     const directUrl = String(doc.url || '');
     const isLocalUploadUrl = directUrl.includes('/uploads/');
-    if (directUrl.startsWith('http') && !isLocalUploadUrl) return res.redirect(directUrl);
-    const filename = String(doc.filename || '').trim();
-    if (!filename) return res.status(404).json({ error:'Evidence filename missing' });
+    if (directUrl.startsWith('http') && !isLocalUploadUrl) {
+      try {
+        const upstream = await fetch(directUrl);
+        if (!upstream.ok) return res.status(502).json({ error:`Evidence storage returned ${upstream.status}. Ask the participant to re-upload the file.` });
+        const bytes = Buffer.from(await upstream.arrayBuffer());
+        res.setHeader('Content-Type', upstream.headers.get('content-type') || doc.mimetype || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `inline; filename="${String(doc.originalname||doc.name||doc.filename||'evidence').replace(/"/g,'')}"`);
+        return res.send(bytes);
+      } catch (_) {
+        return res.status(502).json({ error:'Evidence storage could not be reached. Ask the participant to re-upload if the problem continues.' });
+      }
+    }
+    let filename = String(doc.filename || '').trim();
+    if (!filename && isLocalUploadUrl) {
+      try { filename = path.basename(new URL(directUrl).pathname); } catch (_) { filename = path.basename(directUrl); }
+    }
+    if (!filename) return res.status(410).json({ error:'This evidence record has no stored file. Ask the participant to re-upload it.' });
     const fp = path.join(uploadDir, filename);
-    if (!fs.existsSync(fp)) return res.status(404).json({ error:'Evidence file missing on server' });
+    if (!fs.existsSync(fp)) return res.status(410).json({ error:'This local evidence file was lost during a server restart or redeployment. Ask the participant to re-upload it. Configure Cloudinary for durable evidence storage.' });
     res.setHeader('Content-Type', doc.mimetype || 'application/octet-stream');
     const disp = (String(doc.mimetype||'').startsWith('image/') || String(doc.mimetype||'').includes('pdf')) ? 'inline' : 'attachment';
     res.setHeader('Content-Disposition', `${disp}; filename="${String(doc.originalname||doc.name||filename).replace(/"/g,'')}"`);
@@ -8092,3 +8107,150 @@ try {
 } catch (e) {
   console.error("[TutoPay] Canonical Negotiation Core v14.3.0 failed:", e && e.message ? e.message : e);
 }
+
+/* ===== Clean Cases Stage 2: transaction-backed staff actions ===== */
+(function TP_CLEAN_CASE_ACTIONS_STAGE2(){
+  if (globalThis.__tpCleanCaseActionsStage2) return;
+  globalThis.__tpCleanCaseActionsStage2 = true;
+
+  function caseRole(value){
+    const r = String(value || '').toLowerCase();
+    if (r === 'fraud_agent' || r === 'fraud') return 'risk_agent';
+    return r;
+  }
+  function requireCaseStaff(req,res,next){
+    const r = caseRole(req.user && req.user.role);
+    if (!['admin','risk_agent'].includes(r)) return res.status(403).json({ error:'Admin or Risk staff only' });
+    next();
+  }
+  function caseTx(id){ return (transactions || []).find(t => String(t.id) === String(id)); }
+  function ensureCaseReview(tx){
+    tx.caseReview = tx.caseReview && typeof tx.caseReview === 'object' ? tx.caseReview : {};
+    tx.caseReview.status = tx.caseReview.status || (tx.disputeActive ? 'staff_review' : 'resolved');
+    tx.caseReview.requests = Array.isArray(tx.caseReview.requests) ? tx.caseReview.requests : [];
+    tx.caseReview.actions = Array.isArray(tx.caseReview.actions) ? tx.caseReview.actions : [];
+    return tx.caseReview;
+  }
+  function participantRole(tx, phone){
+    if (String(tx.fromPhone || '') === String(phone || '')) return 'buyer';
+    if (String(tx.toPhone || '') === String(phone || '')) return 'seller';
+    return null;
+  }
+  function restorePreDisputeStatus(tx){
+    const previous = String((tx.dispute && tx.dispute.previousTxStatus) || '').toLowerCase();
+    if (previous && previous !== 'disputed') return previous;
+    if (tx.completedAt) return 'completed';
+    if (tx.deliveredAt) return 'delivered';
+    if (tx.transitStartedAt) return 'in_transit';
+    if (tx.holdStartedAt) return 'held';
+    return tx.paymentStatus === 'paid' ? 'pending' : 'pending_payment';
+  }
+  async function saveCaseTx(tx){
+    if (dbEnabled()) { try { await dbUpsertTransaction(tx); } catch (_) {} }
+  }
+  function actionEntry(req, action, note, extra={}){
+    return {
+      id:uuid(), action, note:String(note || '').trim(), at:nowIso(),
+      byPhone:req.user.phone, byRole:caseRole(req.user.role), ...extra
+    };
+  }
+
+  app.post('/api/transactions/:id/case-action', requireAuth, requireCaseStaff, async (req,res) => {
+    const tx = caseTx(req.params.id);
+    if (!tx || !tx.dispute) return res.status(404).json({ error:'Case transaction not found' });
+    const review = ensureCaseReview(tx);
+    const body = req.body || {};
+    const action = String(body.action || '').toLowerCase().trim();
+    const note = String(body.note || '').trim();
+    const role = caseRole(req.user.role);
+    const riskActions = new Set(['request_evidence','recommend_refund','recommend_reject','internal_note']);
+    const adminActions = new Set(['request_evidence','admin_approve_refund','admin_reject_claim','admin_return_review','internal_note']);
+    const allowed = role === 'admin' ? adminActions : riskActions;
+    if (!allowed.has(action)) return res.status(403).json({ error:'This action is not available for your role.' });
+    if (!note) return res.status(400).json({ error:'Add a clear reason or instruction.' });
+
+    const entry = actionEntry(req, action, note);
+    if (action === 'request_evidence') {
+      const target = String(body.targetParty || '').toLowerCase();
+      if (!['buyer','seller','both'].includes(target)) return res.status(400).json({ error:'Choose Buyer, Seller, or Both.' });
+      const parties = target === 'both' ? ['buyer','seller'] : [target];
+      const dueAt = new Date(Date.now() + Math.max(1, Math.min(168, Number(body.dueHours || 48))) * 3600000).toISOString();
+      for (const party of parties) {
+        review.requests.push({
+          id:uuid(), targetParty:party, targetPhone:party === 'buyer' ? tx.fromPhone : tx.toPhone,
+          instruction:note, status:'open', requestedAt:entry.at, dueAt,
+          requestedByPhone:req.user.phone, requestedByRole:role,
+          response:null, evidenceIds:[]
+        });
+      }
+      review.status = target === 'both' ? 'awaiting_both' : `awaiting_${target}`;
+      entry.targetParty = target;
+      entry.dueAt = dueAt;
+    } else if (action === 'recommend_refund' || action === 'recommend_reject') {
+      const outcome = action === 'recommend_refund' ? 'refund' : 'reject';
+      review.recommendation = { outcome, note, at:entry.at, byPhone:req.user.phone, byRole:role };
+      review.status = 'awaiting_admin_decision';
+    } else if (action === 'admin_approve_refund') {
+      if (!review.recommendation || review.recommendation.outcome !== 'refund') return res.status(409).json({ error:'Risk must first submit a refund recommendation.' });
+      if (String(review.recommendation.byPhone || '') === String(req.user.phone || '')) return res.status(403).json({ error:'The recommending officer cannot approve the same case.' });
+      tx.dispute.adminDecision = { outcome:'refund', note, decidedAt:entry.at, byPhone:req.user.phone };
+      tx.dispute.status = 'admin_approved_refund';
+      tx.dispute.resolvedAt = entry.at;
+      tx.disputeActive = false;
+      tx.status = 'refunded';
+      tx.payoutReconciled = true;
+      review.status = 'resolved';
+      review.decision = { outcome:'refund', note, at:entry.at, byPhone:req.user.phone, byRole:role };
+      try { markPartnerProcessing(tx, { outcome:'refund', partnerActionRequired:true, refundStatus:'authorized_pending_partner_execution', lastOutcomeAt:entry.at }); } catch (_) {}
+      try { recordLedger(req, tx, 'refund_completed', { notes:'Admin approved refund through Clean Cases' }); } catch (_) {}
+    } else if (action === 'admin_reject_claim') {
+      tx.dispute.adminDecision = { outcome:'reject', note, decidedAt:entry.at, byPhone:req.user.phone };
+      tx.dispute.status = 'admin_rejected_claim';
+      tx.dispute.resolvedAt = entry.at;
+      tx.disputeActive = false;
+      tx.status = restorePreDisputeStatus(tx);
+      review.status = 'resolved';
+      review.decision = { outcome:'reject', note, at:entry.at, byPhone:req.user.phone, byRole:role };
+      try { markPartnerProcessing(tx, { outcome:'reject', partnerActionRequired:false, lastOutcomeAt:entry.at }); } catch (_) {}
+      try { recordLedger(req, tx, 'dispute_rejected', { notes:'Admin rejected claim through Clean Cases' }); } catch (_) {}
+    } else if (action === 'admin_return_review') {
+      review.status = 'staff_review';
+      review.returnInstruction = { note, at:entry.at, byPhone:req.user.phone };
+    }
+
+    review.actions.push(entry);
+    if (review.actions.length > 300) review.actions.splice(0, review.actions.length - 300);
+    review.updatedAt = entry.at;
+    await saveCaseTx(tx);
+    logAudit(req, 'clean_case_action', { txId:tx.id, action, targetParty:entry.targetParty || null, caseStatus:review.status });
+    res.json({ ok:true, transaction:tx, caseReview:review });
+  });
+
+  app.post('/api/transactions/:id/case-response', requireAuth, async (req,res) => {
+    const tx = caseTx(req.params.id);
+    if (!tx || !tx.dispute) return res.status(404).json({ error:'Case transaction not found' });
+    const party = participantRole(tx, req.user.phone);
+    if (!party) return res.status(403).json({ error:'Only the buyer or seller on this transaction can respond.' });
+    const review = ensureCaseReview(tx);
+    const requestId = String((req.body || {}).requestId || '').trim();
+    const note = String((req.body || {}).note || '').trim();
+    const evidenceIds = Array.isArray((req.body || {}).evidenceIds) ? req.body.evidenceIds.map(String) : [];
+    const request = review.requests.find(r => String(r.id) === requestId && r.targetParty === party && String(r.targetPhone) === String(req.user.phone));
+    if (!request) return res.status(404).json({ error:'Evidence request not found for your account.' });
+    if (request.status !== 'open') return res.status(409).json({ error:'This request has already been answered.' });
+    if (!note) return res.status(400).json({ error:'Add a short response.' });
+    request.status = 'answered';
+    request.response = { note, at:nowIso(), byPhone:req.user.phone, byRole:party };
+    request.evidenceIds = evidenceIds;
+    const open = review.requests.filter(r => r.status === 'open');
+    if (!open.length) review.status = 'staff_review';
+    review.updatedAt = request.response.at;
+    const entry = { id:uuid(), action:'participant_response', note, at:request.response.at, byPhone:req.user.phone, byRole:party, requestId:request.id, evidenceIds };
+    review.actions.push(entry);
+    await saveCaseTx(tx);
+    logAudit(req, 'clean_case_participant_response', { txId:tx.id, requestId:request.id, party, evidenceCount:evidenceIds.length });
+    res.json({ ok:true, transaction:tx, request, caseReview:review });
+  });
+
+  console.log('[TutoPay] Clean Cases Stage 2 actions loaded');
+})();
