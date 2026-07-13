@@ -3989,6 +3989,7 @@ function handleRequestReply(req, res) {
       availability,
       preOrderDate,
       preOrderNote,
+      collectionPoint,
       message,
     } = req.body || {};
 
@@ -3998,6 +3999,7 @@ function handleRequestReply(req, res) {
       availability: availability || null,
       preOrderDate: preOrderDate || null,
       preOrderNote: preOrderNote || null,
+      collectionPoint: tpPricingCleanText(collectionPoint || "", 180) || null,
       message: message || "",
     };
 
