@@ -7,9 +7,7 @@ function isAccountingRole(role) {
 }
 function isIssuesDeskRoleGlobal(role) {
   const r = String(role || "").toLowerCase();
-  return r === "admin" || r === "risk_agent" || r === "fraud_agent" ||
-    r === "accounts_agent" || r === "accounts" || r === "finance_agent" ||
-    r === "compliance_agent" || r === "compliance_officer";
+  return r === "admin" || r === "risk_agent" || r === "fraud_agent";
 }
 function isComplianceRole(role) {
   const r = String(role || "").toLowerCase();
@@ -3429,11 +3427,6 @@ function maybeAutoResolveDispute(tx) {
 
 app.get("/api/transactions", requireAuth, (req, res) => {
   transactions.forEach(maybeAutoResolveDispute);
-  if (typeof globalThis.__tpSyncCaseWorkflowForTx === "function") {
-    transactions.forEach((tx) => {
-      try { globalThis.__tpSyncCaseWorkflowForTx(tx); } catch (_) {}
-    });
-  }
 
   let view = transactions;
   // Internal staff consoles need platform-wide visibility for operational work.
@@ -3648,7 +3641,6 @@ app.post("/api/transactions/:id/dispute", requireAuth, (req, res) => {
       type === "escrow_refund"
         ? new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString()
         : null,
-    previousTxStatus: tx.status || null,
   };
 
   tx.disputeActive = true;
@@ -3793,24 +3785,6 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
     const id = req.params.id;
     const tx = transactions.find((t) => t.id === id);
     if (!tx) return res.status(404).json({ error: "Transaction not found" });
-
-    const isParticipant = String(req.user && req.user.phone || '') === String(tx.fromPhone || '') ||
-      String(req.user && req.user.phone || '') === String(tx.toPhone || '');
-    const isStaff = !!(req.user && isInternalStaffRole(req.user.role));
-    if (!isParticipant && !isStaff) {
-      return res.status(403).json({ error: "Only a transaction participant or assigned case staff can upload evidence." });
-    }
-    if (!isParticipant && isStaff && String(req.user.role || '').toLowerCase() !== 'admin') {
-      const rawRole = String(req.user.role || '').toLowerCase();
-      const staffRole = ['accounts','finance','finance_agent'].includes(rawRole) ? 'accounts_agent' : (['compliance','compliance_officer'].includes(rawRole) ? 'compliance_agent' : (['fraud_agent','fraud'].includes(rawRole) ? 'risk_agent' : rawRole));
-      const state = globalThis.__tpIssueCaseStore && globalThis.__tpIssueCaseStore.get ? globalThis.__tpIssueCaseStore.get(`CASE-${tx.id}`) : null;
-      const assignedRaw = String((state && state.assignedRole) || 'risk_agent').toLowerCase();
-      const assignedRole = ['accounts','finance','finance_agent'].includes(assignedRaw) ? 'accounts_agent' : (['compliance','compliance_officer'].includes(assignedRaw) ? 'compliance_agent' : (['fraud_agent','fraud'].includes(assignedRaw) ? 'risk_agent' : assignedRaw));
-      const ownedByAnother = state && state.assignedTo && String(state.assignedTo) !== String(req.user.phone || '');
-      if (staffRole !== assignedRole || ownedByAnother) {
-        return res.status(403).json({ error: "This evidence belongs to another case work queue." });
-      }
-    }
 
     if (!tx.disputeActive || !tx.dispute) {
       return res.status(400).json({ error: "No active dispute on this transaction" });
@@ -5489,21 +5463,6 @@ function requireIssuesDesk(req,res,next){
     return { tx, c, state: issueCaseStore.get(c.caseId) };
   }
 
-  function issueRoleNorm(value){
-    const r = String(value || '').toLowerCase();
-    if (['accounts','finance','finance_agent'].includes(r)) return 'accounts_agent';
-    if (['compliance','compliance_officer'].includes(r)) return 'compliance_agent';
-    if (['fraud','fraud_agent'].includes(r)) return 'risk_agent';
-    return r;
-  }
-  function canViewIssueCase(req, got){
-    const role = issueRoleNorm(req && req.user && req.user.role);
-    if (role === 'admin') return true;
-    const state = (got && got.state) || (got && got.c) || {};
-    const assignedRole = issueRoleNorm(state.assignedRole || 'risk_agent');
-    return assignedRole === role;
-  }
-
   function buildIssueTimeline(tx, caseId){
     const rows = [];
     const push = (ts, phase, source, detail, extra={}) => {
@@ -5595,10 +5554,6 @@ function requireIssuesDesk(req,res,next){
     const priority = String(req.query.priority || '').trim().toLowerCase();
     const q = String(req.query.q || '').trim().toLowerCase();
     let rows = issueCaseList();
-    const role = issueRoleNorm(req.user.role);
-    if (role !== 'admin') {
-      rows = rows.filter(r => issueRoleNorm(r.assignedRole || 'risk_agent') === role);
-    }
     if (status) rows = rows.filter(r => String(r.status||'').toLowerCase() === status);
     if (priority) rows = rows.filter(r => String(r.priority||'').toLowerCase() === priority);
     if (q) rows = rows.filter(r => [r.caseId, r.txId, r.buyerPhone, r.sellerPhone, r.reasonCode, r.reasonText].some(v => String(v||'').toLowerCase().includes(q)));
@@ -5614,7 +5569,6 @@ function requireIssuesDesk(req,res,next){
   app.get('/api/issues/cases/:caseId', requireAuth, requireIssuesDesk, (req,res)=>{
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
-    if (!canViewIssueCase(req, got)) return res.status(403).json({ error:'This case belongs to another work queue.' });
     const { tx, c } = got;
     const actions = issueActions.filter(a => a.caseId === c.caseId).slice(-200).reverse();
     const evidence = Array.isArray(tx.disputeDocs) ? tx.disputeDocs.map((d, idx) => {
@@ -5646,16 +5600,13 @@ function requireIssuesDesk(req,res,next){
   app.get('/api/issues/cases/:caseId/timeline', requireAuth, requireIssuesDesk, (req,res)=>{
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
-    if (!canViewIssueCase(req, got)) return res.status(403).json({ error:'This case belongs to another work queue.' });
     const rows = buildIssueTimeline(got.tx, got.c.caseId);
     res.json({ ok:true, caseId: got.c.caseId, txId: got.tx.id, timeline: rows });
   });
 
   app.post('/api/issues/cases/:caseId/assign', requireAuth, requireIssuesDesk, async (req,res)=>{
-    if (!['admin','risk_agent'].includes(issueRoleNorm(req.user.role))) return res.status(409).json({ error:'Use the unified Case Tasks workspace for specialist assignments.' });
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
-    if (issueRoleNorm(req.user.role) !== 'admin' && got.state && got.state.assignedTo && String(got.state.assignedTo) !== String(req.user.phone || '')) return res.status(409).json({ error:`Case is already owned by ${got.state.assignedTo}.` });
     const st = issueCaseStore.get(got.c.caseId);
     const toPhone = String((req.body||{}).toPhone || req.user.phone).trim();
     st.assignedTo = toPhone;
@@ -5709,10 +5660,8 @@ function requireIssuesDesk(req,res,next){
   }
 
 app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, async (req,res)=>{
-    if (!['admin','risk_agent'].includes(issueRoleNorm(req.user.role))) return res.status(409).json({ error:'Use the unified Case Tasks workspace for specialist findings.' });
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
-    if (issueRoleNorm(req.user.role) !== 'admin' && got.state && got.state.assignedTo && String(got.state.assignedTo) !== String(req.user.phone || '')) return res.status(409).json({ error:`Case is owned by ${got.state.assignedTo}.` });
     const body = req.body || {};
     const actionType = String(body.actionType || '').trim();
     const policyCode = String(body.policyCode || '').trim().toUpperCase();
@@ -5810,7 +5759,6 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   app.get('/api/issues/cases/:caseId/evidence/:docId', requireAuth, requireIssuesDesk, (req,res)=>{
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
-    if (!canViewIssueCase(req, got)) return res.status(403).json({ error:'This evidence belongs to another work queue.' });
     const tx = got.tx;
     const docId = String(req.params.docId || '').trim();
     const docs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
@@ -6171,7 +6119,9 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     return { tx, doc };
   }
   function serveEvidenceDoc(req,res,doc){
-    if (doc.url && String(doc.url).startsWith('http')) return res.redirect(String(doc.url));
+    const directUrl = String(doc.url || '');
+    const isLocalUploadUrl = directUrl.includes('/uploads/');
+    if (directUrl.startsWith('http') && !isLocalUploadUrl) return res.redirect(directUrl);
     const filename = String(doc.filename || '').trim();
     if (!filename) return res.status(404).json({ error:'Evidence filename missing' });
     const fp = path.join(uploadDir, filename);
@@ -7242,9 +7192,6 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const list = [];
 
     for (const tx of (transactions || [])) {
-      if (typeof globalThis.__tpSyncCaseWorkflowForTx === 'function') {
-        try { globalThis.__tpSyncCaseWorkflowForTx(tx); } catch (_) {}
-      }
       const buyer = nrTxBuyer(tx); const seller = nrTxSeller(tx);
       const isBuyer = me && me === buyer;
       const isSeller = me && me === seller;
@@ -7273,40 +7220,9 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
       if ((isBuyer || isSeller) && tx.disputeActive) {
         list.push(nrNotif(`tx:${txId}:dispute:active:${isBuyer?'buyer':'seller'}`, me, { title:'Dispute/issue active', message:`An issue is active on ${nrBaseTxNote(tx)}. Normal release/refund actions may be frozen until review is complete.`, severity:'warn', category:'dispute', txId, createdAt:(tx.dispute && tx.dispute.openedAt)||nowIso(), actionLabel:'View issue' }));
       }
-      const caseFlow = tx.caseWorkflow && typeof tx.caseWorkflow === 'object' ? tx.caseWorkflow : null;
-      if ((isBuyer || isSeller) && caseFlow) {
-        const myParty = isBuyer ? 'buyer' : 'seller';
-        const myTasks = (Array.isArray(caseFlow.tasks) ? caseFlow.tasks : []).filter(t => t && t.targetParty === myParty && String(t.status || '') === 'open');
-        for (const task of myTasks) {
-          list.push(nrNotif(`case:${caseFlow.caseId}:task:${task.id}:${myParty}`, me, {
-            title:`Evidence requested from ${myParty === 'buyer' ? 'buyer' : 'seller'}`,
-            message:`The case officer requested: ${String(task.requestText || 'Please provide more information.')} ${task.dueAt ? `Reply by ${task.dueAt}.` : ''}`,
-            severity:'warn', category:'case_action', txId, createdAt:task.requestedAt || caseFlow.updatedAt || nowIso(),
-            actionLabel:'Respond on transaction'
-          }));
-        }
-        if (caseFlow.resolved) {
-          list.push(nrNotif(`case:${caseFlow.caseId}:resolved:${myParty}:${caseFlow.outcomeCode || 'closed'}`, me, {
-            title:'Issue Desk case resolved',
-            message:`${caseFlow.caseId} is resolved. Outcome: ${String(caseFlow.outcomeCode || 'case closed').replace(/_/g,' ')}.`,
-            severity:'ok', category:'case_outcome', txId, createdAt:caseFlow.updatedAt || nowIso(), actionLabel:'View transaction'
-          }));
-        }
-      }
 
       if (staff) {
-        if (caseFlow) {
-          const roleMap = { finance_agent:'accounts_agent', accounts:'accounts_agent', compliance_officer:'compliance_agent', fraud_agent:'risk_agent' };
-          const canonicalRole = roleMap[role] || role;
-          if (String(caseFlow.nextActionRole || '') === canonicalRole) {
-            list.push(nrNotif(`case:${caseFlow.caseId}:staff:${canonicalRole}:${caseFlow.status}`, me, {
-              title:`Case action for ${canonicalRole === 'accounts_agent' ? 'Finance' : (canonicalRole === 'compliance_agent' ? 'Compliance' : (canonicalRole === 'admin' ? 'Admin' : 'Risk'))}`,
-              message:`${caseFlow.caseId}: ${caseFlow.nextAction || 'Case review required'}.`,
-              severity:'warn', category:'case_assignment', txId, createdAt:caseFlow.updatedAt || nowIso(), actionLabel:'Open Issues Desk'
-            }));
-          }
-        }
-        if (!caseFlow && tx.disputeActive && ['admin','risk_agent','fraud_agent','compliance_agent','compliance_officer'].includes(role)) {
+        if (tx.disputeActive && ['admin','risk_agent','fraud_agent','compliance_agent','compliance_officer'].includes(role)) {
           list.push(nrNotif(`staff:${role}:tx:${txId}:open-dispute`, me, { title:'Open dispute needs review', message:`Open issue: ${nrBaseTxNote(tx)}. Risk/compliance should review evidence and update the case.`, severity:'warn', category:'staff_alert', txId, createdAt:(tx.dispute && tx.dispute.openedAt)||nowIso(), actionLabel:'Open issues desk' }));
         }
         if (tx.paymentStatus === 'paid' && !tx.collectionReconciled && ['admin','accounts_agent','accounts','finance_agent'].includes(role)) {
@@ -8176,482 +8092,3 @@ try {
 } catch (e) {
   console.error("[TutoPay] Canonical Negotiation Core v14.3.0 failed:", e && e.message ? e.message : e);
 }
-
-/* ===== TutoPay v1.5: unified case workflow and role-owned resolution ===== */
-(function TP_UNIFIED_CASE_WORKFLOW_V15(){
-  if (globalThis.__tpUnifiedCaseWorkflowV15) return;
-  globalThis.__tpUnifiedCaseWorkflowV15 = true;
-
-  const caseStore = globalThis.__tpIssueCaseStore || (globalThis.__tpIssueCaseStore = new Map());
-  const actionLog = globalThis.__tpIssueActions || (globalThis.__tpIssueActions = []);
-  const OPEN_STATUSES = new Set(['triage','investigating','awaiting_buyer','awaiting_seller','awaiting_both','evidence_review','specialist_review','awaiting_admin_approval','execution_pending','escalated','in_review','awaiting_customer','new']);
-
-  function wfRole(value){
-    const r = String(value || '').trim().toLowerCase();
-    if (['fraud_agent','fraud','risk','riskagent'].includes(r)) return 'risk_agent';
-    if (['accounts','finance','finance_agent'].includes(r)) return 'accounts_agent';
-    if (['compliance','compliance_officer','kyc'].includes(r)) return 'compliance_agent';
-    if (r === 'administrator') return 'admin';
-    return r;
-  }
-  function wfStaff(role){ return ['admin','risk_agent','accounts_agent','compliance_agent'].includes(wfRole(role)); }
-  function wfRoleLabel(role){
-    return ({ admin:'Admin', risk_agent:'Risk', accounts_agent:'Finance', compliance_agent:'Compliance', buyer:'Buyer', seller:'Seller', system:'System' })[wfRole(role)] || 'Staff';
-  }
-  function wfRequireStaff(req,res,next){
-    if (!req.user || !wfStaff(req.user.role)) return res.status(403).json({ error:'Case staff only' });
-    next();
-  }
-  function wfTx(id){ return (transactions || []).find(t => String(t.id) === String(id)); }
-  function wfParty(tx, phone){
-    if (String(tx.fromPhone || '') === String(phone || '')) return 'buyer';
-    if (String(tx.toPhone || '') === String(phone || '')) return 'seller';
-    return null;
-  }
-  function wfIso(value){
-    const ms = Date.parse(value || '');
-    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
-  }
-  function wfPriority(tx){
-    const amount = Number(tx.amount || 0);
-    const reason = String((tx.dispute && (tx.dispute.reasonCode || tx.dispute.reasonText)) || '').toLowerCase();
-    if (reason.includes('fraud') || reason.includes('scam') || amount >= 5000) return 'critical';
-    if (amount >= 1000) return 'high';
-    return 'medium';
-  }
-  function wfEnsure(tx){
-    if (!tx || !tx.id || !tx.dispute) return null;
-    const caseId = `CASE-${tx.id}`;
-    let st = caseStore.get(caseId);
-    const openedAt = wfIso(tx.dispute.openedAt || tx.dispute.createdAt || tx.updatedAt || tx.createdAt) || nowIso();
-    if (!st) {
-      st = {
-        caseId, txId:tx.id, schemaVersion:2, createdAt:openedAt, updatedAt:openedAt,
-        status:'triage', priority:wfPriority(tx), assignedRole:'risk_agent', assignedTo:null,
-        complaintCategory:String(tx.dispute.type || tx.dispute.reasonCode || 'general').toLowerCase(),
-        slaDeadlineAt:new Date((Date.parse(openedAt) || Date.now()) + 24*60*60*1000).toISOString(),
-        tasks:[], messages:[], recommendation:null, approval:null, outcomeCode:null,
-        partnerActionRequired:false, tags:[]
-      };
-      caseStore.set(caseId, st);
-    }
-    st.schemaVersion = 2;
-    st.caseId = caseId;
-    st.txId = tx.id;
-    st.createdAt = st.createdAt || openedAt;
-    st.updatedAt = st.updatedAt || openedAt;
-    st.status = String(st.status || 'triage').toLowerCase();
-    if (st.status === 'new') st.status = 'triage';
-    st.priority = st.priority || wfPriority(tx);
-    st.assignedRole = wfRole(st.assignedRole || 'risk_agent') || 'risk_agent';
-    st.tasks = Array.isArray(st.tasks) ? st.tasks : [];
-    st.messages = Array.isArray(st.messages) ? st.messages : [];
-    st.tags = Array.isArray(st.tags) ? st.tags : [];
-    return st;
-  }
-  function wfOpenTasks(st){ return (st.tasks || []).filter(t => String(t.status || 'open') === 'open'); }
-  function wfNext(st){
-    if (['resolved','closed'].includes(String(st.status || ''))) return { role:'none', label:'Case complete' };
-    const open = wfOpenTasks(st);
-    if (open.length) {
-      const parties = [...new Set(open.map(t => t.targetParty))];
-      const who = parties.length > 1 ? 'Buyer and seller' : (parties[0] === 'seller' ? 'Seller' : 'Buyer');
-      return { role:parties.length > 1 ? 'both' : parties[0], label:`Waiting for ${who.toLowerCase()} response` };
-    }
-    if (st.pendingAdminApproval || st.status === 'awaiting_admin_approval') return { role:'admin', label:'Admin decision required' };
-    const r = wfRole(st.assignedRole || 'risk_agent');
-    return {
-      role:r,
-      label:r === 'compliance_agent' ? 'Compliance finding required' :
-        r === 'accounts_agent' ? 'Finance finding required' :
-        r === 'admin' ? 'Admin review required' : 'Risk review required'
-    };
-  }
-  function wfSummary(tx, st){
-    const next = wfNext(st);
-    return {
-      caseId:st.caseId, txId:tx.id, status:st.status, priority:st.priority,
-      assignedRole:wfRole(st.assignedRole), assignedTo:st.assignedTo || null,
-      nextActionRole:next.role, nextAction:next.label,
-      buyerPhone:tx.fromPhone || null, sellerPhone:tx.toPhone || null,
-      amount:Number(tx.amount || 0), currency:tx.currency || process.env.MOMO_CURRENCY || 'ZMW',
-      complaintCategory:st.complaintCategory || String(tx.dispute.type || tx.dispute.reasonCode || 'general'),
-      reasonCode:tx.dispute.reasonCode || null, reasonText:tx.dispute.reasonText || null,
-      createdAt:st.createdAt, updatedAt:st.updatedAt, slaDeadlineAt:st.slaDeadlineAt || null,
-      pendingTasks:wfOpenTasks(st).length, pendingAdminApproval:!!st.pendingAdminApproval,
-      recommendation:st.recommendation || null, approval:st.approval || null,
-      outcomeCode:st.outcomeCode || null, partnerActionRequired:!!st.partnerActionRequired,
-      txStatus:tx.status || null, paymentStatus:tx.paymentStatus || null,
-      docsCount:Array.isArray(tx.disputeDocs) ? tx.disputeDocs.length : 0
-    };
-  }
-  function wfSyncTx(tx){
-    if (!tx || !tx.dispute) return null;
-    const st = wfEnsure(tx);
-    if (!st) return null;
-    const summary = wfSummary(tx, st);
-    tx.caseWorkflow = {
-      caseId:summary.caseId, status:summary.status, nextAction:summary.nextAction,
-      nextActionRole:summary.nextActionRole, updatedAt:summary.updatedAt,
-      outcomeCode:summary.outcomeCode, resolved:['resolved','closed'].includes(summary.status),
-      tasks:(st.tasks || []).map(t => ({
-        id:t.id, targetParty:t.targetParty, status:t.status, requestText:t.requestText,
-        dueAt:t.dueAt || null, requestedAt:t.requestedAt, responseAt:t.responseAt || null
-      }))
-    };
-    return tx.caseWorkflow;
-  }
-  globalThis.__tpSyncCaseWorkflowForTx = wfSyncTx;
-
-  function wfMessage(st, data){
-    const msg = Object.assign({
-      id:uuid(), timestamp:nowIso(), authorPhone:'system', authorRole:'system',
-      authorLabel:'System', audience:'internal', kind:'note', text:''
-    }, data || {});
-    st.messages.push(msg);
-    if (st.messages.length > 1000) st.messages.splice(0, st.messages.length - 1000);
-    return msg;
-  }
-  async function wfPersist(tx, st, action){
-    st.updatedAt = nowIso();
-    wfSyncTx(tx);
-    try { await dbUpsertIssueCase(st); } catch (_) {}
-    if (action) {
-      actionLog.push(action);
-      if (actionLog.length > 10000) actionLog.splice(0, actionLog.length - 10000);
-      try { await dbInsertIssueAction(action); } catch (_) {}
-    }
-    if (dbEnabled()) { try { await dbUpsertTransaction(tx); } catch (_) {} }
-  }
-  function wfAction(st, tx, req, type, note, extra){
-    return Object.assign({
-      id:uuid(), caseId:st.caseId, txId:tx.id, actionType:type, policyCode:'WF-15',
-      note:String(note || '').trim(), actorPhone:req.user.phone, actorRole:wfRole(req.user.role),
-      timestamp:nowIso(), nextStatus:st.status
-    }, extra || {});
-  }
-  function wfRoleGuide(role){
-    const r = wfRole(role);
-    if (r === 'admin') return { title:'Approval & oversight', purpose:'Decide recommendations, return incomplete cases, and preserve maker-checker control.', output:'Approved outcome or a clear return instruction.' };
-    if (r === 'compliance_agent') return { title:'Compliance review', purpose:'Review identity, KYC, document and regulatory concerns only.', output:'Clear, concern, or more-KYC finding returned to Risk.' };
-    if (r === 'accounts_agent') return { title:'Finance review', purpose:'Check collection, callback, settlement and refund executability only.', output:'Reconciled or mismatch finding returned to Risk.' };
-    return { title:'Risk case ownership', purpose:'Triage facts, coordinate participant evidence and make the resolution recommendation.', output:'Evidence-complete recommendation sent to Admin when approval is required.' };
-  }
-  function wfAvailable(st, role){
-    const r = wfRole(role);
-    const common = [{ type:'internal_note', label:'Add internal note' }];
-    if (r === 'admin') {
-      const out = [{ type:'request_evidence', label:'Request participant evidence' }];
-      if (st.recommendation && st.pendingAdminApproval) out.push({ type:'approve_recommendation', label:`Approve ${st.recommendation.outcome || 'recommendation'}` }, { type:'return_to_risk', label:'Return to Risk' });
-      out.push({ type:'close_case', label:'Close case' }, ...common);
-      return out;
-    }
-    if (r === 'compliance_agent') return [
-      { type:'request_evidence', label:'Request KYC evidence' },
-      { type:'compliance_clear', label:'Return finding: clear' },
-      { type:'compliance_concern', label:'Return finding: concern' },
-      { type:'compliance_need_kyc', label:'Return finding: more KYC needed' }, ...common
-    ];
-    if (r === 'accounts_agent') return [
-      { type:'request_evidence', label:'Request payment evidence' },
-      { type:'finance_reconciled', label:'Return finding: reconciled' },
-      { type:'finance_mismatch', label:'Return finding: mismatch' }, ...common
-    ];
-    return [
-      { type:'request_evidence', label:'Request participant evidence' },
-      { type:'freeze_transaction', label:'Freeze and investigate' },
-      { type:'refer_compliance', label:'Refer to Compliance' },
-      { type:'refer_finance', label:'Refer to Finance' },
-      { type:'recommend_refund', label:'Recommend refund' },
-      { type:'recommend_reject', label:'Recommend rejection' },
-      { type:'close_case', label:'Close resolved case' }, ...common
-    ];
-  }
-  function wfEvidence(tx, st){
-    return (Array.isArray(tx.disputeDocs) ? tx.disputeDocs : []).map((d, index) => {
-      const by = String(d.uploadedByPhone || d.uploadedBy || d.byPhone || d.by || '');
-      const role = by === String(tx.fromPhone || '') ? 'buyer' : (by === String(tx.toPhone || '') ? 'seller' : 'staff');
-      const id = d.id || `${st.caseId}-doc-${index+1}`;
-      return {
-        id, name:d.name || d.originalname || d.filename || `Evidence ${index+1}`,
-        uploadedAt:d.uploadedAt || d.createdAt || null, uploadedBy:by || 'unknown', uploadedByRole:role,
-        mimeType:d.mimetype || d.mimeType || null, size:d.size || null,
-        apiUrl:`${PUBLIC_API_BASE}/api/issues/cases/${encodeURIComponent(st.caseId)}/evidence/${encodeURIComponent(id)}`
-      };
-    });
-  }
-  function wfCommunications(st){
-    const currentIds = new Set((st.messages || []).map(m => m.sourceActionId).filter(Boolean));
-    const legacy = actionLog.filter(a => a.caseId === st.caseId && !currentIds.has(a.id)).map(a => ({
-      id:`legacy-${a.id || uuid()}`, timestamp:a.timestamp, authorPhone:a.actorPhone || a.byPhone || 'system',
-      authorRole:wfRole(a.actorRole || a.byRole || 'system'), authorLabel:wfRoleLabel(a.actorRole || a.byRole || 'system'),
-      audience:'internal', kind:'legacy_action', text:a.note || a.policyLabel || a.actionType || 'Case action',
-      actionType:a.actionType || null
-    }));
-    return [...legacy, ...(st.messages || [])].sort((a,b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
-  }
-  function wfDetail(tx, st, req){
-    const evidence = wfEvidence(tx, st);
-    const communications = wfCommunications(st);
-    const timeline = [
-      { id:`opened-${st.caseId}`, timestamp:st.createdAt, label:'Issue opened', actorLabel:'Buyer / Seller', detail:tx.dispute.reasonText || tx.dispute.reasonCode || st.complaintCategory },
-      ...evidence.map(e => ({ id:`ev-${e.id}`, timestamp:e.uploadedAt, label:'Evidence uploaded', actorLabel:wfRoleLabel(e.uploadedByRole), detail:e.name })),
-      ...communications.map(m => ({ id:`msg-${m.id}`, timestamp:m.timestamp, label:m.kind === 'participant_response' ? 'Participant response' : 'Case update', actorLabel:m.authorLabel, detail:m.text }))
-    ].sort((a,b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
-    return {
-      ok:true, case:wfSummary(tx, st), transaction:{ id:tx.id, itemSnapshot:tx.itemSnapshot || null, itemCode:tx.itemCode || null },
-      tasks:st.tasks || [], communications, evidence, timeline,
-      availableActions:wfAvailable(st, req.user.role), roleGuide:wfRoleGuide(req.user.role)
-    };
-  }
-  function wfQueueFor(role, phone){
-    const r = wfRole(role);
-    const rows = [];
-    for (const tx of (transactions || [])) {
-      if (!tx || !tx.dispute) continue;
-      const st = wfEnsure(tx);
-      if (!st) continue;
-      const open = OPEN_STATUSES.has(String(st.status || '')) && !['resolved','closed'].includes(String(st.status || ''));
-      if (!open) continue;
-      const assignedRole = wfRole(st.assignedRole || 'risk_agent');
-      let relevant = assignedRole === r;
-      if (r === 'risk_agent') relevant = relevant || !st.assignedRole;
-      if (r === 'admin') relevant = relevant || !!st.pendingAdminApproval || st.status === 'awaiting_admin_approval';
-      if (!relevant) continue;
-      rows.push(wfSummary(tx, st));
-    }
-    rows.sort((a,b) => {
-      const pa = ({critical:4,high:3,medium:2,low:1})[a.priority] || 0;
-      const pb = ({critical:4,high:3,medium:2,low:1})[b.priority] || 0;
-      return pb - pa || String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''));
-    });
-    const now = Date.now();
-    return {
-      cases:rows,
-      summary:{
-        total:rows.length,
-        mine:rows.filter(c => String(c.assignedTo || '') === String(phone || '')).length,
-        unassigned:rows.filter(c => !c.assignedTo).length,
-        overdue:rows.filter(c => c.slaDeadlineAt && Date.parse(c.slaDeadlineAt) < now).length,
-        awaitingParticipant:rows.filter(c => c.pendingTasks > 0).length
-      }
-    };
-  }
-  function wfApplyOutcome(req, tx, st, outcome, note){
-    const at = nowIso();
-    tx.dispute = tx.dispute || {};
-    tx.dispute.adminDecision = { outcome, note, decidedAt:at, byPhone:req.user.phone };
-    tx.dispute.status = outcome === 'refund' ? 'admin_approved_refund' : 'admin_rejected_complaint';
-    tx.dispute.resolvedAt = at;
-    tx.disputeActive = false;
-    tx.riskHold = false;
-    if (outcome === 'refund') {
-      tx.status = 'refunded';
-      tx.payoutReconciled = true;
-      try { markPartnerProcessing(tx, { outcome:'refund', partnerActionRequired:true, refundStatus:'authorized_pending_partner_execution', lastOutcomeAt:at }); } catch (_) {}
-      try { recordLedger(req, tx, 'refund_completed', { notes:'Admin authorized refund; licensed partner execution required' }); } catch (_) {}
-    } else {
-      const prior = String((tx.dispute && tx.dispute.previousTxStatus) || '').toLowerCase();
-      tx.status = prior && prior !== 'disputed' ? prior : (tx.completedAt ? 'completed' : (tx.deliveredAt ? 'delivered' : (tx.transitStartedAt ? 'in_transit' : (tx.holdStartedAt ? 'held' : (tx.paymentStatus === 'paid' ? 'pending' : 'pending_payment')))));
-      try { markPartnerProcessing(tx, { outcome:'reject', partnerActionRequired:false, lastOutcomeAt:at }); } catch (_) {}
-      try { recordLedger(req, tx, 'dispute_rejected', { notes:'Admin rejected complaint through unified case workflow' }); } catch (_) {}
-    }
-    st.status = 'resolved';
-    st.pendingAdminApproval = false;
-    st.outcomeCode = outcome === 'refund' ? 'refund_authorized' : 'complaint_rejected';
-    st.partnerActionRequired = outcome === 'refund';
-    st.approval = { outcome, note, at, byPhone:req.user.phone, byRole:'admin' };
-    (st.tasks || []).forEach(t => { if (t.status === 'open') t.status = 'cancelled'; });
-  }
-
-  app.get('/api/case-workflow/cases', requireAuth, wfRequireStaff, (req,res) => {
-    const data = wfQueueFor(req.user.role, req.user.phone);
-    res.json({ ok:true, role:wfRole(req.user.role), roleGuide:wfRoleGuide(req.user.role), ...data });
-  });
-
-  app.get('/api/case-workflow/cases/:caseId', requireAuth, wfRequireStaff, (req,res) => {
-    const txId = String(req.params.caseId || '').replace(/^CASE-/, '');
-    const tx = wfTx(txId);
-    if (!tx || !tx.dispute) return res.status(404).json({ error:'Case not found' });
-    const st = wfEnsure(tx);
-    const r = wfRole(req.user.role);
-    const relevant = r === 'admin' || wfRole(st.assignedRole) === r || (r === 'risk_agent' && !st.assignedRole);
-    if (!relevant) return res.status(403).json({ error:`This case belongs to ${wfRoleLabel(st.assignedRole)}.` });
-    res.json(wfDetail(tx, st, req));
-  });
-
-  app.post('/api/case-workflow/cases/:caseId/actions', requireAuth, wfRequireStaff, async (req,res) => {
-    const txId = String(req.params.caseId || '').replace(/^CASE-/, '');
-    const tx = wfTx(txId);
-    if (!tx || !tx.dispute) return res.status(404).json({ error:'Case not found' });
-    const st = wfEnsure(tx);
-    const body = req.body || {};
-    const type = String(body.type || '').trim().toLowerCase();
-    const note = String(body.note || '').trim();
-    const role = wfRole(req.user.role);
-    const available = new Set(wfAvailable(st, role).map(a => a.type));
-    available.add('assign_to_me');
-    if (!available.has(type)) return res.status(403).json({ error:'This action is not available for your role or the current case stage.' });
-
-    if (type === 'assign_to_me') {
-      if (st.assignedTo && String(st.assignedTo) !== String(req.user.phone) && role !== 'admin') return res.status(409).json({ error:`Case is already owned by ${st.assignedTo}.` });
-      st.assignedRole = role;
-      st.assignedTo = req.user.phone;
-      st.assignedAt = nowIso();
-      const action = wfAction(st, tx, req, type, 'Case assigned to me.');
-      wfMessage(st, { sourceActionId:action.id, timestamp:action.timestamp, authorPhone:req.user.phone, authorRole:role, authorLabel:wfRoleLabel(role), audience:'internal', kind:'assignment', text:'Case assigned to me.' });
-      await wfPersist(tx, st, action);
-      return res.json(wfDetail(tx, st, req));
-    }
-
-    if (role !== 'admin' && wfRole(st.assignedRole) !== role) return res.status(409).json({ error:`This case is currently assigned to ${wfRoleLabel(st.assignedRole)}.` });
-    if (role !== 'admin' && st.assignedTo && String(st.assignedTo) !== String(req.user.phone)) return res.status(409).json({ error:`Case is owned by ${st.assignedTo}. Assign it to yourself before acting.` });
-    if (!note && !['approve_recommendation'].includes(type)) return res.status(400).json({ error:'Add a short reason or finding before saving.' });
-
-    const action = wfAction(st, tx, req, type, note);
-    const internalMessage = (text, kind='staff_action') => wfMessage(st, {
-      sourceActionId:action.id, timestamp:action.timestamp, authorPhone:req.user.phone,
-      authorRole:role, authorLabel:wfRoleLabel(role), audience:'internal', kind, text
-    });
-
-    if (type === 'request_evidence') {
-      const target = String(body.targetParty || '').toLowerCase();
-      if (!['buyer','seller','both'].includes(target)) return res.status(400).json({ error:'Choose Buyer, Seller, or Both.' });
-      const parties = target === 'both' ? ['buyer','seller'] : [target];
-      const dueHours = Math.max(1, Math.min(168, Number(body.dueHours || 48)));
-      const dueAt = new Date(Date.now() + dueHours*60*60*1000).toISOString();
-      for (const party of parties) {
-        const task = {
-          id:uuid(), targetParty:party, targetPhone:party === 'buyer' ? tx.fromPhone : tx.toPhone,
-          status:'open', requestText:note, requestedAt:action.timestamp, dueAt,
-          requestedByPhone:req.user.phone, requestedByRole:role, returnRole:role, responseAt:null
-        };
-        st.tasks.push(task);
-      }
-      st.waitingReturnRole = role;
-      st.status = target === 'both' ? 'awaiting_both' : `awaiting_${target}`;
-      action.targetParty = target;
-      action.nextStatus = st.status;
-      wfMessage(st, { sourceActionId:action.id, timestamp:action.timestamp, authorPhone:req.user.phone, authorRole:role, authorLabel:wfRoleLabel(role), audience:target, kind:'evidence_request', text:note, dueAt });
-    } else if (type === 'freeze_transaction') {
-      tx.riskHold = true;
-      tx.riskHoldAt = action.timestamp;
-      st.status = 'investigating';
-      action.nextStatus = st.status;
-      internalMessage(note);
-    } else if (type === 'refer_compliance' || type === 'refer_finance') {
-      st.assignedRole = type === 'refer_compliance' ? 'compliance_agent' : 'accounts_agent';
-      st.assignedTo = null;
-      st.status = 'specialist_review';
-      action.nextStatus = st.status;
-      internalMessage(`${note} Hand-off: ${wfRoleLabel(role)} to ${wfRoleLabel(st.assignedRole)}.`, 'handoff');
-    } else if (['compliance_clear','compliance_concern','compliance_need_kyc','finance_reconciled','finance_mismatch'].includes(type)) {
-      const findingLabel = ({
-        compliance_clear:'Compliance clear', compliance_concern:'Compliance concern', compliance_need_kyc:'More KYC needed',
-        finance_reconciled:'Finance reconciled', finance_mismatch:'Finance mismatch'
-      })[type];
-      st.specialistFinding = { type, label:findingLabel, note, at:action.timestamp, byPhone:req.user.phone, byRole:role };
-      st.assignedRole = 'risk_agent';
-      st.assignedTo = null;
-      st.status = 'investigating';
-      action.nextStatus = st.status;
-      internalMessage(`${findingLabel}: ${note}. Returned to Risk.`, 'specialist_finding');
-    } else if (type === 'recommend_refund' || type === 'recommend_reject') {
-      const outcome = type === 'recommend_refund' ? 'refund' : 'reject';
-      st.recommendation = { outcome, note, at:action.timestamp, byPhone:req.user.phone, byRole:role };
-      st.pendingAdminApproval = true;
-      st.assignedRole = 'admin';
-      st.assignedTo = null;
-      st.status = 'awaiting_admin_approval';
-      st.outcomeCode = `${outcome}_recommended`;
-      action.nextStatus = st.status;
-      internalMessage(`${wfRoleLabel(role)} recommends ${outcome}: ${note}`, 'recommendation');
-    } else if (type === 'approve_recommendation') {
-      if (!st.recommendation || !st.pendingAdminApproval) return res.status(409).json({ error:'There is no pending recommendation to approve.' });
-      if (String(st.recommendation.byPhone || '') === String(req.user.phone || '')) return res.status(403).json({ error:'Maker-checker control: the recommending officer cannot approve the same case.' });
-      const outcome = String(st.recommendation.outcome || '');
-      wfApplyOutcome(req, tx, st, outcome, note || `Approved ${outcome} recommendation.`);
-      action.note = note || `Approved ${outcome} recommendation.`;
-      action.nextStatus = 'resolved';
-      internalMessage(`Admin approved ${outcome}. ${action.note}`, 'approval');
-    } else if (type === 'return_to_risk') {
-      st.pendingAdminApproval = false;
-      st.assignedRole = 'risk_agent';
-      st.assignedTo = null;
-      st.status = 'investigating';
-      action.nextStatus = st.status;
-      internalMessage(`Admin returned the case to Risk: ${note}`, 'handoff');
-    } else if (type === 'close_case') {
-      st.status = 'resolved';
-      st.closedAt = action.timestamp;
-      if (tx.dispute && !tx.dispute.resolvedAt) tx.dispute.resolvedAt = action.timestamp;
-      tx.disputeActive = false;
-      if (String(tx.status || '').toLowerCase() === 'disputed') {
-        const prior = String((tx.dispute && tx.dispute.previousTxStatus) || '').toLowerCase();
-        tx.status = prior && prior !== 'disputed' ? prior : (tx.completedAt ? 'completed' : (tx.deliveredAt ? 'delivered' : (tx.transitStartedAt ? 'in_transit' : (tx.holdStartedAt ? 'held' : (tx.paymentStatus === 'paid' ? 'pending' : 'pending_payment')))));
-      }
-      st.outcomeCode = st.outcomeCode || 'case_closed';
-      action.nextStatus = st.status;
-      internalMessage(`Case closed: ${note}`, 'resolution');
-    } else {
-      internalMessage(note, 'internal_note');
-    }
-
-    st.lastActionType = type;
-    st.lastActionBy = req.user.phone;
-    st.lastActionAt = action.timestamp;
-    await wfPersist(tx, st, action);
-    logAudit(req, 'case_workflow_action', { caseId:st.caseId, txId:tx.id, type, targetParty:action.targetParty || null, nextStatus:st.status, assignedRole:st.assignedRole });
-    res.json(wfDetail(tx, st, req));
-  });
-
-  app.get('/api/transactions/:id/case', requireAuth, (req,res) => {
-    const tx = wfTx(req.params.id);
-    if (!tx || !tx.dispute) return res.status(404).json({ error:'Case not found' });
-    const party = wfParty(tx, req.user.phone);
-    if (!party && !wfStaff(req.user.role)) return res.status(403).json({ error:'Not a participant in this case.' });
-    const st = wfEnsure(tx);
-    if (wfStaff(req.user.role)) return res.json(wfDetail(tx, st, req));
-    const myTasks = (st.tasks || []).filter(t => t.targetParty === party && String(t.targetPhone || '') === String(req.user.phone || ''));
-    const communications = (st.messages || []).filter(m => {
-      if (m.authorPhone === req.user.phone) return true;
-      return m.audience === party || m.audience === 'both';
-    });
-    const evidence = wfEvidence(tx, st).filter(e => String(e.uploadedBy || '') === String(req.user.phone || ''));
-    res.json({ ok:true, case:wfSummary(tx, st), party, tasks:myTasks, communications, evidence });
-  });
-
-  app.post('/api/transactions/:id/case/respond', requireAuth, async (req,res) => {
-    const tx = wfTx(req.params.id);
-    if (!tx || !tx.dispute) return res.status(404).json({ error:'Case not found' });
-    const party = wfParty(tx, req.user.phone);
-    if (!party) return res.status(403).json({ error:'Only the buyer or seller on this transaction can respond.' });
-    const st = wfEnsure(tx);
-    const taskId = String((req.body || {}).taskId || '').trim();
-    const message = String((req.body || {}).message || '').trim();
-    const task = (st.tasks || []).find(t => String(t.id) === taskId);
-    if (!task || task.targetParty !== party || String(task.targetPhone || '') !== String(req.user.phone || '')) return res.status(404).json({ error:'Evidence request not found for your account.' });
-    if (task.status !== 'open') return res.status(409).json({ error:'This evidence request has already been answered.' });
-    if (!message) return res.status(400).json({ error:'Add a short response before sending.' });
-    task.status = 'submitted';
-    task.responseAt = nowIso();
-    task.responseBy = req.user.phone;
-    task.responseMessage = message;
-    wfMessage(st, { timestamp:task.responseAt, authorPhone:req.user.phone, authorRole:party, authorLabel:wfRoleLabel(party), audience:'internal', kind:'participant_response', text:message, taskId:task.id });
-    const remaining = wfOpenTasks(st);
-    if (!remaining.length) {
-      st.status = 'evidence_review';
-      st.assignedRole = wfRole(task.returnRole || st.waitingReturnRole || 'risk_agent');
-      st.assignedTo = null;
-    }
-    const action = {
-      id:uuid(), caseId:st.caseId, txId:tx.id, actionType:'participant_evidence_response', policyCode:'WF-15',
-      note:message, actorPhone:req.user.phone, actorRole:party, timestamp:task.responseAt, nextStatus:st.status, taskId:task.id
-    };
-    await wfPersist(tx, st, action);
-    logAudit(req, 'case_participant_response', { caseId:st.caseId, txId:tx.id, taskId:task.id, party, nextStatus:st.status });
-    res.json({ ok:true, task, case:wfSummary(tx, st), remainingTasks:remaining.length });
-  });
-
-  console.log('[TutoPay] Unified Case Workflow v1.5 loaded');
-})();
