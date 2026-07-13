@@ -8226,6 +8226,79 @@ try {
     res.json({ ok:true, transaction:tx, caseReview:review });
   });
 
+  app.post('/api/transactions/:id/case-response/upload', requireAuth, (req,res) => {
+    disputeUpload.single('file')(req, res, async (err) => {
+      if (err) {
+        if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(413).json({ error:'File too large (max 10 MB)' });
+        }
+        return res.status(400).json({ error:err.message || 'Evidence upload failed.' });
+      }
+
+      const removeRejectedFile = () => {
+        if (!req.file || !req.file.path) return;
+        try { fs.unlinkSync(req.file.path); } catch (_) {}
+      };
+      const tx = caseTx(req.params.id);
+      if (!tx || !tx.dispute) {
+        removeRejectedFile();
+        return res.status(404).json({ error:'Case transaction not found.' });
+      }
+      const party = participantRole(tx, req.user.phone);
+      if (!party) {
+        removeRejectedFile();
+        return res.status(403).json({ error:'Only the buyer or seller on this transaction can upload case evidence.' });
+      }
+      const review = ensureCaseReview(tx);
+      const requestId = String((req.body || {}).requestId || '').trim();
+      const request = review.requests.find(row => String(row.id) === requestId && row.status === 'open' && row.targetParty === party && String(row.targetPhone) === String(req.user.phone));
+      if (!request) {
+        removeRejectedFile();
+        return res.status(404).json({ error:'No open evidence request was found for your account.' });
+      }
+      if (!req.file) return res.status(400).json({ error:'Choose an evidence file to upload.' });
+
+      let urlPath = `/uploads/${req.file.filename}`;
+      let finalUrl = `${PUBLIC_API_BASE}${urlPath}`;
+      let cloudinaryMeta = null;
+      if (cloudinaryConfigured()) {
+        try {
+          cloudinaryMeta = await uploadLocalFileToCloudinary(req.file.path, {
+            folder:'tutopay/evidence', prefix:'case-response',
+            filename:req.file.originalname || req.file.filename,
+            mimetype:req.file.mimetype, size:req.file.size,
+          });
+          if (cloudinaryMeta && cloudinaryMeta.secureUrl) {
+            finalUrl = cloudinaryMeta.secureUrl;
+            urlPath = null;
+          }
+        } catch (uploadError) {
+          console.error('[cloudinary] requested evidence upload failed, keeping local upload:', uploadError && uploadError.message ? uploadError.message : uploadError);
+        }
+      }
+
+      const doc = {
+        id:uuid(), filename:req.file.filename, originalname:req.file.originalname,
+        name:req.file.originalname, mimetype:req.file.mimetype, size:req.file.size,
+        uploadedAt:nowIso(), uploadedByPhone:String(req.user.phone),
+        uploadedByRole:party, caseRequestId:request.id,
+        evidenceSource:'staff_request_response', urlPath, url:finalUrl,
+        cloudinary:cloudinaryMeta ? {
+          publicId:cloudinaryMeta.publicId, resourceType:cloudinaryMeta.resourceType,
+          bytes:cloudinaryMeta.bytes, format:cloudinaryMeta.format,
+        } : null,
+      };
+      tx.disputeDocs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
+      tx.disputeDocs.push(doc);
+      request.uploadedEvidenceIds = Array.isArray(request.uploadedEvidenceIds) ? request.uploadedEvidenceIds : [];
+      if (!request.uploadedEvidenceIds.includes(doc.id)) request.uploadedEvidenceIds.push(doc.id);
+      review.updatedAt = doc.uploadedAt;
+      await saveCaseTx(tx);
+      logAudit(req, 'clean_case_requested_evidence_upload', { txId:tx.id, requestId:request.id, party, docId:doc.id, filename:doc.name, cloudinary:!!cloudinaryMeta });
+      return res.json({ ok:true, doc, requestId:request.id });
+    });
+  });
+
   app.post('/api/transactions/:id/case-response', requireAuth, async (req,res) => {
     const tx = caseTx(req.params.id);
     if (!tx || !tx.dispute) return res.status(404).json({ error:'Case transaction not found' });
@@ -8234,21 +8307,24 @@ try {
     const review = ensureCaseReview(tx);
     const requestId = String((req.body || {}).requestId || '').trim();
     const note = String((req.body || {}).note || '').trim();
-    const evidenceIds = Array.isArray((req.body || {}).evidenceIds) ? req.body.evidenceIds.map(String) : [];
+    const evidenceIds = Array.isArray((req.body || {}).evidenceIds) ? [...new Set(req.body.evidenceIds.map(String))] : [];
     const request = review.requests.find(r => String(r.id) === requestId && r.targetParty === party && String(r.targetPhone) === String(req.user.phone));
     if (!request) return res.status(404).json({ error:'Evidence request not found for your account.' });
     if (request.status !== 'open') return res.status(409).json({ error:'This request has already been answered.' });
     if (!note) return res.status(400).json({ error:'Add a short response.' });
+    const caseDocs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
+    const validEvidenceIds = evidenceIds.filter(id => caseDocs.some(doc => String(doc.id) === id && String(doc.caseRequestId || '') === requestId && String(doc.uploadedByPhone || '') === String(req.user.phone)));
+    if (validEvidenceIds.length !== evidenceIds.length) return res.status(400).json({ error:'One or more evidence files are not attached to this request. Please upload them again.' });
     request.status = 'answered';
     request.response = { note, at:nowIso(), byPhone:req.user.phone, byRole:party };
-    request.evidenceIds = evidenceIds;
+    request.evidenceIds = validEvidenceIds;
     const open = review.requests.filter(r => r.status === 'open');
     if (!open.length) review.status = 'staff_review';
     review.updatedAt = request.response.at;
-    const entry = { id:uuid(), action:'participant_response', note, at:request.response.at, byPhone:req.user.phone, byRole:party, requestId:request.id, evidenceIds };
+    const entry = { id:uuid(), action:'participant_response', note, at:request.response.at, byPhone:req.user.phone, byRole:party, requestId:request.id, evidenceIds:validEvidenceIds };
     review.actions.push(entry);
     await saveCaseTx(tx);
-    logAudit(req, 'clean_case_participant_response', { txId:tx.id, requestId:request.id, party, evidenceCount:evidenceIds.length });
+    logAudit(req, 'clean_case_participant_response', { txId:tx.id, requestId:request.id, party, evidenceCount:validEvidenceIds.length });
     res.json({ ok:true, transaction:tx, request, caseReview:review });
   });
 
