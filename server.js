@@ -4217,27 +4217,33 @@ app.get("/api/admin/users/:phone", requireAuth, (req, res) => {
 app.get("/api/admin/summary", requireAuth, (req, res) => {
   if (req.user.role !== "admin") return res.status(403).json({ error: "Admin only" });
 
-  const txs = transactions || [];
-  const disputes = issuesTxs().filter((t) => !!t.disputeActive || String(t.status).toLowerCase() === "disputed");
-
-  const active = issuesTxs().filter((t) => ["pending_payment","pending","held"].includes(String(t.status)));
-  const inTransit = issuesTxs().filter((t) => ["in_transit","delivered"].includes(String(t.status)));
-  const completed = issuesTxs().filter((t) => ["released","completed"].includes(String(t.status)));
-
-  const releasedTotal = issuesTxs().reduce((sum, t) => {
+  // Keep this route self-contained. The Issues Desk helper is scoped inside a
+  // later module and cannot safely be called from the Admin Overview route.
+  const txs = Array.isArray(transactions) ? transactions : [];
+  const statusOf = (t) => String((t && t.status) || "").toLowerCase();
+  const disputes = txs.filter((t) => !!(t && (t.disputeActive || (t.dispute && t.dispute.active))) || statusOf(t) === "disputed");
+  const active = txs.filter((t) => ["pending_payment","pending","held"].includes(statusOf(t)));
+  const inTransit = txs.filter((t) => ["in_transit","delivered"].includes(statusOf(t)));
+  const completed = txs.filter((t) => ["released","completed"].includes(statusOf(t)));
+  const totalValue = txs.reduce((sum, t) => sum + (Number(t && (t.amount || t.quoteAmount || 0)) || 0), 0);
+  const heldTotal = active.reduce((sum, t) => sum + (Number(t && (t.amount || t.quoteAmount || 0)) || 0), 0);
+  const releasedTotal = txs.reduce((sum, t) => {
     const amt = Number(t.amount || t.quoteAmount || 0) || 0;
-    if (String(t.status) === "released" || String(t.status) === "completed") return sum + amt;
+    if (statusOf(t) === "released" || statusOf(t) === "completed") return sum + amt;
     return sum;
   }, 0);
 
   res.json({
+    generatedAt: nowIso(),
     totals: {
       users: users.length,
-      transactions: issuesTxs().length,
+      transactions: txs.length,
       disputes: disputes.length,
       active: active.length,
       inTransit: inTransit.length,
       completed: completed.length,
+      totalValue,
+      heldTotal,
       releasedTotal,
     }
   });
