@@ -5609,13 +5609,79 @@ function requireIssuesDesk(req,res,next){
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
     const st = issueCaseStore.get(got.c.caseId);
-    const toPhone = String((req.body||{}).toPhone || req.user.phone).trim();
+    const body = req.body || {};
+    const actorPhone = String(req.user.phone || '').trim();
+    const actorRole = String(req.user.role || '').trim().toLowerCase();
+    const requestedPhone = String(body.toPhone || '').trim();
+    const toPhone = requestedPhone || actorPhone;
+    const currentAssignee = String(st.assignedTo || '').trim();
+    const isAdmin = actorRole === 'admin';
+    const status = String(st.status || got.c.status || '').trim().toLowerCase();
+
+    if (['resolved', 'closed'].includes(status)) {
+      return res.status(409).json({ error:'Closed cases cannot be assigned.' });
+    }
+    if (requestedPhone && tpAuthLocalPhone(requestedPhone) !== tpAuthLocalPhone(actorPhone) && !isAdmin) {
+      return res.status(403).json({ error:'Only Admin can assign a case to another staff member.' });
+    }
+    if (currentAssignee && tpAuthLocalPhone(currentAssignee) !== tpAuthLocalPhone(toPhone) && !isAdmin) {
+      return res.status(409).json({
+        error:`This case is already assigned to ${currentAssignee}. Refresh the queue or ask Admin to reassign it.`,
+        assignedTo: currentAssignee,
+      });
+    }
+
+    const targetUser = findUserByPhone(toPhone);
+    const targetRole = String((targetUser && targetUser.role) || (toPhone === actorPhone ? actorRole : body.toRole) || '').trim().toLowerCase();
+    if (!targetUser && tpAuthLocalPhone(toPhone) !== tpAuthLocalPhone(actorPhone)) {
+      return res.status(404).json({ error:'The selected staff member was not found.' });
+    }
+    if (!isIssuesDeskRole(targetRole)) {
+      return res.status(400).json({ error:'Cases can only be assigned to Admin, Risk, or Fraud staff.' });
+    }
+
+    if (currentAssignee && tpAuthLocalPhone(currentAssignee) === tpAuthLocalPhone(toPhone)) {
+      return res.json({ ok:true, unchanged:true, case: ensureIssueCaseForTx(got.tx) });
+    }
+
+    const assignedAt = nowIso();
     st.assignedTo = toPhone;
-    st.assignedAt = nowIso();
-    st.assignedRole = String(req.user.role || '').toLowerCase();
-    st.updatedAt = nowIso();
+    st.assignedAt = assignedAt;
+    st.assignedRole = targetRole;
+    st.updatedAt = assignedAt;
+    st.assignmentVersion = Number(st.assignmentVersion || 0) + 1;
+
+    const assignmentAction = {
+      id: uuid(),
+      caseId: got.c.caseId,
+      txId: got.tx.id,
+      actionType: currentAssignee ? 'case_reassigned' : 'case_assigned',
+      policyCode: 'CASE-ASSIGN',
+      note: currentAssignee
+        ? `Case reassigned from ${currentAssignee} to ${toPhone}.`
+        : `Case assigned to ${toPhone}.`,
+      actorPhone,
+      actorRole,
+      timestamp: assignedAt,
+      nextStatus: st.status || got.c.status || 'new',
+      assignedTo: toPhone,
+      assignedRole: targetRole,
+      previousAssignee: currentAssignee || null,
+      assignmentVersion: st.assignmentVersion,
+    };
+    issueActions.push(assignmentAction);
+    if (issueActions.length > 10000) issueActions.splice(0, issueActions.length - 10000);
+
+    try { await dbInsertIssueAction(assignmentAction); } catch(e){}
     try { await dbUpsertIssueCase(st); } catch(e){}
-    logAudit(req, 'issues_case_assign', { caseId: got.c.caseId, txId: got.tx.id, assignedTo: toPhone });
+    logAudit(req, currentAssignee ? 'issues_case_reassign' : 'issues_case_assign', {
+      caseId: got.c.caseId,
+      txId: got.tx.id,
+      assignedTo: toPhone,
+      assignedRole: targetRole,
+      previousAssignee: currentAssignee || null,
+      assignmentVersion: st.assignmentVersion,
+    });
     res.json({ ok:true, case: ensureIssueCaseForTx(got.tx) });
   });
 
