@@ -3015,6 +3015,7 @@ const tx = {
     holdExpiresAt,
     holdStartedAt: null,
     transitStartedAt: null,
+    deliveredAt: null,
     completedAt: null,
     disputeActive: false,
     dispute: null,
@@ -3523,6 +3524,7 @@ break;
           .json({ error: "Cannot mark delivered in current state" });
       }
       tx.status = "delivered";
+      tx.deliveredAt = now;
       break;
     }
 
