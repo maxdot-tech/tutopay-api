@@ -5641,6 +5641,16 @@ function requireIssuesDesk(req,res,next){
     }
 
     if (currentAssignee && tpAuthLocalPhone(currentAssignee) === tpAuthLocalPhone(toPhone)) {
+      got.tx.caseReview = got.tx.caseReview && typeof got.tx.caseReview === 'object' ? got.tx.caseReview : {};
+      if (!got.tx.caseReview.assignment) {
+        got.tx.caseReview.assignment = {
+          assignedTo: toPhone,
+          assignedRole: st.assignedRole || targetRole,
+          assignedAt: st.assignedAt || nowIso(),
+          assignmentVersion: Number(st.assignmentVersion || 1),
+        };
+        try { await dbUpsertTransaction(got.tx); } catch(e){}
+      }
       return res.json({ ok:true, unchanged:true, case: ensureIssueCaseForTx(got.tx) });
     }
 
@@ -5672,8 +5682,32 @@ function requireIssuesDesk(req,res,next){
     issueActions.push(assignmentAction);
     if (issueActions.length > 10000) issueActions.splice(0, issueActions.length - 10000);
 
+    got.tx.caseReview = got.tx.caseReview && typeof got.tx.caseReview === 'object' ? got.tx.caseReview : {};
+    got.tx.caseReview.assignment = {
+      assignedTo: toPhone,
+      assignedRole: targetRole,
+      assignedAt,
+      assignedByPhone: actorPhone,
+      assignedByRole: actorRole,
+      previousAssignee: currentAssignee || null,
+      assignmentVersion: st.assignmentVersion,
+    };
+    got.tx.caseReview.actions = Array.isArray(got.tx.caseReview.actions) ? got.tx.caseReview.actions : [];
+    got.tx.caseReview.actions.push({
+      id: assignmentAction.id,
+      action: assignmentAction.actionType,
+      note: assignmentAction.note,
+      at: assignedAt,
+      byPhone: actorPhone,
+      byRole: actorRole,
+      assignedTo: toPhone,
+      previousAssignee: currentAssignee || null,
+    });
+    if (got.tx.caseReview.actions.length > 200) got.tx.caseReview.actions.splice(0, got.tx.caseReview.actions.length - 200);
+
     try { await dbInsertIssueAction(assignmentAction); } catch(e){}
     try { await dbUpsertIssueCase(st); } catch(e){}
+    try { await dbUpsertTransaction(got.tx); } catch(e){}
     logAudit(req, currentAssignee ? 'issues_case_reassign' : 'issues_case_assign', {
       caseId: got.c.caseId,
       txId: got.tx.id,
