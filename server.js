@@ -8271,6 +8271,17 @@ try {
     if (!allowed.has(action)) return res.status(403).json({ error:'This action is not available for your role.' });
     if (!note) return res.status(400).json({ error:'Add a clear reason or instruction.' });
 
+    // Case ownership is operational, not cosmetic: only the assigned Risk
+    // officer may investigate or submit a recommendation on the case.
+    if (role === 'risk_agent') {
+      const assignedTo = String(review.assignment && review.assignment.assignedTo || '').trim();
+      if (!assignedTo) return res.status(409).json({ error:'Assign this case to yourself before taking an action.' });
+      if (assignedTo !== String(req.user.phone || '')) return res.status(403).json({ error:`This case is assigned to ${assignedTo}.` });
+      if (review.status === 'awaiting_admin_decision' && action !== 'internal_note') {
+        return res.status(409).json({ error:'This case is already awaiting an Admin decision. Add an internal note or wait for Admin to return it.' });
+      }
+    }
+
     const entry = actionEntry(req, action, note);
     if (action === 'request_evidence') {
       const target = String(body.targetParty || '').toLowerCase();
@@ -8285,14 +8296,24 @@ try {
           response:null, evidenceIds:[]
         });
       }
+      if (review.recommendation) {
+        review.previousRecommendations = Array.isArray(review.previousRecommendations) ? review.previousRecommendations : [];
+        review.previousRecommendations.push({ ...review.recommendation, supersededAt:entry.at, supersededByAction:'request_evidence' });
+        review.recommendation = null;
+      }
       review.status = target === 'both' ? 'awaiting_both' : `awaiting_${target}`;
       entry.targetParty = target;
       entry.dueAt = dueAt;
     } else if (action === 'recommend_refund' || action === 'recommend_reject') {
+      const openRequests = review.requests.filter(row => row && row.status === 'open');
+      if (openRequests.length) return res.status(409).json({ error:'Wait for all open participant evidence requests to be answered before submitting a recommendation.' });
       const outcome = action === 'recommend_refund' ? 'refund' : 'reject';
-      review.recommendation = { outcome, note, at:entry.at, byPhone:req.user.phone, byRole:role };
+      review.recommendation = { id:uuid(), outcome, note, at:entry.at, byPhone:req.user.phone, byRole:role };
       review.status = 'awaiting_admin_decision';
+      review.returnInstruction = null;
+      entry.recommendationOutcome = outcome;
     } else if (action === 'admin_approve_refund') {
+      if (review.status !== 'awaiting_admin_decision') return res.status(409).json({ error:'This case is not in the Admin decision queue.' });
       if (!review.recommendation || review.recommendation.outcome !== 'refund') return res.status(409).json({ error:'Risk must first submit a refund recommendation.' });
       if (String(review.recommendation.byPhone || '') === String(req.user.phone || '')) return res.status(403).json({ error:'The recommending officer cannot approve the same case.' });
       tx.dispute.adminDecision = { outcome:'refund', note, decidedAt:entry.at, byPhone:req.user.phone };
@@ -8306,6 +8327,8 @@ try {
       try { markPartnerProcessing(tx, { outcome:'refund', partnerActionRequired:true, refundStatus:'authorized_pending_partner_execution', lastOutcomeAt:entry.at }); } catch (_) {}
       try { recordLedger(req, tx, 'refund_completed', { notes:'Admin approved refund through Clean Cases' }); } catch (_) {}
     } else if (action === 'admin_reject_claim') {
+      if (review.status !== 'awaiting_admin_decision' || !review.recommendation) return res.status(409).json({ error:'Risk must first submit a recommendation for Admin review.' });
+      if (String(review.recommendation.byPhone || '') === String(req.user.phone || '')) return res.status(403).json({ error:'The recommending officer cannot approve the same case.' });
       tx.dispute.adminDecision = { outcome:'reject', note, decidedAt:entry.at, byPhone:req.user.phone };
       tx.dispute.status = 'admin_rejected_claim';
       tx.dispute.resolvedAt = entry.at;
@@ -8316,8 +8339,16 @@ try {
       try { markPartnerProcessing(tx, { outcome:'reject', partnerActionRequired:false, lastOutcomeAt:entry.at }); } catch (_) {}
       try { recordLedger(req, tx, 'dispute_rejected', { notes:'Admin rejected claim through Clean Cases' }); } catch (_) {}
     } else if (action === 'admin_return_review') {
+      if (review.status !== 'awaiting_admin_decision' || !review.recommendation) return res.status(409).json({ error:'Only a submitted Risk recommendation can be returned for review.' });
+      const reasonCode = String(body.reasonCode || '').toLowerCase().trim();
+      const allowedReasons = new Set(['insufficient_evidence','reasoning_unclear','policy_check_required','participant_clarification','incorrect_outcome','other']);
+      if (!allowedReasons.has(reasonCode)) return res.status(400).json({ error:'Choose a valid return reason.' });
+      review.previousRecommendations = Array.isArray(review.previousRecommendations) ? review.previousRecommendations : [];
+      review.previousRecommendations.push({ ...review.recommendation, returnedAt:entry.at, returnedByPhone:req.user.phone, returnReasonCode:reasonCode, returnNote:note });
       review.status = 'staff_review';
-      review.returnInstruction = { note, at:entry.at, byPhone:req.user.phone };
+      review.returnInstruction = { reasonCode, note, at:entry.at, byPhone:req.user.phone, byRole:role };
+      review.recommendation = null;
+      entry.reasonCode = reasonCode;
     }
 
     review.actions.push(entry);
