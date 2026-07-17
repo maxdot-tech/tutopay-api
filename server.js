@@ -975,7 +975,7 @@ function migrateItemImagesInPlace(item) {
   // Ensure every item has a stable id for future lookups
   if (!item.id) item.id = uuid();
 
-  const urls = Array.isArray(item.imageUrls)
+  const urls = Array.isArray(item.imageUrls) && item.imageUrls.length
     ? item.imageUrls.slice()
     : (item.imageUrl ? [item.imageUrl] : []);
 
@@ -2902,7 +2902,7 @@ const cache = new Map();
     sellerPhone,
     holdHours: holdHours ? Number(holdHours) : 24,
     imageUrl: convertedFirst || "",
-    imageUrls: convertedUrls,
+    imageUrls: convertedUrls.length ? convertedUrls : (convertedFirst ? [convertedFirst] : []),
     availability: availability || "available",
     condition: condition || "used",
     category: req.body && req.body.category ? String(req.body.category) : "",
@@ -5596,6 +5596,40 @@ function requireIssuesDesk(req,res,next){
         push(d.uploadedAt || d.createdAt, 'evidence_uploaded', 'evidence', d.name || d.filename || 'Evidence file', { by: d.uploadedByPhone || d.byPhone || d.by || null, fileType: d.mimetype || null, url: d.url || null });
       }
     }
+    const review = tx.caseReview && typeof tx.caseReview === 'object' ? tx.caseReview : {};
+    if (Array.isArray(review.requests)) {
+      for (const request of review.requests) {
+        const target = String(request.targetParty || 'participant').replace(/_/g, ' ');
+        push(request.requestedAt, 'evidence_requested', 'case_review', `More evidence requested from ${target}: ${request.instruction || 'No instruction recorded.'}`, {
+          actorPhone:request.requestedByPhone || null,
+          actorRole:request.requestedByRole || null,
+          requestId:request.id || null,
+          requestStatus:request.status || 'open',
+        });
+        if (request.response) {
+          push(request.response.at, 'participant_response', 'case_review', `${target} replied: ${request.response.note || 'Evidence supplied without a note.'}`, {
+            actorPhone:request.response.byPhone || null,
+            actorRole:request.response.byRole || target,
+            requestId:request.id || null,
+            evidenceCount:Array.isArray(request.evidenceIds) ? request.evidenceIds.length : 0,
+          });
+        }
+      }
+    }
+    if (Array.isArray(review.actions)) {
+      for (const action of review.actions) {
+        push(action.at, action.action || 'staff_action', 'case_review', action.note || String(action.action || 'Case action').replace(/_/g, ' '), {
+          actorPhone:action.byPhone || null,
+          actorRole:action.byRole || null,
+          assignedTo:action.assignedTo || null,
+          previousOwner:action.previousOwner || null,
+        });
+      }
+    }
+    if (tx.refundExecution) {
+      push(tx.refundExecution.startedAt || tx.refundExecution.requestedAt, 'refund_execution_started', 'finance', 'Finance submitted the authorised refund for partner execution.', { reference:tx.refundExecution.referenceId || null });
+      push(tx.refundExecution.completedAt || tx.refundExecution.confirmedAt, 'refund_execution_completed', 'finance', 'Partner refund execution completed.', { reference:tx.refundExecution.referenceId || null });
+    }
     for (const a of issueActions) {
       if (a.caseId !== caseId) continue;
       push(a.timestamp, a.actionType || 'case_action', 'issues_desk', a.note || a.policyLabel || a.policyCode || 'Case action', { actorPhone: a.actorPhone, actorRole: a.actorRole, policyCode: a.policyCode, nextStatus: a.nextStatus });
@@ -5718,14 +5752,53 @@ function requireIssuesDesk(req,res,next){
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
     const st = issueCaseStore.get(got.c.caseId);
-    const toPhone = String((req.body||{}).toPhone || req.user.phone).trim();
+    const actorRole = String(req.user.role || '').toLowerCase();
+    const requestedPhone = String((req.body||{}).toPhone || '').trim();
+    const toPhone = actorRole === 'admin' && requestedPhone ? requestedPhone : String(req.user.phone || '').trim();
+    if (!toPhone) return res.status(400).json({ error:'Assignment phone is required.' });
+    if (st.assignedTo && String(st.assignedTo) !== toPhone && actorRole !== 'admin') {
+      return res.status(409).json({ error:`This case is already assigned to ${st.assignedTo}.` });
+    }
+    if (String(st.assignedTo || '') === toPhone) return res.json({ ok:true, case:ensureIssueCaseForTx(got.tx), alreadyAssigned:true });
     st.assignedTo = toPhone;
     st.assignedAt = nowIso();
-    st.assignedRole = String(req.user.role || '').toLowerCase();
+    st.assignedRole = toPhone === String(req.user.phone || '') ? actorRole : 'risk_agent';
     st.updatedAt = nowIso();
+    got.tx.caseReview = got.tx.caseReview && typeof got.tx.caseReview === 'object' ? got.tx.caseReview : {};
+    got.tx.caseReview.actions = Array.isArray(got.tx.caseReview.actions) ? got.tx.caseReview.actions : [];
+    got.tx.caseReview.actions.push({ id:uuid(), action:'case_assigned', note:`Case assigned to ${toPhone}.`, at:st.assignedAt, byPhone:req.user.phone, byRole:actorRole, assignedTo:toPhone });
+    got.tx.caseReview.updatedAt = st.assignedAt;
     try { await dbUpsertIssueCase(st); } catch(e){}
+    try { if (dbEnabled()) await dbUpsertTransaction(got.tx); } catch(e){}
     logAudit(req, 'issues_case_assign', { caseId: got.c.caseId, txId: got.tx.id, assignedTo: toPhone });
     res.json({ ok:true, case: ensureIssueCaseForTx(got.tx) });
+  });
+
+  app.post('/api/issues/cases/:caseId/release-assignment', requireAuth, requireIssuesDesk, async (req,res)=>{
+    const got = getIssueCaseAndTx(req.params.caseId);
+    if (got.err) return res.status(404).json({ error:got.err });
+    const st = issueCaseStore.get(got.c.caseId);
+    const actorRole = String(req.user.role || '').toLowerCase();
+    const note = String((req.body||{}).note || '').trim();
+    if (!st || !st.assignedTo) return res.status(409).json({ error:'This case is already unassigned.' });
+    if (actorRole !== 'admin' && String(st.assignedTo) !== String(req.user.phone || '')) {
+      return res.status(403).json({ error:'Only the assigned Risk Agent or Admin can release this case.' });
+    }
+    if (note.length < 3) return res.status(400).json({ error:'Add a short reason for releasing the case.' });
+    const previousOwner = String(st.assignedTo);
+    const releasedAt = nowIso();
+    st.assignedTo = null;
+    st.assignedAt = null;
+    st.assignedRole = null;
+    st.updatedAt = releasedAt;
+    got.tx.caseReview = got.tx.caseReview && typeof got.tx.caseReview === 'object' ? got.tx.caseReview : {};
+    got.tx.caseReview.actions = Array.isArray(got.tx.caseReview.actions) ? got.tx.caseReview.actions : [];
+    got.tx.caseReview.actions.push({ id:uuid(), action:'case_released', note, at:releasedAt, byPhone:req.user.phone, byRole:actorRole, previousOwner });
+    got.tx.caseReview.updatedAt = releasedAt;
+    try { await dbUpsertIssueCase(st); } catch(e){}
+    try { if (dbEnabled()) await dbUpsertTransaction(got.tx); } catch(e){}
+    logAudit(req, 'issues_case_assignment_released', { caseId:got.c.caseId, txId:got.tx.id, previousOwner, note });
+    res.json({ ok:true, case:ensureIssueCaseForTx(got.tx) });
   });
 
   
@@ -8297,6 +8370,12 @@ try {
     const action = String(body.action || '').toLowerCase().trim();
     const note = String(body.note || '').trim();
     const role = caseRole(req.user.role);
+    if (role === 'risk_agent') {
+      const assignmentStore = globalThis.__tpIssueCaseStore;
+      const assignment = assignmentStore && typeof assignmentStore.get === 'function' ? assignmentStore.get(`CASE-${tx.id}`) : null;
+      if (!assignment || !assignment.assignedTo) return res.status(409).json({ error:'Assign this case to yourself before taking a Risk action.' });
+      if (String(assignment.assignedTo) !== String(req.user.phone || '')) return res.status(403).json({ error:`This case is assigned to ${assignment.assignedTo}.` });
+    }
     const riskActions = new Set(['request_evidence','recommend_refund','recommend_reject','internal_note']);
     const adminActions = new Set(['request_evidence','admin_approve_refund','admin_reject_claim','admin_return_review','internal_note']);
     const allowed = role === 'admin' ? adminActions : riskActions;
@@ -8606,10 +8685,12 @@ function financeTxSnapshot(tx) {
   if (!tx) return null;
   const snap = tx.itemSnapshot || {};
   const catalogItem = items.find(item => String(item && item.code || '') === String(tx.itemCode || snap.code || '')) || null;
-  const imageCandidate = snap.imageUrl ||
+  const imageCandidate = tx.itemImage || snap.imageUrl ||
     (Array.isArray(snap.imageUrls) && snap.imageUrls[0]) ||
     (Array.isArray(snap.images) && snap.images[0]) ||
-    (catalogItem && (catalogItem.imageUrl || (Array.isArray(catalogItem.imageUrls) && catalogItem.imageUrls[0]))) || null;
+    (catalogItem && (catalogItem.imageUrl ||
+      (Array.isArray(catalogItem.imageUrls) && catalogItem.imageUrls[0]) ||
+      (Array.isArray(catalogItem.images) && catalogItem.images[0]))) || null;
   return {
     id:tx.id, recordNo:tx.recordNo || null, itemCode:tx.itemCode || (tx.itemSnapshot && tx.itemSnapshot.code) || null,
     itemTitle:snap.title || (catalogItem && (catalogItem.title || catalogItem.name)) || null,
