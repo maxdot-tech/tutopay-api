@@ -1317,7 +1317,48 @@ function ensureTxReconDefaults(tx) {
   if (typeof tx.refundReconciled !== "boolean") tx.refundReconciled = false;
   if (!Array.isArray(tx.reconNotes)) tx.reconNotes = [];
   if (!tx.reconUpdatedAt) tx.reconUpdatedAt = null;
+  if (!tx.reconciliationWork || typeof tx.reconciliationWork !== "object") tx.reconciliationWork = {};
+  const work = tx.reconciliationWork;
+  if (!work.assignedTo) work.assignedTo = null;
+  if (!work.assignedAt) work.assignedAt = null;
+  if (!Array.isArray(work.history)) work.history = [];
+  if (!Array.isArray(work.exceptions)) work.exceptions = [];
+  if (!work.updatedAt) work.updatedAt = null;
   return tx;
+}
+
+function reconciliationWorkEvent(tx, req, event, note, meta = {}) {
+  ensureTxReconDefaults(tx);
+  const row = {
+    id: uuid(),
+    at: nowIso(),
+    event: String(event || "updated"),
+    note: String(note || ""),
+    byPhone: req && req.user ? req.user.phone : "system",
+    byRole: req && req.user ? req.user.role : "system",
+    ...meta,
+  };
+  tx.reconciliationWork.history.push(row);
+  tx.reconciliationWork.updatedAt = row.at;
+  tx.reconUpdatedAt = row.at;
+  return row;
+}
+
+function requireReconciliationOwnership(req, tx) {
+  ensureTxReconDefaults(tx);
+  if (String(req.user.role || "").toLowerCase() === "admin") return null;
+  const owner = String(tx.reconciliationWork.assignedTo || "");
+  if (!owner) return "Assign this reconciliation record to yourself before taking action.";
+  if (owner !== String(req.user.phone || "")) return `This reconciliation record is assigned to ${owner}.`;
+  return null;
+}
+
+function openReconciliationExceptions(tx, target) {
+  ensureTxReconDefaults(tx);
+  return tx.reconciliationWork.exceptions.filter((row) =>
+    String(row.status || "open") === "open" &&
+    (!target || String(row.target || "") === String(target))
+  );
 }
 
 async function dbLoadIntoMemory() {
@@ -4419,10 +4460,10 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
   if (!isAccountingRole(req.user.role)) return res.status(403).json({ error: "Accounting only" });
 
   const txs = transactions.map(ensureTxReconDefaults);
-  const pendingCollection = issuesTxs().filter((t) => t.paymentStatus === "paid" && !t.collectionReconciled).length;
-  const pendingPayout = issuesTxs().filter((t) => (t.status === "completed" || (t.disbursement && t.disbursement.status === "successful")) && !t.payoutReconciled).length;
+  const pendingCollection = txs.filter((t) => t.paymentStatus === "paid" && !t.collectionReconciled).length;
+  const pendingPayout = txs.filter((t) => (t.status === "completed" || (t.disbursement && t.disbursement.status === "successful")) && !t.payoutReconciled).length;
 
-  const money = issuesTxs().reduce((acc, t) => {
+  const money = txs.reduce((acc, t) => {
     const amt = Number(t.amount || 0) || 0;
     if (t.paymentStatus === "paid") acc.collectionsPaid += amt;
     if (t.disbursement && t.disbursement.status === "successful") acc.payoutsSuccessful += amt;
@@ -4433,9 +4474,19 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
   res.json({
     totals: {
       ledgerEntries: ledgerEntries.length,
-      transactions: issuesTxs().length,
+      transactions: txs.length,
       pendingCollectionReconciliation: pendingCollection,
       pendingPayoutReconciliation: pendingPayout,
+      assignedReconciliation: txs.filter((t) => !!t.reconciliationWork.assignedTo).length,
+      openReconciliationExceptions: txs.reduce((sum, t) => sum + openReconciliationExceptions(t).length, 0),
+      fullyReconciled: txs.filter((t) => {
+        const paid = String(t.paymentStatus || "").toLowerCase() === "paid";
+        const payoutSuccessful = String((t.disbursement && t.disbursement.status) || "").toLowerCase() === "successful";
+        const refundRequired = financialActions.some((row) => String(row.txId) === String(t.id) &&
+          ["refund","partial_refund","reversal"].includes(String(row.type)) &&
+          ["awaiting_reconciliation","reconciled"].includes(String(row.status)));
+        return (paid || payoutSuccessful || refundRequired) && (!paid || t.collectionReconciled) && (!payoutSuccessful || t.payoutReconciled) && (!refundRequired || t.refundReconciled);
+      }).length,
       ...money,
     },
     recentUnreconciled: txs
@@ -4456,17 +4507,122 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
   });
 });
 
+app.post("/api/admin/reconciliation/:txId/assign", requireAuth, (req, res) => {
+  if (!isAccountsReconciliationRole(req.user.role)) return res.status(403).json({ error: "Accounts reconciliation access required" });
+  const tx = transactions.find((row) => String(row.id) === String(req.params.txId || ""));
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+  ensureTxReconDefaults(tx);
+  const work = tx.reconciliationWork;
+  const actor = String(req.user.phone || "");
+  if (work.assignedTo && String(work.assignedTo) !== actor && String(req.user.role || "").toLowerCase() !== "admin") {
+    return res.status(409).json({ error: `This reconciliation record is already assigned to ${work.assignedTo}.` });
+  }
+  work.assignedTo = actor;
+  work.assignedAt = work.assignedAt || nowIso();
+  reconciliationWorkEvent(tx, req, "assigned", "Accounts reconciliation record assigned.");
+  logAudit(req, "reconciliation_assigned", { txId: tx.id, assignedTo: work.assignedTo });
+  if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
+  return res.json({ ok: true, txId: tx.id, reconciliationWork: work });
+});
+
+app.post("/api/admin/reconciliation/:txId/release", requireAuth, (req, res) => {
+  if (!isAccountsReconciliationRole(req.user.role)) return res.status(403).json({ error: "Accounts reconciliation access required" });
+  const tx = transactions.find((row) => String(row.id) === String(req.params.txId || ""));
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+  ensureTxReconDefaults(tx);
+  const work = tx.reconciliationWork;
+  const actor = String(req.user.phone || "");
+  if (work.assignedTo && String(work.assignedTo) !== actor && String(req.user.role || "").toLowerCase() !== "admin") {
+    return res.status(409).json({ error: `Only ${work.assignedTo} or an Admin can release this record.` });
+  }
+  const previousOwner = work.assignedTo;
+  work.assignedTo = null;
+  work.assignedAt = null;
+  reconciliationWorkEvent(tx, req, "released", `Assignment released${previousOwner ? ` from ${previousOwner}` : ""}.`);
+  logAudit(req, "reconciliation_released", { txId: tx.id, previousOwner });
+  if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
+  return res.json({ ok: true, txId: tx.id, reconciliationWork: work });
+});
+
+app.post("/api/admin/reconciliation/:txId/exception", requireAuth, (req, res) => {
+  if (!isAccountsReconciliationRole(req.user.role)) return res.status(403).json({ error: "Accounts reconciliation access required" });
+  const tx = transactions.find((row) => String(row.id) === String(req.params.txId || ""));
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+  ensureTxReconDefaults(tx);
+  const ownershipError = requireReconciliationOwnership(req, tx);
+  if (ownershipError) return res.status(409).json({ error: ownershipError });
+  const body = req.body || {};
+  const target = String(body.target || "").toLowerCase();
+  const category = String(body.category || "other").toLowerCase();
+  const note = String(body.note || "").trim();
+  const categories = ["reference_missing","amount_mismatch","duplicate","partner_status_mismatch","beneficiary_mismatch","other"];
+  if (!["collection","payout","refund"].includes(target)) return res.status(400).json({ error: "Select collection, payout, or refund." });
+  if (!categories.includes(category)) return res.status(400).json({ error: "Select a valid discrepancy category." });
+  if (!note) return res.status(400).json({ error: "Explain the discrepancy before recording it." });
+  const hasObservedAmount = body.observedAmount !== null && body.observedAmount !== undefined && String(body.observedAmount).trim() !== "" && Number.isFinite(Number(body.observedAmount));
+  const row = {
+    id: `REC-EXC-${uuid()}`,
+    target,
+    category,
+    note,
+    partnerReference: String(body.partnerReference || "").trim() || null,
+    observedAmount: hasObservedAmount ? Number(body.observedAmount) : null,
+    status: "open",
+    openedAt: nowIso(),
+    openedBy: req.user.phone,
+    resolvedAt: null,
+    resolvedBy: null,
+    resolutionNote: null,
+  };
+  tx.reconciliationWork.exceptions.push(row);
+  tx.reconNotes.push({ at: row.openedAt, by: req.user.phone, target, status: "exception_opened", note, partnerReference: row.partnerReference, observedAmount: row.observedAmount });
+  reconciliationWorkEvent(tx, req, "exception_opened", note, { target, category, exceptionId: row.id });
+  recordLedger(req, tx, "reconciliation_exception_opened", { dedupe: false, notes: note, meta: { target, category, exceptionId: row.id } });
+  logAudit(req, "reconciliation_exception_opened", { txId: tx.id, target, category, exceptionId: row.id, note });
+  if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
+  return res.json({ ok: true, txId: tx.id, exception: row, reconciliationWork: tx.reconciliationWork });
+});
+
+app.post("/api/admin/reconciliation/:txId/exception/:exceptionId/resolve", requireAuth, (req, res) => {
+  if (!isAccountsReconciliationRole(req.user.role)) return res.status(403).json({ error: "Accounts reconciliation access required" });
+  const tx = transactions.find((row) => String(row.id) === String(req.params.txId || ""));
+  if (!tx) return res.status(404).json({ error: "Transaction not found" });
+  ensureTxReconDefaults(tx);
+  const ownershipError = requireReconciliationOwnership(req, tx);
+  if (ownershipError) return res.status(409).json({ error: ownershipError });
+  const row = tx.reconciliationWork.exceptions.find((item) => String(item.id) === String(req.params.exceptionId || ""));
+  if (!row) return res.status(404).json({ error: "Reconciliation discrepancy not found" });
+  if (String(row.status) === "resolved") return res.status(409).json({ error: "This discrepancy is already resolved." });
+  const note = String((req.body && req.body.note) || "").trim();
+  if (!note) return res.status(400).json({ error: "Add a resolution note." });
+  row.status = "resolved";
+  row.resolvedAt = nowIso();
+  row.resolvedBy = req.user.phone;
+  row.resolutionNote = note;
+  tx.reconNotes.push({ at: row.resolvedAt, by: req.user.phone, target: row.target, status: "exception_resolved", note, exceptionId: row.id });
+  reconciliationWorkEvent(tx, req, "exception_resolved", note, { target: row.target, category: row.category, exceptionId: row.id });
+  recordLedger(req, tx, "reconciliation_exception_resolved", { dedupe: false, notes: note, meta: { target: row.target, category: row.category, exceptionId: row.id } });
+  logAudit(req, "reconciliation_exception_resolved", { txId: tx.id, exceptionId: row.id, target: row.target, note });
+  if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
+  return res.json({ ok: true, txId: tx.id, exception: row, reconciliationWork: tx.reconciliationWork });
+});
+
 app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   if (!isAccountsReconciliationRole(req.user.role)) return res.status(403).json({ error: "Accounts reconciliation access required" });
 
   const tx = transactions.find((t) => String(t.id) === String(req.params.txId || ""));
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
   ensureTxReconDefaults(tx);
+  const ownershipError = requireReconciliationOwnership(req, tx);
+  if (ownershipError) return res.status(409).json({ error: ownershipError });
 
   const body = req.body || {};
   const target = String(body.target || "").toLowerCase(); // collection | payout | refund | both
   const status = String(body.status || "reconciled").toLowerCase(); // reconciled | unreconciled
   const note = body.note ? String(body.note) : "";
+  const partnerReference = String(body.partnerReference || "").trim();
+  const hasObservedAmount = body.observedAmount !== null && body.observedAmount !== undefined && String(body.observedAmount).trim() !== "";
+  const observedAmount = hasObservedAmount ? Number(body.observedAmount) : NaN;
 
   const val = status === "reconciled";
 
@@ -4492,6 +4648,17 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   if (status === "reconciled" && target === "refund" && (!refundAction || String(tx.refundExecution && tx.refundExecution.status || '').toLowerCase() !== 'successful')) {
     return res.status(409).json({ error: "Refund cannot be reconciled until the licensed partner confirms it as successful." });
   }
+  if (status === "reconciled" && openReconciliationExceptions(tx, target).length) {
+    return res.status(409).json({ error: `Resolve the open ${target} discrepancy before recording a match.` });
+  }
+  if (status === "reconciled" && String(req.user.role || "").toLowerCase() !== "admin") {
+    if (!partnerReference) return res.status(400).json({ error: "Add the partner statement or transaction reference used for this match." });
+    if (!Number.isFinite(observedAmount)) return res.status(400).json({ error: "Add the amount observed on the partner statement." });
+    const expectedAmount = target === "refund" && refundAction ? Number(refundAction.amount || 0) : Number(tx.amount || 0);
+    if (Math.abs(observedAmount - expectedAmount) > 0.01) {
+      return res.status(409).json({ error: `Observed amount ${observedAmount.toFixed(2)} does not match expected amount ${expectedAmount.toFixed(2)}. Record a discrepancy instead.` });
+    }
+  }
 
   if (target === "collection" || target === "both") tx.collectionReconciled = val;
   if (target === "payout" || target === "both") tx.payoutReconciled = val;
@@ -4500,7 +4667,7 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
     if (refundAction) {
       refundAction.status = val ? 'reconciled' : 'awaiting_reconciliation';
       refundAction.reconciliationStatus = val ? 'reconciled' : 'pending';
-      refundAction.reconciliation = {status:val ? 'reconciled' : 'reopened',at:nowIso(),byPhone:req.user.phone,note};
+      refundAction.reconciliation = {status:val ? 'reconciled' : 'reopened',at:nowIso(),byPhone:req.user.phone,note,partnerReference:partnerReference || null,observedAmount:Number.isFinite(observedAmount) ? observedAmount : null};
       financeActionEvent(refundAction,refundAction.status,req.user,val ? 'Accounts reconciled the confirmed refund.' : 'Accounts reopened the refund reconciliation.',{txId:tx.id});
       persistFinancialAction(refundAction);
     }
@@ -4515,16 +4682,21 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
     }
   }
   tx.reconUpdatedAt = nowIso();
-  if (note) tx.reconNotes.push({ at: tx.reconUpdatedAt, by: req.user.phone, target, status, note });
+  if (note) tx.reconNotes.push({ at: tx.reconUpdatedAt, by: req.user.phone, target, status, note, partnerReference:partnerReference || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null });
+  reconciliationWorkEvent(tx, req, status === "reconciled" ? "match_recorded" : "match_reopened", note, {
+    target,
+    partnerReference: partnerReference || null,
+    observedAmount: Number.isFinite(observedAmount) ? observedAmount : null,
+  });
 
   recordLedger(req, tx, "reconciliation_marked", {
     dedupe: false,
     notes: note || `Marked ${target} as ${status}`,
-    meta: { target, status }
+    meta: { target, status, partnerReference:partnerReference || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null }
   });
 
   logAudit(req, "reconciliation_marked", {
-    txId: tx.id, target, status, note,
+    txId: tx.id, target, status, note, partnerReference:partnerReference || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null,
     collectionReconciled: tx.collectionReconciled,
     payoutReconciled: tx.payoutReconciled,
     refundReconciled: tx.refundReconciled,
