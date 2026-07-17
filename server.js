@@ -5,6 +5,10 @@ function isAccountingRole(role) {
   const r = String(role || "").toLowerCase();
   return r === "admin" || r === "accounts_agent" || r === "accounts" || r === "finance_agent";
 }
+function isAccountsReconciliationRole(role) {
+  const r = String(role || "").toLowerCase();
+  return r === "admin" || r === "accounts_agent" || r === "accounts";
+}
 function isIssuesDeskRoleGlobal(role) {
   const r = String(role || "").toLowerCase();
   return r === "admin" || r === "risk_agent" || r === "fraud_agent";
@@ -1041,6 +1045,10 @@ const requests = [];
 // Each entry: { id, timestamp, ip, userPhone, userRole, eventType, details }
 const auditLog = [];
 const ledgerEntries = []; // immutable-ish append-only ledger for money events
+// Operational partner-rail instructions are stored separately from the
+// transaction. This keeps authorisation, execution and reconciliation as
+// distinct events instead of one overloaded transaction status.
+const financialActions = [];
 
 // ===== PostgreSQL persistence (Railway) =====
 // If DATABASE_URL exists and pg is installed, we persist users/items/transactions/requests/audit logs.
@@ -1096,6 +1104,7 @@ async function dbInit() {
       await dbEnsureSchema();
       await dbLoadIntoMemory();
       await dbLoadOpsIntoMemory();
+      await dbLoadFinancialActions();
       _dbReady = true;
       dbInitError = null;
       console.log(`[DB] Connected + schema ready. attempt=${attempt}/${DB_INIT_RETRIES}`);
@@ -1167,6 +1176,17 @@ async function dbEnsureSchema() {
       expires_at TIMESTAMPTZ NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS tutopay_financial_actions (
+      action_id TEXT PRIMARY KEY,
+      tx_id TEXT,
+      case_id TEXT,
+      action_type TEXT,
+      status TEXT,
+      data JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS tutopay_sessions (
       token TEXT PRIMARY KEY,
       data JSONB NOT NULL,
@@ -1179,6 +1199,10 @@ async function dbEnsureSchema() {
     CREATE INDEX IF NOT EXISTS tutopay_ledger_ts_idx ON tutopay_ledger(ts);
     CREATE INDEX IF NOT EXISTS tutopay_ledger_tx_idx ON tutopay_ledger(tx_id);
     CREATE INDEX IF NOT EXISTS tutopay_idem_expires_idx ON tutopay_idempotency(expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_tutopay_fin_actions_tx ON tutopay_financial_actions(tx_id);
+CREATE INDEX IF NOT EXISTS idx_tutopay_fin_actions_case ON tutopay_financial_actions(case_id);
+CREATE INDEX IF NOT EXISTS idx_tutopay_fin_actions_status ON tutopay_financial_actions(status);
 
 CREATE TABLE IF NOT EXISTS tutopay_issue_cases (
   case_id TEXT PRIMARY KEY,
@@ -1406,6 +1430,44 @@ async function dbInsertLedger(entry) {
      VALUES ($1, $2, $3, $4, $5::jsonb)
      ON CONFLICT (id) DO NOTHING`,
     [id, ts, entry.txId ? String(entry.txId) : null, entry.eventType || null, JSON.stringify(entry)]
+  );
+}
+
+async function dbLoadFinancialActions() {
+  if (!_pgPool) return;
+  try {
+    const result = await _pgPool.query("SELECT data FROM tutopay_financial_actions ORDER BY created_at ASC");
+    financialActions.length = 0;
+    for (const row of (result.rows || [])) {
+      if (row && row.data && row.data.actionId) financialActions.push(row.data);
+    }
+  } catch (error) {
+    console.warn("[finance] Could not load financial actions:", error && error.message ? error.message : error);
+  }
+}
+
+async function dbUpsertFinancialAction(action) {
+  if (!_pgPool || !action || !action.actionId) return;
+  await _pgPool.query(
+    `INSERT INTO tutopay_financial_actions(action_id, tx_id, case_id, action_type, status, data, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
+     ON CONFLICT (action_id) DO UPDATE SET
+       tx_id=EXCLUDED.tx_id,
+       case_id=EXCLUDED.case_id,
+       action_type=EXCLUDED.action_type,
+       status=EXCLUDED.status,
+       data=EXCLUDED.data,
+       updated_at=EXCLUDED.updated_at`,
+    [
+      String(action.actionId),
+      action.txId ? String(action.txId) : null,
+      action.caseId ? String(action.caseId) : null,
+      String(action.type || "unknown"),
+      String(action.status || "draft"),
+      JSON.stringify(action),
+      action.createdAt || nowIso(),
+      action.updatedAt || nowIso(),
+    ]
   );
 }
 
@@ -3015,7 +3077,6 @@ const tx = {
     holdExpiresAt,
     holdStartedAt: null,
     transitStartedAt: null,
-    deliveredAt: null,
     completedAt: null,
     disputeActive: false,
     dispute: null,
@@ -3524,7 +3585,6 @@ break;
           .json({ error: "Cannot mark delivered in current state" });
       }
       tx.status = "delivered";
-      tx.deliveredAt = now;
       break;
     }
 
@@ -4323,7 +4383,7 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
 });
 
 app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
-  if (!isAccountingRole(req.user.role)) return res.status(403).json({ error: "Accounting only" });
+  if (!isAccountsReconciliationRole(req.user.role)) return res.status(403).json({ error: "Accounts reconciliation access required" });
 
   const tx = transactions.find((t) => String(t.id) === String(req.params.txId || ""));
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
@@ -4341,6 +4401,16 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   }
   if (!["reconciled","unreconciled"].includes(status)) {
     return res.status(400).json({ error: "status must be reconciled or unreconciled" });
+  }
+  if (!note.trim()) return res.status(400).json({ error: "Add a reconciliation note or partner statement reference." });
+  if (target === "both" && String(req.user.role) !== "admin") {
+    return res.status(403).json({ error: "Collection and payout must be reconciled separately by Accounts." });
+  }
+  if (status === "reconciled" && (target === "collection" || target === "both") && String(tx.paymentStatus || "").toLowerCase() !== "paid") {
+    return res.status(409).json({ error: "Collection cannot be reconciled until the partner confirms payment as paid." });
+  }
+  if (status === "reconciled" && (target === "payout" || target === "both") && String((tx.disbursement && tx.disbursement.status) || "").toLowerCase() !== "successful") {
+    return res.status(409).json({ error: "Payout cannot be reconciled until the partner confirms it as successful." });
   }
 
   if (target === "collection" || target === "both") tx.collectionReconciled = val;
@@ -5231,7 +5301,7 @@ app.get('/api/admin/export/issues-approvals.csv', requireAuth, requireIssuesDesk
     { code:'RISK-04', label:'Reject Complaint Recommended', actionType:'recommend_reject', nextStatus:'awaiting_admin_approval', template:'Evidence does not support complaint claim. Prepare a structured rejection response.' },
     { code:'RISK-05', label:'Escalate to Supervisor', actionType:'escalate_supervisor', nextStatus:'escalated', template:'Case escalated due to severity, repeat pattern, or policy trigger.' },
     { code:'RISK-06', label:'Close Case', actionType:'close_case', nextStatus:'resolved', template:'Issue is resolved and case can be closed with final notes recorded.' }
-    ,{ code:'ADM-01', label:'ADMIN: Approve Refund (Execute)', actionType:'admin_execute_refund', nextStatus:'resolved', template:'Admin approval: execute refund outcome (money-moving). Records authorization + closes case.' }
+    ,{ code:'ADM-01', label:'ADMIN: Authorize Refund for Finance', actionType:'admin_execute_refund', nextStatus:'awaiting_finance_execution', template:'Admin authorization: create a controlled Finance instruction. The case closes only after partner execution is confirmed.' }
     ,{ code:'ADM-02', label:'ADMIN: Approve Reject (Close)', actionType:'admin_execute_reject', nextStatus:'resolved', template:'Admin approval: reject complaint outcome (money-moving decision) + close case.' }
     ];
   const issueCaseStore = globalThis.__tpIssueCaseStore || (globalThis.__tpIssueCaseStore = new Map()); // caseId -> state/meta
@@ -5611,113 +5681,13 @@ function requireIssuesDesk(req,res,next){
     const got = getIssueCaseAndTx(req.params.caseId);
     if (got.err) return res.status(404).json({ error: got.err });
     const st = issueCaseStore.get(got.c.caseId);
-    const body = req.body || {};
-    const actorPhone = String(req.user.phone || '').trim();
-    const actorRole = String(req.user.role || '').trim().toLowerCase();
-    const requestedPhone = String(body.toPhone || '').trim();
-    const toPhone = requestedPhone || actorPhone;
-    const currentAssignee = String(st.assignedTo || '').trim();
-    const isAdmin = actorRole === 'admin';
-    const status = String(st.status || got.c.status || '').trim().toLowerCase();
-
-    if (['resolved', 'closed'].includes(status)) {
-      return res.status(409).json({ error:'Closed cases cannot be assigned.' });
-    }
-    if (requestedPhone && tpAuthLocalPhone(requestedPhone) !== tpAuthLocalPhone(actorPhone) && !isAdmin) {
-      return res.status(403).json({ error:'Only Admin can assign a case to another staff member.' });
-    }
-    if (currentAssignee && tpAuthLocalPhone(currentAssignee) !== tpAuthLocalPhone(toPhone) && !isAdmin) {
-      return res.status(409).json({
-        error:`This case is already assigned to ${currentAssignee}. Refresh the queue or ask Admin to reassign it.`,
-        assignedTo: currentAssignee,
-      });
-    }
-
-    const targetUser = findUserByPhone(toPhone);
-    const targetRole = String((targetUser && targetUser.role) || (toPhone === actorPhone ? actorRole : body.toRole) || '').trim().toLowerCase();
-    if (!targetUser && tpAuthLocalPhone(toPhone) !== tpAuthLocalPhone(actorPhone)) {
-      return res.status(404).json({ error:'The selected staff member was not found.' });
-    }
-    if (!isIssuesDeskRole(targetRole)) {
-      return res.status(400).json({ error:'Cases can only be assigned to Admin, Risk, or Fraud staff.' });
-    }
-
-    if (currentAssignee && tpAuthLocalPhone(currentAssignee) === tpAuthLocalPhone(toPhone)) {
-      got.tx.caseReview = got.tx.caseReview && typeof got.tx.caseReview === 'object' ? got.tx.caseReview : {};
-      if (!got.tx.caseReview.assignment) {
-        got.tx.caseReview.assignment = {
-          assignedTo: toPhone,
-          assignedRole: st.assignedRole || targetRole,
-          assignedAt: st.assignedAt || nowIso(),
-          assignmentVersion: Number(st.assignmentVersion || 1),
-        };
-        try { await dbUpsertTransaction(got.tx); } catch(e){}
-      }
-      return res.json({ ok:true, unchanged:true, case: ensureIssueCaseForTx(got.tx) });
-    }
-
-    const assignedAt = nowIso();
+    const toPhone = String((req.body||{}).toPhone || req.user.phone).trim();
     st.assignedTo = toPhone;
-    st.assignedAt = assignedAt;
-    st.assignedRole = targetRole;
-    st.updatedAt = assignedAt;
-    st.assignmentVersion = Number(st.assignmentVersion || 0) + 1;
-
-    const assignmentAction = {
-      id: uuid(),
-      caseId: got.c.caseId,
-      txId: got.tx.id,
-      actionType: currentAssignee ? 'case_reassigned' : 'case_assigned',
-      policyCode: 'CASE-ASSIGN',
-      note: currentAssignee
-        ? `Case reassigned from ${currentAssignee} to ${toPhone}.`
-        : `Case assigned to ${toPhone}.`,
-      actorPhone,
-      actorRole,
-      timestamp: assignedAt,
-      nextStatus: st.status || got.c.status || 'new',
-      assignedTo: toPhone,
-      assignedRole: targetRole,
-      previousAssignee: currentAssignee || null,
-      assignmentVersion: st.assignmentVersion,
-    };
-    issueActions.push(assignmentAction);
-    if (issueActions.length > 10000) issueActions.splice(0, issueActions.length - 10000);
-
-    got.tx.caseReview = got.tx.caseReview && typeof got.tx.caseReview === 'object' ? got.tx.caseReview : {};
-    got.tx.caseReview.assignment = {
-      assignedTo: toPhone,
-      assignedRole: targetRole,
-      assignedAt,
-      assignedByPhone: actorPhone,
-      assignedByRole: actorRole,
-      previousAssignee: currentAssignee || null,
-      assignmentVersion: st.assignmentVersion,
-    };
-    got.tx.caseReview.actions = Array.isArray(got.tx.caseReview.actions) ? got.tx.caseReview.actions : [];
-    got.tx.caseReview.actions.push({
-      id: assignmentAction.id,
-      action: assignmentAction.actionType,
-      note: assignmentAction.note,
-      at: assignedAt,
-      byPhone: actorPhone,
-      byRole: actorRole,
-      assignedTo: toPhone,
-      previousAssignee: currentAssignee || null,
-    });
-    if (got.tx.caseReview.actions.length > 200) got.tx.caseReview.actions.splice(0, got.tx.caseReview.actions.length - 200);
-
-    try { await dbInsertIssueAction(assignmentAction); } catch(e){}
+    st.assignedAt = nowIso();
+    st.assignedRole = String(req.user.role || '').toLowerCase();
+    st.updatedAt = nowIso();
     try { await dbUpsertIssueCase(st); } catch(e){}
-    try { await dbUpsertTransaction(got.tx); } catch(e){}
-    logAudit(req, currentAssignee ? 'issues_case_reassign' : 'issues_case_assign', {
-      caseId: got.c.caseId,
-      txId: got.tx.id,
-      assignedTo: toPhone,
-      assignedRole: targetRole,
-      previousAssignee: currentAssignee || null,
-      assignmentVersion: st.assignmentVersion,
-    });
+    logAudit(req, 'issues_case_assign', { caseId: got.c.caseId, txId: got.tx.id, assignedTo: toPhone });
     res.json({ ok:true, case: ensureIssueCaseForTx(got.tx) });
   });
 
@@ -5736,18 +5706,25 @@ function requireIssuesDesk(req,res,next){
     tx.riskHoldAt = tx.riskHoldAt || null;
 
     if (outcome === 'refund') {
-      tx.dispute.status = 'admin_approved_refund';
-      tx.dispute.resolvedAt = now;
+      tx.dispute.status = 'refund_authorized';
+      tx.dispute.decisionAt = now;
+      tx.dispute.resolvedAt = null;
       tx.disputeActive = false;
-      tx.status = 'refunded';
-      tx.payoutReconciled = true;
+      tx.status = 'refund_authorized';
+      tx.refundReconciled = false;
+      const financeAction = authorizeRefundFinancialAction(req, tx, {
+        note: note || '',
+        source: 'issues_desk_admin_decision',
+        sourceKey: `issues-refund:${String(tx.id)}:${String((tx.dispute.adminDecision && tx.dispute.adminDecision.decidedAt) || now)}`,
+      });
+      tx.financeActionId = financeAction.actionId;
       markPartnerProcessing(tx, {
         outcome: 'refund',
         partnerActionRequired: true,
-        refundStatus: 'authorized_pending_partner_execution',
+        refundStatus: 'authorized_pending_finance_validation',
         lastOutcomeAt: now,
       });
-      recordLedger(req, tx, 'refund_completed', { notes: 'Admin authorized refund outcome; partner execution required' });
+      recordLedger(req, tx, 'refund_authorized', { notes: 'Admin authorized refund; Finance validation and partner execution are still required', meta:{ financeActionId:financeAction.actionId } });
     } else if (outcome === 'reject') {
       tx.dispute.status = 'admin_rejected_complaint';
       tx.dispute.resolvedAt = now;
@@ -5836,10 +5813,19 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
       const outcome = actionType === 'admin_execute_refund' ? 'refund' : (actionType === 'admin_execute_reject' ? 'reject' : null);
       if (outcome) {
         applyAdminIssueOutcome(req, got.tx, outcome, entry.note);
-        st.executedOutcome = outcome;
-        st.executedAt = entry.timestamp;
-        st.closedAt = entry.timestamp;
-        st.status = 'resolved';
+        if (outcome === 'refund') {
+          st.authorizedOutcome = outcome;
+          st.authorizedAt = entry.timestamp;
+          st.executedOutcome = null;
+          st.executedAt = null;
+          st.closedAt = null;
+          st.status = 'awaiting_finance_execution';
+        } else {
+          st.executedOutcome = outcome;
+          st.executedAt = entry.timestamp;
+          st.closedAt = entry.timestamp;
+          st.status = 'resolved';
+        }
       }
     }
 
@@ -5937,7 +5923,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
       txId: got.tx.id,
       actionType,
       policyCode,
-      nextStatus: 'resolved',
+      nextStatus: outcome === 'refund' ? 'awaiting_finance_execution' : 'resolved',
       note: note || `Admin approved RA recommendation: ${outcome}`,
       byPhone: req.user.phone,
       byRole: req.user.role,
@@ -5949,10 +5935,19 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     st.partnerActionRequired = outcome === 'refund';
     st.partnerActionType = outcome === 'refund' ? 'refund' : null;
     st.outcomeCode = outcome === 'refund' ? 'refund_authorized' : 'complaint_rejected';
-    st.executedOutcome = outcome;
-    st.executedAt = entry.timestamp;
-    st.closedAt = entry.timestamp;
-    st.status = 'resolved';
+    if (outcome === 'refund') {
+      st.authorizedOutcome = outcome;
+      st.authorizedAt = entry.timestamp;
+      st.executedOutcome = null;
+      st.executedAt = null;
+      st.closedAt = null;
+      st.status = 'awaiting_finance_execution';
+    } else {
+      st.executedOutcome = outcome;
+      st.executedAt = entry.timestamp;
+      st.closedAt = entry.timestamp;
+      st.status = 'resolved';
+    }
     st.updatedAt = entry.timestamp;
 
     applyAdminIssueOutcome(req, got.tx, outcome, entry.note);
@@ -8271,17 +8266,6 @@ try {
     if (!allowed.has(action)) return res.status(403).json({ error:'This action is not available for your role.' });
     if (!note) return res.status(400).json({ error:'Add a clear reason or instruction.' });
 
-    // Case ownership is operational, not cosmetic: only the assigned Risk
-    // officer may investigate or submit a recommendation on the case.
-    if (role === 'risk_agent') {
-      const assignedTo = String(review.assignment && review.assignment.assignedTo || '').trim();
-      if (!assignedTo) return res.status(409).json({ error:'Assign this case to yourself before taking an action.' });
-      if (assignedTo !== String(req.user.phone || '')) return res.status(403).json({ error:`This case is assigned to ${assignedTo}.` });
-      if (review.status === 'awaiting_admin_decision' && action !== 'internal_note') {
-        return res.status(409).json({ error:'This case is already awaiting an Admin decision. Add an internal note or wait for Admin to return it.' });
-      }
-    }
-
     const entry = actionEntry(req, action, note);
     if (action === 'request_evidence') {
       const target = String(body.targetParty || '').toLowerCase();
@@ -8296,39 +8280,35 @@ try {
           response:null, evidenceIds:[]
         });
       }
-      if (review.recommendation) {
-        review.previousRecommendations = Array.isArray(review.previousRecommendations) ? review.previousRecommendations : [];
-        review.previousRecommendations.push({ ...review.recommendation, supersededAt:entry.at, supersededByAction:'request_evidence' });
-        review.recommendation = null;
-      }
       review.status = target === 'both' ? 'awaiting_both' : `awaiting_${target}`;
       entry.targetParty = target;
       entry.dueAt = dueAt;
     } else if (action === 'recommend_refund' || action === 'recommend_reject') {
-      const openRequests = review.requests.filter(row => row && row.status === 'open');
-      if (openRequests.length) return res.status(409).json({ error:'Wait for all open participant evidence requests to be answered before submitting a recommendation.' });
       const outcome = action === 'recommend_refund' ? 'refund' : 'reject';
-      review.recommendation = { id:uuid(), outcome, note, at:entry.at, byPhone:req.user.phone, byRole:role };
+      review.recommendation = { outcome, note, at:entry.at, byPhone:req.user.phone, byRole:role };
       review.status = 'awaiting_admin_decision';
-      review.returnInstruction = null;
-      entry.recommendationOutcome = outcome;
     } else if (action === 'admin_approve_refund') {
-      if (review.status !== 'awaiting_admin_decision') return res.status(409).json({ error:'This case is not in the Admin decision queue.' });
       if (!review.recommendation || review.recommendation.outcome !== 'refund') return res.status(409).json({ error:'Risk must first submit a refund recommendation.' });
       if (String(review.recommendation.byPhone || '') === String(req.user.phone || '')) return res.status(403).json({ error:'The recommending officer cannot approve the same case.' });
       tx.dispute.adminDecision = { outcome:'refund', note, decidedAt:entry.at, byPhone:req.user.phone };
-      tx.dispute.status = 'admin_approved_refund';
-      tx.dispute.resolvedAt = entry.at;
+      tx.dispute.status = 'refund_authorized';
+      tx.dispute.decisionAt = entry.at;
+      tx.dispute.resolvedAt = null;
       tx.disputeActive = false;
-      tx.status = 'refunded';
-      tx.payoutReconciled = true;
-      review.status = 'resolved';
+      tx.status = 'refund_authorized';
+      tx.refundReconciled = false;
+      review.status = 'awaiting_finance_execution';
       review.decision = { outcome:'refund', note, at:entry.at, byPhone:req.user.phone, byRole:role };
-      try { markPartnerProcessing(tx, { outcome:'refund', partnerActionRequired:true, refundStatus:'authorized_pending_partner_execution', lastOutcomeAt:entry.at }); } catch (_) {}
-      try { recordLedger(req, tx, 'refund_completed', { notes:'Admin approved refund through Clean Cases' }); } catch (_) {}
+      const financeAction = authorizeRefundFinancialAction(req, tx, {
+        note,
+        source:'clean_cases_admin_decision',
+        sourceKey:`clean-refund:${String(tx.id)}:${String((review.recommendation && review.recommendation.at) || entry.at)}`,
+        recommendation:review.recommendation || null,
+      });
+      tx.financeActionId = financeAction.actionId;
+      try { markPartnerProcessing(tx, { outcome:'refund', partnerActionRequired:true, refundStatus:'authorized_pending_finance_validation', lastOutcomeAt:entry.at }); } catch (_) {}
+      try { recordLedger(req, tx, 'refund_authorized', { notes:'Admin approved refund; Finance validation and partner execution are pending', meta:{ financeActionId:financeAction.actionId } }); } catch (_) {}
     } else if (action === 'admin_reject_claim') {
-      if (review.status !== 'awaiting_admin_decision' || !review.recommendation) return res.status(409).json({ error:'Risk must first submit a recommendation for Admin review.' });
-      if (String(review.recommendation.byPhone || '') === String(req.user.phone || '')) return res.status(403).json({ error:'The recommending officer cannot approve the same case.' });
       tx.dispute.adminDecision = { outcome:'reject', note, decidedAt:entry.at, byPhone:req.user.phone };
       tx.dispute.status = 'admin_rejected_claim';
       tx.dispute.resolvedAt = entry.at;
@@ -8339,16 +8319,8 @@ try {
       try { markPartnerProcessing(tx, { outcome:'reject', partnerActionRequired:false, lastOutcomeAt:entry.at }); } catch (_) {}
       try { recordLedger(req, tx, 'dispute_rejected', { notes:'Admin rejected claim through Clean Cases' }); } catch (_) {}
     } else if (action === 'admin_return_review') {
-      if (review.status !== 'awaiting_admin_decision' || !review.recommendation) return res.status(409).json({ error:'Only a submitted Risk recommendation can be returned for review.' });
-      const reasonCode = String(body.reasonCode || '').toLowerCase().trim();
-      const allowedReasons = new Set(['insufficient_evidence','reasoning_unclear','policy_check_required','participant_clarification','incorrect_outcome','other']);
-      if (!allowedReasons.has(reasonCode)) return res.status(400).json({ error:'Choose a valid return reason.' });
-      review.previousRecommendations = Array.isArray(review.previousRecommendations) ? review.previousRecommendations : [];
-      review.previousRecommendations.push({ ...review.recommendation, returnedAt:entry.at, returnedByPhone:req.user.phone, returnReasonCode:reasonCode, returnNote:note });
       review.status = 'staff_review';
-      review.returnInstruction = { reasonCode, note, at:entry.at, byPhone:req.user.phone, byRole:role };
-      review.recommendation = null;
-      entry.reasonCode = reasonCode;
+      review.returnInstruction = { note, at:entry.at, byPhone:req.user.phone };
     }
 
     review.actions.push(entry);
@@ -8462,4 +8434,288 @@ try {
   });
 
   console.log('[TutoPay] Clean Cases Stage 2 actions loaded');
+})();
+
+/* ===== Finance Workflow Phase 1: authorisation, assignment and validation ===== */
+const FINANCE_ACTION_TYPES = new Set([
+  'collection','payout','refund','partial_refund','reversal','payout_retry',
+  'duplicate_payment','unmatched_payment','chargeback','fee_variance',
+  'manual_adjustment','settlement_batch'
+]);
+const FINANCE_OPEN_STATUSES = new Set(['authorized','assigned','validated','on_hold','processing','failed','awaiting_reconciliation']);
+
+function financeRole(value) {
+  return String(value || '').toLowerCase().trim();
+}
+function financeCanRead(req) {
+  return ['admin','finance_agent','accounts_agent','accounts'].includes(financeRole(req.user && req.user.role));
+}
+function financeCanOperate(req) {
+  return financeRole(req.user && req.user.role) === 'finance_agent';
+}
+function financeCaseIdForTx(tx) {
+  return String(
+    (tx && tx.caseReview && tx.caseReview.caseId) ||
+    (tx && tx.dispute && (tx.dispute.caseId || tx.dispute.id)) ||
+    (tx && tx.caseId) ||
+    (tx && tx.id ? `CASE-${tx.id}` : '')
+  );
+}
+function financeProviderForTx(tx, type) {
+  if (type === 'payout' || type === 'payout_retry') {
+    return String((tx.disbursement && tx.disbursement.provider) || (tx.partnerProcessing && tx.partnerProcessing.provider) || 'mtn_momo_disbursement');
+  }
+  return String(tx.paymentProvider || (tx.partnerProcessing && tx.partnerProcessing.provider) || PAYMENTS_MODE || 'unassigned');
+}
+function financeActionEvent(action, status, actor, note, meta={}) {
+  action.history = Array.isArray(action.history) ? action.history : [];
+  const event = {
+    id:uuid(), status:String(status || action.status || 'updated'), at:nowIso(),
+    byPhone:String((actor && actor.phone) || 'system'),
+    byRole:String((actor && actor.role) || 'system'),
+    note:String(note || ''), meta:meta && typeof meta === 'object' ? meta : {},
+  };
+  action.history.push(event);
+  if (action.history.length > 300) action.history.splice(0, action.history.length - 300);
+  action.updatedAt = event.at;
+  return event;
+}
+function findFinancialActionById(id) {
+  return financialActions.find(row => String(row.actionId) === String(id || '')) || null;
+}
+function findFinancialActionBySource(sourceKey) {
+  return financialActions.find(row => sourceKey && String(row.sourceKey || '') === String(sourceKey)) || null;
+}
+function findOpenFinancialAction(txId, type) {
+  return financialActions.find(row => String(row.txId) === String(txId) && String(row.type) === String(type) && FINANCE_OPEN_STATUSES.has(String(row.status))) || null;
+}
+function persistFinancialAction(action) {
+  if (_pgPool) dbUpsertFinancialAction(action).catch(error => console.warn('[finance] action save failed:', error && error.message ? error.message : error));
+  return action;
+}
+function ensureFinancialAction(tx, opts={}) {
+  const type = String(opts.type || '').toLowerCase();
+  if (!tx || !tx.id) throw new Error('A transaction is required for a financial action.');
+  if (!FINANCE_ACTION_TYPES.has(type)) throw new Error(`Unsupported financial action type: ${type}`);
+  const sourceKey = String(opts.sourceKey || `${type}:${tx.id}`);
+  let action = findFinancialActionBySource(sourceKey) || findOpenFinancialAction(tx.id, type);
+  if (action) return action;
+  const createdAt = opts.createdAt || nowIso();
+  action = {
+    actionId:`FIN-${new Date().getUTCFullYear()}-${uuid().slice(0,8).toUpperCase()}`,
+    txId:String(tx.id), caseId:String(opts.caseId || financeCaseIdForTx(tx)),
+    type, status:String(opts.status || 'authorized'), priority:String(opts.priority || (type === 'refund' ? 'high' : 'normal')),
+    amount:Number(opts.amount != null ? opts.amount : tx.amount || 0) || 0,
+    currency:String(opts.currency || tx.currency || 'ZMW'),
+    beneficiaryParty:String(opts.beneficiaryParty || (type.includes('refund') || type === 'reversal' ? 'buyer' : 'seller')),
+    beneficiaryPhone:String(opts.beneficiaryPhone || (type.includes('refund') || type === 'reversal' ? tx.fromPhone : tx.toPhone) || ''),
+    provider:String(opts.provider || financeProviderForTx(tx, type)),
+    source:String(opts.source || 'transaction_policy'), sourceKey,
+    authorization:opts.authorization || null,
+    recommendation:opts.recommendation || null,
+    assignedTo:null, assignedAt:null, validatedAt:null, validation:null,
+    holds:[], notes:[], partnerReference:null, reconciliationStatus:'not_started',
+    executionEnabled:false,
+    createdAt, updatedAt:createdAt, history:[],
+  };
+  financialActions.push(action);
+  financeActionEvent(action, action.status, opts.actor || {phone:'system',role:'system'}, opts.historyNote || 'Financial action created.');
+  persistFinancialAction(action);
+  tx.financialActionIds = Array.isArray(tx.financialActionIds) ? tx.financialActionIds : [];
+  if (!tx.financialActionIds.includes(action.actionId)) tx.financialActionIds.push(action.actionId);
+  return action;
+}
+function authorizeRefundFinancialAction(req, tx, opts={}) {
+  const decidedAt = (tx.dispute && tx.dispute.adminDecision && tx.dispute.adminDecision.decidedAt) || nowIso();
+  return ensureFinancialAction(tx, {
+    type:'refund', status:'authorized', priority:'high',
+    source:opts.source || 'admin_dispute_decision',
+    sourceKey:opts.sourceKey || `refund:${tx.id}:${decidedAt}`,
+    beneficiaryParty:'buyer', beneficiaryPhone:tx.fromPhone,
+    authorization:{
+      mode:'admin_decision', byPhone:String(req.user.phone), byRole:String(req.user.role),
+      at:decidedAt, note:String(opts.note || ''), outcome:'refund'
+    },
+    recommendation:opts.recommendation || null,
+    actor:req.user,
+    historyNote:'Admin authorised refund. Awaiting Finance assignment and validation.'
+  });
+}
+function financeTxSnapshot(tx) {
+  if (!tx) return null;
+  return {
+    id:tx.id, recordNo:tx.recordNo || null, itemCode:tx.itemCode || (tx.itemSnapshot && tx.itemSnapshot.code) || null,
+    itemTitle:(tx.itemSnapshot && tx.itemSnapshot.title) || null,
+    itemImage:(tx.itemSnapshot && (tx.itemSnapshot.imageUrl ||
+      (Array.isArray(tx.itemSnapshot.imageUrls) && tx.itemSnapshot.imageUrls[0]) ||
+      (Array.isArray(tx.itemSnapshot.images) && tx.itemSnapshot.images[0]))) || null,
+    buyerPhone:tx.fromPhone || null, sellerPhone:tx.toPhone || null,
+    amount:Number(tx.amount || 0) || 0, currency:tx.currency || 'ZMW',
+    status:tx.status || null, paymentStatus:tx.paymentStatus || null,
+    paymentProvider:tx.paymentProvider || null, paymentReference:tx.paymentRef || null,
+    payoutStatus:(tx.disbursement && tx.disbursement.status) || 'not_started',
+    payoutReference:(tx.disbursement && tx.disbursement.referenceId) || null,
+    disputeActive:!!tx.disputeActive, riskHold:!!tx.riskHold, complianceHold:!!tx.complianceHold,
+    collectionReconciled:!!tx.collectionReconciled, payoutReconciled:!!tx.payoutReconciled,
+    createdAt:tx.createdAt || null, paidAt:tx.paidAt || null, completedAt:tx.completedAt || null,
+  };
+}
+function financeActionView(action) {
+  const tx = transactions.find(row => String(row.id) === String(action.txId));
+  return Object.assign({}, action, { transaction:financeTxSnapshot(tx) });
+}
+function syncFinancialActionsFromTransactions() {
+  for (const tx of transactions) {
+    if (!tx || !tx.id) continue;
+    const refundSignal = String(tx.status || '') === 'refund_authorized' ||
+      String(tx.dispute && tx.dispute.status || '') === 'refund_authorized' ||
+      ['authorized_pending_partner_execution','authorized_pending_finance_validation'].includes(String(tx.partnerProcessing && tx.partnerProcessing.refundStatus || ''));
+    if (refundSignal) {
+      if (String(tx.status) === 'refunded' && String(tx.partnerProcessing && tx.partnerProcessing.refundStatus || '').startsWith('authorized_pending_')) {
+        tx.status = 'refund_authorized';
+        tx.refundReconciled = false;
+        if (_pgPool) dbUpsertTransaction(tx).catch(()=>{});
+      }
+      const decision = tx.dispute && tx.dispute.adminDecision;
+      ensureFinancialAction(tx, {
+        type:'refund', status:'authorized', priority:'high', source:'admin_dispute_decision',
+        sourceKey:`refund:${tx.id}:${String((decision && decision.decidedAt) || 'legacy')}`,
+        beneficiaryParty:'buyer', beneficiaryPhone:tx.fromPhone,
+        authorization:decision ? {mode:'admin_decision',byPhone:decision.byPhone,byRole:'admin',at:decision.decidedAt,note:decision.note,outcome:'refund'} : null,
+        historyNote:'Refund authorisation imported into Finance queue.'
+      });
+    }
+
+    const payoutStatus = String(tx.disbursement && tx.disbursement.status || '').toLowerCase();
+    let observedStatus = null;
+    if (payoutStatus === 'successful') observedStatus = tx.payoutReconciled ? 'reconciled' : 'awaiting_reconciliation';
+    else if (payoutStatus === 'pending') observedStatus = 'processing';
+    else if (payoutStatus === 'failed') observedStatus = 'failed';
+    else if (String(tx.status || '').toLowerCase() === 'completed' && String(tx.paymentStatus || '').toLowerCase() === 'paid' && !tx.disputeActive) observedStatus = 'authorized';
+    if (observedStatus) {
+      const action = ensureFinancialAction(tx, {
+        type:'payout', status:observedStatus, source:'routine_release_policy', sourceKey:`payout:${tx.id}`,
+        beneficiaryParty:'seller', beneficiaryPhone:tx.toPhone,
+        authorization:{mode:'policy',byPhone:'system',byRole:'system',at:tx.completedAt || tx.updatedAt || nowIso(),note:'Routine payout eligibility derived from completed paid transaction.'},
+        historyNote:'Routine seller payout entered Finance workflow.'
+      });
+      if (['processing','failed','awaiting_reconciliation','reconciled'].includes(observedStatus) && String(action.status) !== observedStatus) {
+        action.status = observedStatus;
+        action.partnerReference = (tx.disbursement && tx.disbursement.referenceId) || action.partnerReference;
+        financeActionEvent(action, observedStatus, {phone:'system',role:'system'}, 'Status synchronized from partner payout record.');
+        persistFinancialAction(action);
+      }
+    }
+  }
+}
+function financeValidationChecks(action, tx) {
+  const exceptional = !['payout','collection','settlement_batch'].includes(String(action.type));
+  const duplicates = financialActions.filter(row => row.actionId !== action.actionId && row.txId === action.txId && row.type === action.type && FINANCE_OPEN_STATUSES.has(String(row.status)));
+  return [
+    {key:'authorization',label:'Valid authorisation',ok:!exceptional || !!(action.authorization && action.authorization.byPhone),detail:exceptional ? 'Admin authorisation is required for this exceptional action.' : 'Routine policy authorisation is permitted.'},
+    {key:'amount',label:'Valid amount',ok:Number(action.amount) > 0 && (!tx || Number(action.amount) <= Number(tx.amount || action.amount)),detail:`${action.currency || 'ZMW'} ${Number(action.amount || 0).toFixed(2)}`},
+    {key:'beneficiary',label:'Beneficiary available',ok:!!String(action.beneficiaryPhone || '').trim(),detail:String(action.beneficiaryPhone || 'Missing phone')},
+    {key:'collection',label:'Original collection confirmed',ok:!tx || String(tx.paymentStatus || '').toLowerCase() === 'paid',detail:tx ? `paymentStatus=${tx.paymentStatus || 'unknown'}` : 'Transaction unavailable'},
+    {key:'holds',label:'No active operational hold',ok:!tx || (!tx.riskHold && !tx.complianceHold),detail:tx && (tx.riskHold || tx.complianceHold) ? 'Risk or Compliance hold is active.' : 'No hold recorded.'},
+    {key:'duplicate',label:'No duplicate instruction',ok:duplicates.length === 0,detail:duplicates.length ? `${duplicates.length} other open action(s) detected.` : 'No duplicate open action.'},
+    {key:'provider',label:'Partner route identified',ok:!!String(action.provider || '').trim() && action.provider !== 'unassigned',detail:String(action.provider || 'Unassigned')},
+  ];
+}
+
+(function TP_FINANCE_WORKFLOW_PHASE1_API(){
+  function requireFinanceRead(req,res,next){ if (!financeCanRead(req)) return res.status(403).json({error:'Finance, Accounts or Admin access required.'}); next(); }
+  function requireFinanceOperator(req,res,next){ if (!financeCanOperate(req)) return res.status(403).json({error:'Finance Agent access required.'}); next(); }
+  function assignedToCurrent(action, req){ return String(action.assignedTo || '') === String(req.user.phone || ''); }
+  function summary(rows, me){
+    const count = status => rows.filter(row => status.includes(String(row.status))).length;
+    return {
+      total:rows.length, authorized:count(['authorized']), validated:count(['validated']),
+      processing:count(['processing']), failed:count(['failed','on_hold']),
+      awaitingReconciliation:count(['awaiting_reconciliation']), completed:count(['reconciled','completed']),
+      unassigned:rows.filter(row => !row.assignedTo && FINANCE_OPEN_STATUSES.has(String(row.status))).length,
+      mine:rows.filter(row => String(row.assignedTo || '') === String(me || '') && FINANCE_OPEN_STATUSES.has(String(row.status))).length,
+      value:rows.reduce((sum,row)=>sum + Number(row.amount || 0),0),
+    };
+  }
+
+  app.get('/api/finance/actions', requireAuth, requireFinanceRead, (req,res)=>{
+    syncFinancialActionsFromTransactions();
+    let rows = financialActions.slice();
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const type = String(req.query.type || '').trim().toLowerCase();
+    const status = String(req.query.status || '').trim().toLowerCase();
+    if (type) rows = rows.filter(row => String(row.type) === type);
+    if (status) rows = rows.filter(row => String(row.status) === status);
+    if (q) rows = rows.filter(row => [row.actionId,row.txId,row.caseId,row.type,row.status,row.beneficiaryPhone,row.provider].some(value => String(value || '').toLowerCase().includes(q)));
+    rows.sort((a,b)=>Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0));
+    res.json({ok:true, phase:'assignment_and_validation', executionEnabled:false, summary:summary(rows, req.user.phone), actions:rows.slice(0,1000).map(financeActionView)});
+  });
+
+  app.get('/api/finance/actions/:actionId', requireAuth, requireFinanceRead, (req,res)=>{
+    syncFinancialActionsFromTransactions();
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    res.json({ok:true, executionEnabled:false, action:financeActionView(action)});
+  });
+
+  app.post('/api/finance/actions/:actionId/assign', requireAuth, requireFinanceOperator, async (req,res)=>{
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    if (!FINANCE_OPEN_STATUSES.has(String(action.status))) return res.status(409).json({error:'This action is no longer assignable.'});
+    if (action.assignedTo && String(action.assignedTo) !== String(req.user.phone)) return res.status(409).json({error:`Already assigned to ${action.assignedTo}.`});
+    action.assignedTo = String(req.user.phone); action.assignedAt = action.assignedAt || nowIso();
+    if (action.status === 'authorized') action.status = 'assigned';
+    financeActionEvent(action, action.status, req.user, 'Finance action assigned.');
+    await dbUpsertFinancialAction(action).catch(()=>{});
+    logAudit(req,'finance_action_assigned',{actionId:action.actionId,txId:action.txId});
+    res.json({ok:true,action:financeActionView(action)});
+  });
+
+  app.post('/api/finance/actions/:actionId/release-assignment', requireAuth, requireFinanceOperator, async (req,res)=>{
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    if (!assignedToCurrent(action,req)) return res.status(403).json({error:'Only the assigned Finance Agent can release this action.'});
+    action.assignedTo = null; action.assignedAt = null;
+    if (['assigned','validated','on_hold'].includes(String(action.status))) action.status = 'authorized';
+    financeActionEvent(action, action.status, req.user, String((req.body||{}).note || 'Assignment released.'));
+    await dbUpsertFinancialAction(action).catch(()=>{});
+    logAudit(req,'finance_action_assignment_released',{actionId:action.actionId,txId:action.txId});
+    res.json({ok:true,action:financeActionView(action)});
+  });
+
+  app.post('/api/finance/actions/:actionId/validate', requireAuth, requireFinanceOperator, async (req,res)=>{
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    if (!assignedToCurrent(action,req)) return res.status(403).json({error:'Assign this action to yourself before validation.'});
+    const tx = transactions.find(row => String(row.id) === String(action.txId));
+    const checks = financeValidationChecks(action,tx);
+    const blockers = checks.filter(check => !check.ok);
+    action.validation = {checks, blockers:blockers.map(row=>row.key), byPhone:req.user.phone, at:nowIso(), note:String((req.body||{}).note || '')};
+    action.validatedAt = blockers.length ? null : action.validation.at;
+    action.status = blockers.length ? 'on_hold' : 'validated';
+    if (blockers.length) {
+      action.holds = Array.isArray(action.holds) ? action.holds : [];
+      action.holds.push({id:uuid(),reason:'validation_blocked',details:blockers.map(row=>row.detail),at:action.validation.at,byPhone:req.user.phone,status:'open'});
+    }
+    financeActionEvent(action, action.status, req.user, blockers.length ? `Validation blocked: ${blockers.map(row=>row.label).join(', ')}` : 'Instruction validated and ready for the execution phase.');
+    await dbUpsertFinancialAction(action).catch(()=>{});
+    logAudit(req,'finance_action_validated',{actionId:action.actionId,txId:action.txId,passed:!blockers.length,blockers:blockers.map(row=>row.key)});
+    res.status(blockers.length ? 409 : 200).json({ok:!blockers.length,action:financeActionView(action),checks,blockers});
+  });
+
+  app.post('/api/finance/actions/:actionId/note', requireAuth, requireFinanceOperator, async (req,res)=>{
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    if (action.assignedTo && !assignedToCurrent(action,req)) return res.status(403).json({error:'This action is assigned to another Finance Agent.'});
+    const note = String((req.body||{}).note || '').trim();
+    if (!note) return res.status(400).json({error:'Add an internal Finance note.'});
+    action.notes = Array.isArray(action.notes) ? action.notes : [];
+    action.notes.push({id:uuid(),note,at:nowIso(),byPhone:req.user.phone,byRole:req.user.role});
+    financeActionEvent(action, action.status, req.user, note, {kind:'internal_note'});
+    await dbUpsertFinancialAction(action).catch(()=>{});
+    logAudit(req,'finance_action_note_added',{actionId:action.actionId,txId:action.txId});
+    res.json({ok:true,action:financeActionView(action)});
+  });
+
+  console.log('[TutoPay] Finance Workflow Phase 1 API loaded');
 })();
