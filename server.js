@@ -8793,7 +8793,7 @@ const FINANCE_ACTION_TYPES = new Set([
   'duplicate_payment','unmatched_payment','chargeback','fee_variance',
   'manual_adjustment','settlement_batch'
 ]);
-const FINANCE_OPEN_STATUSES = new Set(['authorized','assigned','validated','on_hold','processing','failed','awaiting_reconciliation']);
+const FINANCE_OPEN_STATUSES = new Set(['authorized','assigned','validated','on_hold','awaiting_admin_clarification','processing','failed','awaiting_reconciliation']);
 const FINANCE_EXECUTION_MODE = (() => {
   const value = String(process.env.FINANCE_EXECUTION_MODE || 'disabled').toLowerCase().trim();
   return ['disabled','sandbox_simulation','mtn_sandbox'].includes(value) ? value : 'disabled';
@@ -8994,12 +8994,14 @@ function syncFinancialActionsFromTransactions() {
 function financeValidationChecks(action, tx) {
   const exceptional = !['payout','collection','settlement_batch'].includes(String(action.type));
   const duplicates = financialActions.filter(row => row.actionId !== action.actionId && row.txId === action.txId && row.type === action.type && FINANCE_OPEN_STATUSES.has(String(row.status)));
+  const openActionHolds = (Array.isArray(action.holds) ? action.holds : []).filter(row => String(row.status || 'open') === 'open');
   return [
     {key:'authorization',label:'Valid authorisation',ok:!exceptional || !!(action.authorization && action.authorization.byPhone),detail:exceptional ? 'Admin authorisation is required for this exceptional action.' : 'Routine policy authorisation is permitted.'},
     {key:'amount',label:'Valid amount',ok:Number(action.amount) > 0 && (!tx || Number(action.amount) <= Number(tx.amount || action.amount)),detail:`${action.currency || 'ZMW'} ${Number(action.amount || 0).toFixed(2)}`},
     {key:'beneficiary',label:'Beneficiary available',ok:!!String(action.beneficiaryPhone || '').trim(),detail:String(action.beneficiaryPhone || 'Missing phone')},
     {key:'collection',label:'Original collection confirmed',ok:!tx || String(tx.paymentStatus || '').toLowerCase() === 'paid',detail:tx ? `paymentStatus=${tx.paymentStatus || 'unknown'}` : 'Transaction unavailable'},
     {key:'holds',label:'No active operational hold',ok:!tx || (!tx.riskHold && !tx.complianceHold),detail:tx && (tx.riskHold || tx.complianceHold) ? 'Risk or Compliance hold is active.' : 'No hold recorded.'},
+    {key:'finance_holds',label:'No unresolved Finance hold',ok:openActionHolds.length === 0,detail:openActionHolds.length ? `${openActionHolds.length} Finance hold(s) must be resolved before execution.` : 'No Finance hold recorded.'},
     {key:'duplicate',label:'No duplicate instruction',ok:duplicates.length === 0,detail:duplicates.length ? `${duplicates.length} other open action(s) detected.` : 'No duplicate open action.'},
     {key:'provider',label:'Partner route identified',ok:!!String(action.provider || '').trim() && action.provider !== 'unassigned',detail:String(action.provider || 'Unassigned')},
   ];
@@ -9123,6 +9125,7 @@ async function checkFinancePartnerAction(action) {
     return {
       total:rows.length, authorized:count(['authorized']), validated:count(['validated']),
       processing:count(['processing']), failed:count(['failed','on_hold']),
+      awaitingAdminClarification:count(['awaiting_admin_clarification']),
       awaitingReconciliation:count(['awaiting_reconciliation']), completed:count(['reconciled','completed']),
       unassigned:rows.filter(row => !row.assignedTo && FINANCE_OPEN_STATUSES.has(String(row.status))).length,
       mine:rows.filter(row => String(row.assignedTo || '') === String(me || '') && FINANCE_OPEN_STATUSES.has(String(row.status))).length,
@@ -9177,19 +9180,143 @@ async function checkFinancePartnerAction(action) {
     res.json({ok:true,action:financeActionView(action)});
   });
 
+  app.post('/api/finance/actions/:actionId/hold', requireAuth, requireFinanceOperator, async (req,res)=>{
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    if (!assignedToCurrent(action,req)) return res.status(403).json({error:'Only the assigned Finance Agent can place this instruction on hold.'});
+    if (action.partnerReference || ['processing','awaiting_reconciliation','reconciled','completed'].includes(String(action.status))) {
+      return res.status(409).json({error:'This instruction has already entered partner processing and cannot be placed on a pre-execution hold.'});
+    }
+    const body = req.body || {};
+    const category = String(body.category || 'other').toLowerCase();
+    const note = String(body.note || '').trim();
+    const allowedCategories = ['authorization_ambiguous','amount_mismatch','beneficiary_mismatch','duplicate_risk','partner_route','compliance','other'];
+    if (!allowedCategories.includes(category)) return res.status(400).json({error:'Select a valid hold category.'});
+    if (note.length < 8) return res.status(400).json({error:'Explain the hold reason in at least 8 characters.'});
+    action.holds = Array.isArray(action.holds) ? action.holds : [];
+    const hold = {id:uuid(),reason:'finance_manual_hold',category,note,at:nowIso(),byPhone:req.user.phone,byRole:req.user.role,status:'open',resumableByFinance:true};
+    action.holds.push(hold);
+    action.status = 'on_hold';
+    action.validatedAt = null;
+    financeActionEvent(action,'on_hold',req.user,`Finance hold: ${note}`,{holdId:hold.id,category});
+    const tx = transactions.find(row => String(row.id) === String(action.txId));
+    if (tx && tx.caseReview) {
+      tx.caseReview.status = 'finance_on_hold';
+      tx.caseReview.actions = Array.isArray(tx.caseReview.actions) ? tx.caseReview.actions : [];
+      tx.caseReview.actions.push({id:uuid(),action:'finance_hold',note,at:hold.at,byPhone:req.user.phone,byRole:req.user.role,financeActionId:action.actionId,category});
+      tx.caseReview.updatedAt = hold.at;
+    }
+    await dbUpsertFinancialAction(action).catch(()=>{});
+    if (tx && dbEnabled()) await dbUpsertTransaction(tx).catch(()=>{});
+    logAudit(req,'finance_action_held',{actionId:action.actionId,txId:action.txId,category,note});
+    res.json({ok:true,hold,action:financeActionView(action)});
+  });
+
+  app.post('/api/finance/actions/:actionId/request-admin-clarification', requireAuth, requireFinanceOperator, async (req,res)=>{
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    if (!assignedToCurrent(action,req)) return res.status(403).json({error:'Only the assigned Finance Agent can request clarification.'});
+    if (action.partnerReference || ['processing','awaiting_reconciliation','reconciled','completed'].includes(String(action.status))) {
+      return res.status(409).json({error:'Clarification must be requested before partner execution starts.'});
+    }
+    if (action.clarificationRequest && String(action.clarificationRequest.status) === 'open') {
+      return res.status(409).json({error:'An Admin clarification request is already open.'});
+    }
+    const body = req.body || {};
+    const category = String(body.category || 'authorization_ambiguous').toLowerCase();
+    const question = String(body.question || body.note || '').trim();
+    const allowedCategories = ['authorization_ambiguous','amount_mismatch','beneficiary_mismatch','case_outcome','partner_route','other'];
+    if (!allowedCategories.includes(category)) return res.status(400).json({error:'Select a valid clarification category.'});
+    if (question.length < 8) return res.status(400).json({error:'Ask a clear question of at least 8 characters.'});
+    const request = {id:uuid(),status:'open',category,question,requestedAt:nowIso(),requestedByPhone:req.user.phone,requestedByRole:req.user.role,response:null};
+    action.clarificationHistory = Array.isArray(action.clarificationHistory) ? action.clarificationHistory : [];
+    action.clarificationHistory.push(request);
+    action.clarificationRequest = request;
+    action.status = 'awaiting_admin_clarification';
+    action.validatedAt = null;
+    financeActionEvent(action,'awaiting_admin_clarification',req.user,question,{clarificationId:request.id,category});
+    const tx = transactions.find(row => String(row.id) === String(action.txId));
+    if (tx && tx.caseReview) {
+      tx.caseReview.status = 'awaiting_admin_finance_clarification';
+      tx.caseReview.actions = Array.isArray(tx.caseReview.actions) ? tx.caseReview.actions : [];
+      tx.caseReview.actions.push({id:uuid(),action:'finance_clarification_requested',note:question,at:request.requestedAt,byPhone:req.user.phone,byRole:req.user.role,financeActionId:action.actionId,category});
+      tx.caseReview.updatedAt = request.requestedAt;
+    }
+    await dbUpsertFinancialAction(action).catch(()=>{});
+    if (tx && dbEnabled()) await dbUpsertTransaction(tx).catch(()=>{});
+    logAudit(req,'finance_admin_clarification_requested',{actionId:action.actionId,txId:action.txId,clarificationId:request.id,category,question});
+    res.json({ok:true,request,action:financeActionView(action)});
+  });
+
+  app.post('/api/finance/actions/:actionId/admin-clarification', requireAuth, async (req,res)=>{
+    if (financeRole(req.user && req.user.role) !== 'admin') return res.status(403).json({error:'Admin access required.'});
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    const request = action.clarificationRequest;
+    if (!request || String(request.status) !== 'open') return res.status(409).json({error:'No open Finance clarification request exists for this instruction.'});
+    const body = req.body || {};
+    const direction = String(body.direction || '').toLowerCase();
+    const note = String(body.note || '').trim();
+    if (!['confirm_proceed','keep_on_hold'].includes(direction)) return res.status(400).json({error:'Choose confirm_proceed or keep_on_hold.'});
+    if (note.length < 8) return res.status(400).json({error:'Add a clear Admin response of at least 8 characters.'});
+    const respondedAt = nowIso();
+    request.status = 'answered';
+    request.response = {direction,note,at:respondedAt,byPhone:req.user.phone,byRole:req.user.role};
+    action.clarificationRequest = request;
+    action.validatedAt = null;
+    action.holds = Array.isArray(action.holds) ? action.holds : [];
+    if (direction === 'confirm_proceed') {
+      action.holds.forEach(hold => {
+        if (String(hold.status || 'open') === 'open' && (hold.category === request.category || hold.resumableByFinance === false)) {
+          hold.status = 'resolved'; hold.resolvedAt = respondedAt; hold.resolvedByPhone = req.user.phone; hold.resolutionNote = note;
+        }
+      });
+      action.status = action.assignedTo ? 'assigned' : 'authorized';
+    } else {
+      action.status = 'on_hold';
+      action.holds.push({id:uuid(),reason:'admin_direction',category:request.category,note,at:respondedAt,byPhone:req.user.phone,byRole:req.user.role,status:'open',resumableByFinance:false});
+    }
+    financeActionEvent(action,action.status,req.user,note,{clarificationId:request.id,direction});
+    const tx = transactions.find(row => String(row.id) === String(action.txId));
+    if (tx && tx.caseReview) {
+      tx.caseReview.status = direction === 'confirm_proceed' ? 'awaiting_finance_execution' : 'finance_on_hold';
+      tx.caseReview.actions = Array.isArray(tx.caseReview.actions) ? tx.caseReview.actions : [];
+      tx.caseReview.actions.push({id:uuid(),action:'admin_finance_clarification_response',note,at:respondedAt,byPhone:req.user.phone,byRole:req.user.role,financeActionId:action.actionId,direction});
+      tx.caseReview.updatedAt = respondedAt;
+    }
+    await dbUpsertFinancialAction(action).catch(()=>{});
+    if (tx && dbEnabled()) await dbUpsertTransaction(tx).catch(()=>{});
+    logAudit(req,'finance_admin_clarification_answered',{actionId:action.actionId,txId:action.txId,clarificationId:request.id,direction,note});
+    res.json({ok:true,request,action:financeActionView(action)});
+  });
+
   app.post('/api/finance/actions/:actionId/validate', requireAuth, requireFinanceOperator, async (req,res)=>{
     const action = findFinancialActionById(req.params.actionId);
     if (!action) return res.status(404).json({error:'Financial action not found.'});
     if (!assignedToCurrent(action,req)) return res.status(403).json({error:'Assign this action to yourself before validation.'});
+    if (String(action.status) === 'awaiting_admin_clarification') return res.status(409).json({error:'Wait for Admin to answer the open clarification request.'});
+    const body = req.body || {};
+    if (String(action.status) === 'on_hold') {
+      if (body.resume !== true) return res.status(409).json({error:'Confirm that you are resuming this held instruction before revalidation.'});
+      const resumeNote = String(body.note || '').trim();
+      if (resumeNote.length < 8) return res.status(400).json({error:'Add a clear resume note of at least 8 characters.'});
+      const blockingAdminHolds = (Array.isArray(action.holds) ? action.holds : []).filter(row => String(row.status || 'open') === 'open' && row.resumableByFinance === false);
+      if (blockingAdminHolds.length) return res.status(409).json({error:'Admin kept this instruction on hold. Request a new Admin clarification before resuming.'});
+      (Array.isArray(action.holds) ? action.holds : []).forEach(hold => {
+        if (String(hold.status || 'open') === 'open' && hold.resumableByFinance !== false) {
+          hold.status = 'resolved'; hold.resolvedAt = nowIso(); hold.resolvedByPhone = req.user.phone; hold.resolutionNote = resumeNote;
+        }
+      });
+    }
     const tx = transactions.find(row => String(row.id) === String(action.txId));
     const checks = financeValidationChecks(action,tx);
     const blockers = checks.filter(check => !check.ok);
-    action.validation = {checks, blockers:blockers.map(row=>row.key), byPhone:req.user.phone, at:nowIso(), note:String((req.body||{}).note || '')};
+    action.validation = {checks, blockers:blockers.map(row=>row.key), byPhone:req.user.phone, at:nowIso(), note:String(body.note || '')};
     action.validatedAt = blockers.length ? null : action.validation.at;
     action.status = blockers.length ? 'on_hold' : 'validated';
     if (blockers.length) {
       action.holds = Array.isArray(action.holds) ? action.holds : [];
-      action.holds.push({id:uuid(),reason:'validation_blocked',details:blockers.map(row=>row.detail),at:action.validation.at,byPhone:req.user.phone,status:'open'});
+      action.holds.push({id:uuid(),reason:'validation_blocked',category:'validation',details:blockers.map(row=>row.detail),at:action.validation.at,byPhone:req.user.phone,status:'open',resumableByFinance:true});
     }
     financeActionEvent(action, action.status, req.user, blockers.length ? `Validation blocked: ${blockers.map(row=>row.label).join(', ')}` : 'Instruction validated and ready for the execution phase.');
     await dbUpsertFinancialAction(action).catch(()=>{});
