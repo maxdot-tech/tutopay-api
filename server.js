@@ -369,6 +369,7 @@ const MOMO_BASE_URL = process.env.MOMO_BASE_URL || "https://sandbox.momodevelope
 const MOMO_CURRENCY = process.env.MOMO_CURRENCY || "ZMW";
 const PUBLIC_API_BASE = process.env.PUBLIC_API_BASE || process.env.API_PUBLIC_BASE || "https://api.tutopay.online";
 const MOMO_CALLBACK_URL = process.env.MOMO_CALLBACK_URL || `${PUBLIC_API_BASE}/api/callbacks/mtn/collection`;
+const MOMO_DISBURSEMENT_CALLBACK_URL = process.env.MOMO_DISBURSEMENT_CALLBACK_URL || `${PUBLIC_API_BASE}/api/callbacks/mtn/payout`;
 
 const MTN_CALLBACK_SECRET = String(process.env.MTN_CALLBACK_SECRET || process.env.CALLBACK_SHARED_SECRET || "").trim();
 const AIRTEL_CALLBACK_SECRET = String(process.env.AIRTEL_CALLBACK_SECRET || process.env.CALLBACK_SHARED_SECRET || "").trim();
@@ -411,6 +412,7 @@ function findTxByAnyReference(ref) {
   return transactions.find((t) =>
     String(t.paymentRef || "") === sref ||
     String((t.disbursement && t.disbursement.referenceId) || "") === sref ||
+    String((t.refundExecution && t.refundExecution.referenceId) || "") === sref ||
     String(t.id || "") === sref
   ) || null;
 }
@@ -640,7 +642,7 @@ function momoNormalizeMsisdn(input) {
   return s.replace(/\D+/g, "");
 }
 
-async function momoDisburseTransfer({ amount, currency, payeeMsisdn, externalId, payerMessage, payeeNote }) {
+async function momoDisburseTransfer({ amount, currency, payeeMsisdn, externalId, payerMessage, payeeNote, referenceId: suppliedReferenceId }) {
   momoAssertEnv([
     "MOMO_BASE_URL",
     "MOMO_TARGET_ENV",
@@ -650,7 +652,7 @@ async function momoDisburseTransfer({ amount, currency, payeeMsisdn, externalId,
   ]);
 
   const token = await momoGetToken("disbursement");
-  const referenceId = uuid();
+  const referenceId = suppliedReferenceId || uuid();
 
   const url = `${process.env.MOMO_BASE_URL}/disbursement/v1_0/transfer`;
   const targetEnv = (process.env.MOMO_TARGET_ENV || "sandbox").trim();
@@ -676,8 +678,8 @@ async function momoDisburseTransfer({ amount, currency, payeeMsisdn, externalId,
   };
 
   // optional, only if you have a public callback endpoint
-  if (process.env.MOMO_CALLBACK_URL) {
-    headers["X-Callback-Url"] = process.env.MOMO_CALLBACK_URL;
+  if (MOMO_DISBURSEMENT_CALLBACK_URL) {
+    headers["X-Callback-Url"] = MOMO_DISBURSEMENT_CALLBACK_URL;
   }
 
   const resp = await momoFetchJson(url, {
@@ -770,7 +772,13 @@ function processProviderCallback(req, res, provider, kind) {
     applyCollectionCallbackUpdate(tx, provider, normStatus, reference, info.raw);
     logAudit(req, "callback_collection_processed", { provider, txId: tx.id, reference, status: normStatus });
   } else {
-    applyPayoutCallbackUpdate(tx, normStatus, reference, info.raw);
+    const financeAction = findFinancialActionByPartnerReference(reference);
+    if (financeAction && ['refund','partial_refund','reversal'].includes(String(financeAction.type))) {
+      applyFinancePartnerResult(financeAction, tx, normStatus, reference, info.raw, {phone:'system',role:'system'});
+    } else {
+      applyPayoutCallbackUpdate(tx, normStatus, reference, info.raw);
+      if (financeAction) applyFinancePartnerResult(financeAction, tx, normStatus, reference, info.raw, {phone:'system',role:'system'});
+    }
     logAudit(req, "callback_payout_processed", { provider, txId: tx.id, reference, status: normStatus });
   }
 
@@ -1235,6 +1243,7 @@ function ensureTxReconDefaults(tx) {
   if (!tx || typeof tx !== "object") return tx;
   if (typeof tx.collectionReconciled !== "boolean") tx.collectionReconciled = false;
   if (typeof tx.payoutReconciled !== "boolean") tx.payoutReconciled = false;
+  if (typeof tx.refundReconciled !== "boolean") tx.refundReconciled = false;
   if (!Array.isArray(tx.reconNotes)) tx.reconNotes = [];
   if (!tx.reconUpdatedAt) tx.reconUpdatedAt = null;
   return tx;
@@ -3348,9 +3357,10 @@ app.post("/api/transactions/:id/payout", requireAuth, payoutLimiter, idempotency
   const tx = transactions.find((t) => String(t.id) === id);
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
 
-  // Only allow seller (or admin) to request payout
-  if (req.user.role !== "admin" && req.user.phone !== tx.toPhone) {
-    return res.status(403).json({ error: "Not allowed" });
+  // Phase 2 segregation of duties: users and Admin approve workflow outcomes;
+  // only Finance sends a validated instruction to the licensed partner rail.
+  if (String(req.user.role || "").toLowerCase() !== "finance_agent") {
+    return res.status(403).json({ error: "Payout execution is restricted to the Finance action queue." });
   }
 
   if (tx.status !== "completed") {
@@ -4390,14 +4400,14 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   ensureTxReconDefaults(tx);
 
   const body = req.body || {};
-  const target = String(body.target || "").toLowerCase(); // collection | payout | both
+  const target = String(body.target || "").toLowerCase(); // collection | payout | refund | both
   const status = String(body.status || "reconciled").toLowerCase(); // reconciled | unreconciled
   const note = body.note ? String(body.note) : "";
 
   const val = status === "reconciled";
 
-  if (!["collection","payout","both"].includes(target)) {
-    return res.status(400).json({ error: "target must be collection, payout, or both" });
+  if (!["collection","payout","refund","both"].includes(target)) {
+    return res.status(400).json({ error: "target must be collection, payout, refund, or both" });
   }
   if (!["reconciled","unreconciled"].includes(status)) {
     return res.status(400).json({ error: "status must be reconciled or unreconciled" });
@@ -4412,9 +4422,34 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   if (status === "reconciled" && (target === "payout" || target === "both") && String((tx.disbursement && tx.disbursement.status) || "").toLowerCase() !== "successful") {
     return res.status(409).json({ error: "Payout cannot be reconciled until the partner confirms it as successful." });
   }
+  const refundAction = financialActions.find(row => String(row.txId) === String(tx.id) &&
+    ['refund','partial_refund','reversal'].includes(String(row.type)) &&
+    ['awaiting_reconciliation','reconciled'].includes(String(row.status))) || null;
+  if (status === "reconciled" && target === "refund" && (!refundAction || String(tx.refundExecution && tx.refundExecution.status || '').toLowerCase() !== 'successful')) {
+    return res.status(409).json({ error: "Refund cannot be reconciled until the licensed partner confirms it as successful." });
+  }
 
   if (target === "collection" || target === "both") tx.collectionReconciled = val;
   if (target === "payout" || target === "both") tx.payoutReconciled = val;
+  if (target === "refund") {
+    tx.refundReconciled = val;
+    if (refundAction) {
+      refundAction.status = val ? 'reconciled' : 'awaiting_reconciliation';
+      refundAction.reconciliationStatus = val ? 'reconciled' : 'pending';
+      refundAction.reconciliation = {status:val ? 'reconciled' : 'reopened',at:nowIso(),byPhone:req.user.phone,note};
+      financeActionEvent(refundAction,refundAction.status,req.user,val ? 'Accounts reconciled the confirmed refund.' : 'Accounts reopened the refund reconciliation.',{txId:tx.id});
+      persistFinancialAction(refundAction);
+    }
+    if (val) {
+      if (tx.dispute) { tx.dispute.status = 'refunded'; tx.dispute.resolvedAt = nowIso(); }
+      if (tx.caseReview) tx.caseReview.status = 'resolved';
+      markPartnerProcessing(tx,{refundStatus:'reconciled'});
+    } else {
+      if (tx.dispute) tx.dispute.status = 'refund_executed_pending_reconciliation';
+      if (tx.caseReview) tx.caseReview.status = 'refund_executed_pending_reconciliation';
+      markPartnerProcessing(tx,{refundStatus:'successful_pending_reconciliation'});
+    }
+  }
   tx.reconUpdatedAt = nowIso();
   if (note) tx.reconNotes.push({ at: tx.reconUpdatedAt, by: req.user.phone, target, status, note });
 
@@ -4428,6 +4463,7 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
     txId: tx.id, target, status, note,
     collectionReconciled: tx.collectionReconciled,
     payoutReconciled: tx.payoutReconciled,
+    refundReconciled: tx.refundReconciled,
   });
 
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
@@ -4436,6 +4472,7 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
     txId: tx.id,
     collectionReconciled: tx.collectionReconciled,
     payoutReconciled: tx.payoutReconciled,
+    refundReconciled: tx.refundReconciled,
     reconUpdatedAt: tx.reconUpdatedAt,
     reconNotes: tx.reconNotes,
   });
@@ -8443,6 +8480,30 @@ const FINANCE_ACTION_TYPES = new Set([
   'manual_adjustment','settlement_batch'
 ]);
 const FINANCE_OPEN_STATUSES = new Set(['authorized','assigned','validated','on_hold','processing','failed','awaiting_reconciliation']);
+const FINANCE_EXECUTION_MODE = (() => {
+  const value = String(process.env.FINANCE_EXECUTION_MODE || 'disabled').toLowerCase().trim();
+  return ['disabled','sandbox_simulation','mtn_sandbox'].includes(value) ? value : 'disabled';
+})();
+const FINANCE_RAIL_TYPES = new Set(['payout','payout_retry','refund','partial_refund','reversal']);
+const FINANCE_REFUND_SANDBOX_ROUTE = String(process.env.FINANCE_REFUND_SANDBOX_ROUTE || 'disabled').toLowerCase().trim();
+
+function financeExecutionProfile() {
+  if (FINANCE_EXECUTION_MODE === 'disabled') {
+    return {enabled:false,mode:'disabled',sandboxOnly:true,supportedTypes:[],reason:'Partner execution is disabled until FINANCE_EXECUTION_MODE is explicitly configured.'};
+  }
+  if (FINANCE_EXECUTION_MODE === 'sandbox_simulation') {
+    return {enabled:true,mode:'sandbox_simulation',sandboxOnly:true,supportedTypes:Array.from(FINANCE_RAIL_TYPES),reason:'Controlled simulation; no external partner is called and no money moves.'};
+  }
+  const target = String(process.env.MOMO_TARGET_ENV || 'sandbox').toLowerCase().trim();
+  const base = String(process.env.MOMO_BASE_URL || MOMO_BASE_URL || '').toLowerCase();
+  const sandboxSafe = target === 'sandbox' && base.includes('sandbox');
+  const supported = ['payout','payout_retry'];
+  if (FINANCE_REFUND_SANDBOX_ROUTE === 'disbursement') supported.push('refund','partial_refund','reversal');
+  return {
+    enabled:sandboxSafe, mode:'mtn_sandbox', sandboxOnly:true, supportedTypes:supported,
+    reason:sandboxSafe ? 'MTN sandbox partner execution is enabled.' : 'MTN sandbox mode requires MOMO_TARGET_ENV=sandbox and a sandbox MOMO_BASE_URL.'
+  };
+}
 
 function financeRole(value) {
   return String(value || '').toLowerCase().trim();
@@ -8543,12 +8604,16 @@ function authorizeRefundFinancialAction(req, tx, opts={}) {
 }
 function financeTxSnapshot(tx) {
   if (!tx) return null;
+  const snap = tx.itemSnapshot || {};
+  const catalogItem = items.find(item => String(item && item.code || '') === String(tx.itemCode || snap.code || '')) || null;
+  const imageCandidate = snap.imageUrl ||
+    (Array.isArray(snap.imageUrls) && snap.imageUrls[0]) ||
+    (Array.isArray(snap.images) && snap.images[0]) ||
+    (catalogItem && (catalogItem.imageUrl || (Array.isArray(catalogItem.imageUrls) && catalogItem.imageUrls[0]))) || null;
   return {
     id:tx.id, recordNo:tx.recordNo || null, itemCode:tx.itemCode || (tx.itemSnapshot && tx.itemSnapshot.code) || null,
-    itemTitle:(tx.itemSnapshot && tx.itemSnapshot.title) || null,
-    itemImage:(tx.itemSnapshot && (tx.itemSnapshot.imageUrl ||
-      (Array.isArray(tx.itemSnapshot.imageUrls) && tx.itemSnapshot.imageUrls[0]) ||
-      (Array.isArray(tx.itemSnapshot.images) && tx.itemSnapshot.images[0]))) || null,
+    itemTitle:snap.title || (catalogItem && (catalogItem.title || catalogItem.name)) || null,
+    itemImage:imageCandidate,
     buyerPhone:tx.fromPhone || null, sellerPhone:tx.toPhone || null,
     amount:Number(tx.amount || 0) || 0, currency:tx.currency || 'ZMW',
     status:tx.status || null, paymentStatus:tx.paymentStatus || null,
@@ -8557,6 +8622,8 @@ function financeTxSnapshot(tx) {
     payoutReference:(tx.disbursement && tx.disbursement.referenceId) || null,
     disputeActive:!!tx.disputeActive, riskHold:!!tx.riskHold, complianceHold:!!tx.complianceHold,
     collectionReconciled:!!tx.collectionReconciled, payoutReconciled:!!tx.payoutReconciled,
+    refundReconciled:!!tx.refundReconciled,
+    refundReference:(tx.refundExecution && tx.refundExecution.referenceId) || null,
     createdAt:tx.createdAt || null, paidAt:tx.paidAt || null, completedAt:tx.completedAt || null,
   };
 }
@@ -8622,6 +8689,115 @@ function financeValidationChecks(action, tx) {
   ];
 }
 
+function findFinancialActionByPartnerReference(reference) {
+  const ref = String(reference || '').trim();
+  if (!ref) return null;
+  return financialActions.find(row => String(row.partnerReference || '') === ref ||
+    String(row.partnerExecution && row.partnerExecution.referenceId || '') === ref) || null;
+}
+function financePartnerPayload(raw) {
+  if (!raw || typeof raw !== 'object') return raw || null;
+  const safe = {};
+  ['status','reason','financialTransactionId','externalId','referenceId'].forEach(key => {
+    if (raw[key] != null) safe[key] = raw[key];
+  });
+  return safe;
+}
+function applyFinancePartnerResult(action, tx, rawStatus, reference, raw, actor={phone:'system',role:'system'}) {
+  if (!action || !tx) return null;
+  const normalized = normalizeCallbackStatus(rawStatus, 'mtn');
+  const previous = String(action.status || '');
+  const next = normalized === 'SUCCESSFUL' ? 'awaiting_reconciliation' : (normalized === 'FAILED' ? 'failed' : 'processing');
+  const at = nowIso();
+  action.status = next;
+  action.partnerReference = String(reference || action.partnerReference || '');
+  action.partnerResult = {status:normalized,at,referenceId:action.partnerReference,raw:financePartnerPayload(raw)};
+  action.reconciliationStatus = normalized === 'SUCCESSFUL' ? 'pending' : 'not_started';
+
+  if (['payout','payout_retry'].includes(String(action.type))) {
+    tx.disbursement = Object.assign({}, tx.disbursement || {}, {
+      referenceId:action.partnerReference,
+      status:normalized === 'SUCCESSFUL' ? 'successful' : (normalized === 'FAILED' ? 'failed' : 'pending'),
+      financeActionId:action.actionId,
+      updatedAt:Date.now(),
+    });
+    tx.payoutReconciled = false;
+    markPartnerProcessing(tx, {
+      payoutStatus:normalized, lastPayoutReference:action.partnerReference,
+      lastPayoutCheckAt:at, settlementStatus:normalized === 'SUCCESSFUL' ? 'awaiting_reconciliation' : normalized.toLowerCase()
+    });
+  } else if (['refund','partial_refund','reversal'].includes(String(action.type))) {
+    tx.refundExecution = Object.assign({}, tx.refundExecution || {}, {
+      referenceId:action.partnerReference, financeActionId:action.actionId,
+      status:normalized === 'SUCCESSFUL' ? 'successful' : (normalized === 'FAILED' ? 'failed' : 'pending'),
+      updatedAt:at,
+    });
+    tx.refundReconciled = false;
+    markPartnerProcessing(tx, {
+      refundStatus:normalized === 'SUCCESSFUL' ? 'successful_pending_reconciliation' : normalized.toLowerCase(),
+      lastRefundReference:action.partnerReference, lastRefundCheckAt:at
+    });
+    if (normalized === 'SUCCESSFUL') {
+      tx.status = String(action.type) === 'partial_refund' ? 'partially_refunded' : 'refunded';
+      if (tx.dispute) {
+        tx.dispute.status = 'refund_executed_pending_reconciliation';
+        tx.dispute.refundExecutedAt = at;
+        tx.dispute.refundReference = action.partnerReference;
+      }
+      if (tx.caseReview) tx.caseReview.status = 'refund_executed_pending_reconciliation';
+    }
+  }
+
+  if (previous !== next || String(action.partnerResult && action.partnerResult.status || '') !== normalized) {
+    financeActionEvent(action, next, actor, normalized === 'SUCCESSFUL'
+      ? 'Licensed-partner result confirmed. Awaiting Accounts reconciliation.'
+      : (normalized === 'FAILED' ? 'Licensed-partner execution failed; Finance review is required.' : 'Licensed partner is processing the instruction.'),
+      {partnerReference:action.partnerReference,partnerStatus:normalized});
+    recordLedger(null, tx, 'finance_partner_result', {
+      reference:action.partnerReference, provider:action.provider, amount:action.amount, currency:action.currency,
+      actorPhone:String(actor.phone || 'system'), actorRole:String(actor.role || 'system'),
+      notes:`Finance action ${action.actionId} partner status ${normalized}`,
+      meta:{actionId:action.actionId,type:action.type,status:normalized}
+    });
+  }
+  persistFinancialAction(action);
+  if (dbEnabled()) dbUpsertTransaction(tx).catch(()=>{});
+  return action;
+}
+async function executeFinancePartnerAction(action, tx) {
+  const profile = financeExecutionProfile();
+  if (!profile.enabled) {
+    const error = new Error(profile.reason); error.statusCode = 409; throw error;
+  }
+  if (!profile.supportedTypes.includes(String(action.type))) {
+    const error = new Error(`The ${action.type} adapter is not enabled in ${profile.mode} mode.`); error.statusCode = 409; throw error;
+  }
+  if (profile.mode === 'sandbox_simulation') {
+    return {referenceId:String(action.executionAttempt && action.executionAttempt.referenceId || `SIM-${uuid()}`),adapter:'sandbox_simulation',raw:{status:'PENDING'}};
+  }
+  const result = await momoDisburseTransfer({
+    amount:action.amount, currency:action.currency,
+    payeeMsisdn:action.beneficiaryPhone,
+    externalId:String(action.actionId),
+    payerMessage:`TutoPay ${String(action.type).replace(/_/g,' ')} ${action.actionId}`,
+    payeeNote:`TutoPay ${String(action.type).replace(/_/g,' ')} for ${tx.id}`,
+    referenceId:action.executionAttempt && action.executionAttempt.referenceId,
+  });
+  return {referenceId:result.referenceId,adapter:'mtn_sandbox_disbursement',raw:result.response || null};
+}
+async function checkFinancePartnerAction(action) {
+  const profile = financeExecutionProfile();
+  if (!profile.enabled) {
+    const error = new Error(profile.reason); error.statusCode = 409; throw error;
+  }
+  if (profile.mode === 'sandbox_simulation') {
+    const status = String(process.env.FINANCE_SIMULATION_RESULT || 'SUCCESSFUL').toUpperCase();
+    return {status:['SUCCESSFUL','FAILED','PENDING'].includes(status) ? status : 'SUCCESSFUL',raw:{status,simulation:true}};
+  }
+  const raw = await momoGetTransferStatus(action.partnerReference);
+  return {status:String(raw && raw.status || 'PENDING').toUpperCase(),raw};
+}
+
 (function TP_FINANCE_WORKFLOW_PHASE1_API(){
   function requireFinanceRead(req,res,next){ if (!financeCanRead(req)) return res.status(403).json({error:'Finance, Accounts or Admin access required.'}); next(); }
   function requireFinanceOperator(req,res,next){ if (!financeCanOperate(req)) return res.status(403).json({error:'Finance Agent access required.'}); next(); }
@@ -8648,14 +8824,16 @@ function financeValidationChecks(action, tx) {
     if (status) rows = rows.filter(row => String(row.status) === status);
     if (q) rows = rows.filter(row => [row.actionId,row.txId,row.caseId,row.type,row.status,row.beneficiaryPhone,row.provider].some(value => String(value || '').toLowerCase().includes(q)));
     rows.sort((a,b)=>Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0));
-    res.json({ok:true, phase:'assignment_and_validation', executionEnabled:false, summary:summary(rows, req.user.phone), actions:rows.slice(0,1000).map(financeActionView)});
+    const executionProfile = financeExecutionProfile();
+    res.json({ok:true, phase:'partner_execution_and_reconciliation', executionEnabled:executionProfile.enabled, executionProfile, summary:summary(rows, req.user.phone), actions:rows.slice(0,1000).map(financeActionView)});
   });
 
   app.get('/api/finance/actions/:actionId', requireAuth, requireFinanceRead, (req,res)=>{
     syncFinancialActionsFromTransactions();
     const action = findFinancialActionById(req.params.actionId);
     if (!action) return res.status(404).json({error:'Financial action not found.'});
-    res.json({ok:true, executionEnabled:false, action:financeActionView(action)});
+    const executionProfile = financeExecutionProfile();
+    res.json({ok:true, executionEnabled:executionProfile.enabled, executionProfile, action:financeActionView(action)});
   });
 
   app.post('/api/finance/actions/:actionId/assign', requireAuth, requireFinanceOperator, async (req,res)=>{
@@ -8703,6 +8881,85 @@ function financeValidationChecks(action, tx) {
     res.status(blockers.length ? 409 : 200).json({ok:!blockers.length,action:financeActionView(action),checks,blockers});
   });
 
+  app.post('/api/finance/actions/:actionId/execute', requireAuth, requireFinanceOperator, payoutLimiter, async (req,res)=>{
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    if (!assignedToCurrent(action,req)) return res.status(403).json({error:'Only the assigned Finance Agent can execute this action.'});
+    if (String(action.status) !== 'validated') return res.status(409).json({error:'Run and pass validation immediately before execution.'});
+    if (action.partnerReference || (action.executionAttempt && ['submitting','accepted'].includes(String(action.executionAttempt.status)))) {
+      return res.status(409).json({error:'This action already has a partner execution attempt. Check its status instead of resubmitting.'});
+    }
+    const body = req.body || {};
+    const note = String(body.note || '').trim();
+    const confirmation = String(body.confirmation || '').trim();
+    if (note.length < 8) return res.status(400).json({error:'Add a clear execution note of at least 8 characters.'});
+    if (confirmation !== String(action.actionId)) return res.status(400).json({error:'Execution confirmation did not match the Finance action number.'});
+    const tx = transactions.find(row => String(row.id) === String(action.txId));
+    if (!tx) return res.status(404).json({error:'Linked transaction not found.'});
+    const checks = financeValidationChecks(action,tx);
+    const blockers = checks.filter(check => !check.ok);
+    if (blockers.length) return res.status(409).json({error:'Execution stopped because validation is no longer current.',blockers:blockers.map(row=>row.label),checks});
+
+    const profile = financeExecutionProfile();
+    if (!profile.enabled) return res.status(409).json({error:profile.reason,executionProfile:profile});
+    if (!profile.supportedTypes.includes(String(action.type))) return res.status(409).json({error:`The ${action.type} adapter is not enabled in ${profile.mode} mode.`,executionProfile:profile});
+    const attemptReference = profile.mode === 'sandbox_simulation' ? `SIM-${uuid()}` : uuid();
+    action.executionAttempt = {id:uuid(),referenceId:attemptReference,mode:profile.mode,status:'submitting',at:nowIso(),byPhone:req.user.phone,note};
+    action.status = 'processing';
+    financeActionEvent(action,'processing',req.user,'Execution submitted to the configured licensed-partner adapter.',{mode:profile.mode,attemptReference});
+    await dbUpsertFinancialAction(action).catch(()=>{});
+
+    try {
+      const result = await executeFinancePartnerAction(action,tx);
+      action.partnerReference = result.referenceId;
+      action.partnerExecution = {referenceId:result.referenceId,adapter:result.adapter,status:'accepted',submittedAt:nowIso(),submittedByPhone:req.user.phone,note};
+      action.executionAttempt.status = 'accepted';
+      if (['payout','payout_retry'].includes(String(action.type))) {
+        tx.disbursement = Object.assign({},tx.disbursement||{},{referenceId:result.referenceId,status:'pending',financeActionId:action.actionId,startedAt:Date.now(),processedBy:'licensed_partner'});
+        tx.payoutReconciled = false;
+        markPartnerProcessing(tx,{payoutStatus:'pending',provider:action.provider,payoutInitiatedAt:nowIso(),lastPayoutReference:result.referenceId});
+      } else {
+        tx.refundExecution = {referenceId:result.referenceId,status:'pending',financeActionId:action.actionId,startedAt:nowIso(),processedBy:'licensed_partner'};
+        tx.refundReconciled = false;
+        markPartnerProcessing(tx,{refundStatus:'pending',provider:action.provider,lastRefundReference:result.referenceId});
+      }
+      recordLedger(req,tx,'finance_partner_execution_submitted',{reference:result.referenceId,provider:action.provider,amount:action.amount,currency:action.currency,notes:note,meta:{actionId:action.actionId,type:action.type,mode:profile.mode}});
+      await dbUpsertFinancialAction(action).catch(()=>{});
+      if (dbEnabled()) await dbUpsertTransaction(tx).catch(()=>{});
+      logAudit(req,'finance_partner_execution_submitted',{actionId:action.actionId,txId:tx.id,type:action.type,referenceId:result.referenceId,mode:profile.mode});
+      return res.json({ok:true,action:financeActionView(action),executionProfile:profile});
+    } catch (error) {
+      action.status = 'failed';
+      action.executionAttempt.status = 'failed';
+      action.executionAttempt.error = String(error && error.message || error);
+      financeActionEvent(action,'failed',req.user,'Partner submission failed. Review the error before creating any retry.',{error:action.executionAttempt.error});
+      await dbUpsertFinancialAction(action).catch(()=>{});
+      logAudit(req,'finance_partner_execution_failed',{actionId:action.actionId,txId:action.txId,error:action.executionAttempt.error});
+      return res.status(Number(error && error.statusCode) || 502).json({error:action.executionAttempt.error,action:financeActionView(action)});
+    }
+  });
+
+  app.post('/api/finance/actions/:actionId/check-status', requireAuth, requireFinanceOperator, async (req,res)=>{
+    const action = findFinancialActionById(req.params.actionId);
+    if (!action) return res.status(404).json({error:'Financial action not found.'});
+    if (!assignedToCurrent(action,req)) return res.status(403).json({error:'Only the assigned Finance Agent can check this action.'});
+    if (!action.partnerReference) return res.status(409).json({error:'No partner reference is attached to this action.'});
+    if (!['processing','failed'].includes(String(action.status))) return res.status(409).json({error:'Partner status checking is only available for processing or failed actions.'});
+    const tx = transactions.find(row => String(row.id) === String(action.txId));
+    if (!tx) return res.status(404).json({error:'Linked transaction not found.'});
+    try {
+      const result = await checkFinancePartnerAction(action);
+      applyFinancePartnerResult(action,tx,result.status,action.partnerReference,result.raw,req.user);
+      await dbUpsertFinancialAction(action).catch(()=>{});
+      if (dbEnabled()) await dbUpsertTransaction(tx).catch(()=>{});
+      logAudit(req,'finance_partner_status_checked',{actionId:action.actionId,txId:tx.id,referenceId:action.partnerReference,status:action.partnerResult && action.partnerResult.status});
+      return res.json({ok:true,action:financeActionView(action)});
+    } catch (error) {
+      logAudit(req,'finance_partner_status_check_failed',{actionId:action.actionId,txId:action.txId,error:String(error && error.message || error)});
+      return res.status(Number(error && error.statusCode) || 502).json({error:String(error && error.message || error)});
+    }
+  });
+
   app.post('/api/finance/actions/:actionId/note', requireAuth, requireFinanceOperator, async (req,res)=>{
     const action = findFinancialActionById(req.params.actionId);
     if (!action) return res.status(404).json({error:'Financial action not found.'});
@@ -8717,5 +8974,5 @@ function financeValidationChecks(action, tx) {
     res.json({ok:true,action:financeActionView(action)});
   });
 
-  console.log('[TutoPay] Finance Workflow Phase 1 API loaded');
+  console.log(`[TutoPay] Finance Workflow Phase 2 API loaded (${FINANCE_EXECUTION_MODE})`);
 })();
