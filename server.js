@@ -799,7 +799,7 @@ app.post("/api/callbacks/mtn/payout", (req, res) => processProviderCallback(req,
 app.post("/api/callbacks/airtel/collection", (req, res) => processProviderCallback(req, res, "airtel", "collection"));
 
 // ===== Dispute document uploads (Multer) =====
-const uploadDir = path.join(__dirname, "uploads");
+const uploadDir = path.resolve(String(process.env.UPLOAD_DIR || path.join(__dirname, "uploads")));
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
 }
@@ -834,7 +834,41 @@ function extFromMime(mime) {
 }
 
 function cloudinaryConfigured() {
-  return !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
+  return !!cloudinaryConfig();
+}
+
+function cloudinaryConfig() {
+  const explicit = {
+    cloudName:String(process.env.CLOUDINARY_CLOUD_NAME || "").trim(),
+    apiKey:String(process.env.CLOUDINARY_API_KEY || "").trim(),
+    apiSecret:String(process.env.CLOUDINARY_API_SECRET || "").trim(),
+  };
+  if (explicit.cloudName && explicit.apiKey && explicit.apiSecret) return explicit;
+  const connectionUrl = String(process.env.CLOUDINARY_URL || "").trim();
+  if (!connectionUrl) return null;
+  try {
+    const parsed = new URL(connectionUrl);
+    if (parsed.protocol !== "cloudinary:") return null;
+    const fromUrl = {
+      cloudName:decodeURIComponent(parsed.hostname || "").trim(),
+      apiKey:decodeURIComponent(parsed.username || "").trim(),
+      apiSecret:decodeURIComponent(parsed.password || "").trim(),
+    };
+    return fromUrl.cloudName && fromUrl.apiKey && fromUrl.apiSecret ? fromUrl : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function durableEvidenceStorageRequired() {
+  const configured = String(process.env.EVIDENCE_DURABLE_STORAGE_REQUIRED || "").trim().toLowerCase();
+  if (configured) return configured === "true";
+  return APP_STAGE !== "local" && String(process.env.NODE_ENV || "").toLowerCase() !== "test";
+}
+
+function removeTemporaryUpload(filePath) {
+  if (!filePath) return;
+  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (_) {}
 }
 
 function normalizeCloudinaryFolder(folder) {
@@ -858,9 +892,9 @@ async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
   if (!dataUrl.startsWith("data:")) return dataUrl;
   if (!cloudinaryConfigured()) return "";
 
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-  const apiKey = process.env.CLOUDINARY_API_KEY;
-  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+  const config = cloudinaryConfig();
+  if (!config) return "";
+  const { cloudName, apiKey, apiSecret } = config;
   const folder = normalizeCloudinaryFolder(opts.folder || "tutopay/catalogue");
   const timestamp = Math.floor(Date.now() / 1000);
   const publicId = `${String(opts.prefix || "item")}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
@@ -890,14 +924,15 @@ async function uploadDataUrlToCloudinary(dataUrl, opts = {}) {
 }
 
 async function uploadLocalFileToCloudinary(filePath, opts = {}) {
-  if (!filePath || !cloudinaryConfigured()) return null;
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-  const apiKey = process.env.CLOUDINARY_API_KEY;
-  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+  const config = cloudinaryConfig();
+  if (!filePath || !config) return null;
+  const { cloudName, apiKey, apiSecret } = config;
   const folder = normalizeCloudinaryFolder(opts.folder || "tutopay/evidence");
   const timestamp = Math.floor(Date.now() / 1000);
   const publicId = `${String(opts.prefix || "file")}-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-  const paramsToSign = { folder, public_id: publicId, resource_type: "auto", timestamp };
+  // resource_type belongs in the REST endpoint path and must not be included
+  // in Cloudinary's signature payload.
+  const paramsToSign = { folder, public_id: publicId, timestamp };
   const signature = cloudinarySignature(paramsToSign, apiSecret);
 
   const fileBuf = fs.readFileSync(filePath);
@@ -908,7 +943,6 @@ async function uploadLocalFileToCloudinary(filePath, opts = {}) {
   form.append("timestamp", String(timestamp));
   form.append("folder", folder);
   form.append("public_id", publicId);
-  form.append("resource_type", "auto");
   form.append("signature", signature);
 
   const resp = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`, {
@@ -929,6 +963,43 @@ async function uploadLocalFileToCloudinary(filePath, opts = {}) {
     format: payload.format || null,
     originalFilename: payload.original_filename || null,
   };
+}
+
+async function persistEvidenceUpload(file, opts = {}) {
+  if (!file || !file.path) throw new Error("No evidence file was received.");
+  const localUrlPath = `/uploads/${file.filename}`;
+  const localUrl = `${PUBLIC_API_BASE}${localUrlPath}`;
+  if (!cloudinaryConfigured()) {
+    if (durableEvidenceStorageRequired()) {
+      removeTemporaryUpload(file.path);
+      const error = new Error("Durable evidence storage is not configured. Add CLOUDINARY_URL or the three CLOUDINARY_* variables in Railway, then retry the upload.");
+      error.code = "EVIDENCE_STORAGE_UNAVAILABLE";
+      throw error;
+    }
+    return { urlPath:localUrlPath, finalUrl:localUrl, cloudinaryMeta:null, durable:false };
+  }
+  try {
+    const cloudinaryMeta = await uploadLocalFileToCloudinary(file.path, {
+      folder:opts.folder || "tutopay/evidence",
+      prefix:opts.prefix || "evidence",
+      filename:file.originalname || file.filename,
+      mimetype:file.mimetype,
+      size:file.size,
+    });
+    if (!cloudinaryMeta || !cloudinaryMeta.secureUrl) throw new Error("Cloudinary returned no durable evidence URL.");
+    removeTemporaryUpload(file.path);
+    return { urlPath:null, finalUrl:cloudinaryMeta.secureUrl, cloudinaryMeta, durable:true };
+  } catch (uploadError) {
+    if (durableEvidenceStorageRequired()) {
+      removeTemporaryUpload(file.path);
+      const error = new Error("Durable evidence storage could not save this file. Nothing was attached; please retry after checking the Cloudinary settings.");
+      error.code = "EVIDENCE_STORAGE_UNAVAILABLE";
+      error.cause = uploadError;
+      throw error;
+    }
+    console.error("[cloudinary] evidence upload failed in local mode; using temporary storage:", uploadError && uploadError.message ? uploadError.message : uploadError);
+    return { urlPath:localUrlPath, finalUrl:localUrl, cloudinaryMeta:null, durable:false };
+  }
 }
 
 async function persistKycDataUrl(dataUrl, opts = {}) {
@@ -3857,9 +3928,13 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
 
     const id = req.params.id;
     const tx = transactions.find((t) => t.id === id);
-    if (!tx) return res.status(404).json({ error: "Transaction not found" });
+    if (!tx) {
+      removeTemporaryUpload(req.file && req.file.path);
+      return res.status(404).json({ error: "Transaction not found" });
+    }
 
     if (!tx.disputeActive || !tx.dispute) {
+      removeTemporaryUpload(req.file && req.file.path);
       return res.status(400).json({ error: "No active dispute on this transaction" });
     }
 
@@ -3871,26 +3946,14 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
       tx.disputeDocs = [];
     }
 
-    let urlPath = `/uploads/${req.file.filename}`;
-    let finalUrl = `${PUBLIC_API_BASE}${urlPath}`;
-    let cloudinaryMeta = null;
-    if (cloudinaryConfigured()) {
-      try {
-        cloudinaryMeta = await uploadLocalFileToCloudinary(req.file.path, {
-          folder: "tutopay/evidence",
-          prefix: "evidence",
-          filename: req.file.originalname || req.file.filename,
-          mimetype: req.file.mimetype,
-          size: req.file.size,
-        });
-        if (cloudinaryMeta && cloudinaryMeta.secureUrl) {
-          finalUrl = cloudinaryMeta.secureUrl;
-          urlPath = null;
-        }
-      } catch (e) {
-        console.error('[cloudinary] evidence upload failed, keeping local upload:', e && e.message ? e.message : e);
-      }
+    let storage;
+    try {
+      storage = await persistEvidenceUpload(req.file, { folder:"tutopay/evidence", prefix:"evidence" });
+    } catch (storageError) {
+      console.error("[evidence] durable upload failed:", storageError && storageError.cause && storageError.cause.message ? storageError.cause.message : storageError.message);
+      return res.status(storageError && storageError.code === "EVIDENCE_STORAGE_UNAVAILABLE" ? 503 : 500).json({ error:storageError.message || "Evidence storage failed." });
     }
+    const { urlPath, finalUrl, cloudinaryMeta } = storage;
 
     const doc = {
       id: uuid(),
@@ -3910,6 +3973,7 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
         bytes: cloudinaryMeta.bytes,
         format: cloudinaryMeta.format,
       } : null,
+      storage: storage.durable ? "cloudinary" : "local_temporary",
     };
 
     tx.disputeDocs.push(doc);
@@ -8479,24 +8543,14 @@ try {
       }
       if (!req.file) return res.status(400).json({ error:'Choose an evidence file to upload.' });
 
-      let urlPath = `/uploads/${req.file.filename}`;
-      let finalUrl = `${PUBLIC_API_BASE}${urlPath}`;
-      let cloudinaryMeta = null;
-      if (cloudinaryConfigured()) {
-        try {
-          cloudinaryMeta = await uploadLocalFileToCloudinary(req.file.path, {
-            folder:'tutopay/evidence', prefix:'case-response',
-            filename:req.file.originalname || req.file.filename,
-            mimetype:req.file.mimetype, size:req.file.size,
-          });
-          if (cloudinaryMeta && cloudinaryMeta.secureUrl) {
-            finalUrl = cloudinaryMeta.secureUrl;
-            urlPath = null;
-          }
-        } catch (uploadError) {
-          console.error('[cloudinary] requested evidence upload failed, keeping local upload:', uploadError && uploadError.message ? uploadError.message : uploadError);
-        }
+      let storage;
+      try {
+        storage = await persistEvidenceUpload(req.file, { folder:'tutopay/evidence', prefix:'case-response' });
+      } catch (storageError) {
+        console.error("[evidence] requested durable upload failed:", storageError && storageError.cause && storageError.cause.message ? storageError.cause.message : storageError.message);
+        return res.status(storageError && storageError.code === "EVIDENCE_STORAGE_UNAVAILABLE" ? 503 : 500).json({ error:storageError.message || "Evidence storage failed." });
       }
+      const { urlPath, finalUrl, cloudinaryMeta } = storage;
 
       const doc = {
         id:uuid(), filename:req.file.filename, originalname:req.file.originalname,
@@ -8508,6 +8562,7 @@ try {
           publicId:cloudinaryMeta.publicId, resourceType:cloudinaryMeta.resourceType,
           bytes:cloudinaryMeta.bytes, format:cloudinaryMeta.format,
         } : null,
+        storage:storage.durable ? 'cloudinary' : 'local_temporary',
       };
       tx.disputeDocs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
       tx.disputeDocs.push(doc);
@@ -8527,21 +8582,29 @@ try {
     if (!party) return res.status(403).json({ error:'Only the buyer or seller on this transaction can respond.' });
     const review = ensureCaseReview(tx);
     const requestId = String((req.body || {}).requestId || '').trim();
-    const note = String((req.body || {}).note || '').trim();
+    const note = String((req.body || {}).note || '').trim().slice(0, 4000);
     const evidenceIds = Array.isArray((req.body || {}).evidenceIds) ? [...new Set(req.body.evidenceIds.map(String))] : [];
     const request = review.requests.find(r => String(r.id) === requestId && r.targetParty === party && String(r.targetPhone) === String(req.user.phone));
     if (!request) return res.status(404).json({ error:'Evidence request not found for your account.' });
     if (request.status !== 'open') return res.status(409).json({ error:'This request has already been answered.' });
     if (!note) return res.status(400).json({ error:'Add a short response.' });
     const caseDocs = Array.isArray(tx.disputeDocs) ? tx.disputeDocs : [];
-    const validEvidenceIds = evidenceIds.filter(id => caseDocs.some(doc => String(doc.id) === id && String(doc.caseRequestId || '') === requestId && String(doc.uploadedByPhone || '') === String(req.user.phone)));
-    if (validEvidenceIds.length !== evidenceIds.length) return res.status(400).json({ error:'One or more evidence files are not attached to this request. Please upload them again.' });
+    // A file upload and the written response are deliberately separate HTTP
+    // calls. Include any files already staged for this same request/account so
+    // a refresh or a retry between those calls cannot orphan valid evidence.
+    const stagedEvidenceIds = Array.isArray(request.uploadedEvidenceIds) ? request.uploadedEvidenceIds.map(String) : [];
+    const submittedEvidenceIds = [...new Set([...evidenceIds, ...stagedEvidenceIds])];
+    const validEvidenceIds = submittedEvidenceIds.filter(id => caseDocs.some(doc => String(doc.id) === id && String(doc.caseRequestId || '') === requestId && String(doc.uploadedByPhone || '') === String(req.user.phone)));
+    if (validEvidenceIds.length !== submittedEvidenceIds.length) return res.status(400).json({ error:'One or more evidence files are not attached to this request. Please upload them again.' });
     request.status = 'answered';
-    request.response = { note, at:nowIso(), byPhone:req.user.phone, byRole:party };
+    const respondedAt = nowIso();
+    const reviewDueAt = new Date(Date.parse(respondedAt) + 48 * 3600000).toISOString();
+    request.response = { note, at:respondedAt, reviewDueAt, byPhone:req.user.phone, byRole:party };
     request.evidenceIds = validEvidenceIds;
     const open = review.requests.filter(r => r.status === 'open');
     if (!open.length) review.status = 'staff_review';
     review.updatedAt = request.response.at;
+    review.nextUserUpdateDueAt = reviewDueAt;
     const entry = { id:uuid(), action:'participant_response', note, at:request.response.at, byPhone:req.user.phone, byRole:party, requestId:request.id, evidenceIds:validEvidenceIds };
     review.actions.push(entry);
     await saveCaseTx(tx);
