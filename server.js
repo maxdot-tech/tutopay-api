@@ -1323,6 +1323,10 @@ function ensureTxReconDefaults(tx) {
   if (!work.assignedAt) work.assignedAt = null;
   if (!Array.isArray(work.history)) work.history = [];
   if (!Array.isArray(work.exceptions)) work.exceptions = [];
+  if (!Array.isArray(work.matches)) work.matches = [];
+  if (!work.status) work.status = "pending";
+  if (!work.completedAt) work.completedAt = null;
+  if (!work.completedBy) work.completedBy = null;
   if (!work.updatedAt) work.updatedAt = null;
   return tx;
 }
@@ -1359,6 +1363,82 @@ function openReconciliationExceptions(tx, target) {
     String(row.status || "open") === "open" &&
     (!target || String(row.target || "") === String(target))
   );
+}
+
+function reconciliationRequiredTargets(tx) {
+  if (!tx || typeof tx !== "object") return [];
+  const targets = [];
+  if (String(tx.paymentStatus || "").toLowerCase() === "paid") targets.push("collection");
+  if (String((tx.disbursement && tx.disbursement.status) || "").toLowerCase() === "successful") targets.push("payout");
+  const refundRequired = financialActions.some((row) =>
+    String(row.txId) === String(tx.id) &&
+    ["refund","partial_refund","reversal"].includes(String(row.type)) &&
+    ["awaiting_reconciliation","reconciled"].includes(String(row.status))
+  );
+  if (refundRequired) targets.push("refund");
+  return targets;
+}
+
+function refreshReconciliationWorkState(tx, actorPhone = null) {
+  ensureTxReconDefaults(tx);
+  const work = tx.reconciliationWork;
+  const targets = reconciliationRequiredTargets(tx);
+  const openExceptions = openReconciliationExceptions(tx);
+  const matched = (target) => target === "collection" ? !!tx.collectionReconciled
+    : target === "payout" ? !!tx.payoutReconciled
+    : !!tx.refundReconciled;
+  const complete = targets.length > 0 && targets.every(matched) && openExceptions.length === 0;
+  if (complete) {
+    work.status = "completed";
+    work.completedAt = work.completedAt || nowIso();
+    work.completedBy = actorPhone || work.completedBy || work.assignedTo || "system";
+  } else {
+    work.status = openExceptions.length ? "exception" : (work.assignedTo ? "in_progress" : "pending");
+    work.completedAt = null;
+    work.completedBy = null;
+  }
+  return { targets, complete, openExceptions };
+}
+
+function syncRefundCaseAfterAccountsReconciliation(tx, req, reconciled, note, at = nowIso()) {
+  if (!tx || !tx.id || !tx.dispute) return null;
+  const caseId = `CASE-${tx.id}`;
+  const store = globalThis.__tpIssueCaseStore;
+  const actions = globalThis.__tpIssueActions;
+  const state = store && typeof store.get === "function" ? store.get(caseId) : null;
+  if (!state || !Array.isArray(actions)) return null;
+
+  const nextStatus = reconciled ? "resolved" : "refund_executed_pending_reconciliation";
+  state.status = nextStatus;
+  state.updatedAt = at;
+  state.pendingAdminApproval = false;
+  state.partnerActionRequired = false;
+  state.partnerActionType = null;
+  state.outcomeCode = reconciled ? "refund_completed_reconciled" : "refund_reconciliation_reopened";
+  state.executedOutcome = reconciled ? "refund" : null;
+  state.executedAt = reconciled ? at : null;
+  state.closedAt = reconciled ? at : null;
+
+  const entry = {
+    id: uuid(),
+    caseId,
+    txId: tx.id,
+    actionType: reconciled ? "accounts_refund_reconciled" : "accounts_refund_reopened",
+    policyCode: reconciled ? "ACC-REF-01" : "ACC-REF-02",
+    policyLabel: reconciled ? "Refund Reconciled and Case Closed" : "Refund Reconciliation Reopened",
+    note: note || (reconciled
+      ? "Accounts matched the licensed-partner refund statement and closed the case."
+      : "Accounts reopened the refund statement match for correction."),
+    actorPhone: req && req.user ? req.user.phone : "system",
+    actorRole: req && req.user ? req.user.role : "system",
+    timestamp: at,
+    nextStatus,
+  };
+  actions.push(entry);
+  if (actions.length > 10000) actions.splice(0, actions.length - 10000);
+  dbInsertIssueAction(entry).catch(() => {});
+  dbUpsertIssueCase(state).catch(() => {});
+  return { caseId, status: nextStatus, entry };
 }
 
 async function dbLoadIntoMemory() {
@@ -4459,9 +4539,13 @@ app.get("/api/admin/callback-config", requireAuth, (req, res) => {
 app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
   if (!isAccountingRole(req.user.role)) return res.status(403).json({ error: "Accounting only" });
 
-  const txs = transactions.map(ensureTxReconDefaults);
+  const txs = transactions.map((tx) => {
+    ensureTxReconDefaults(tx);
+    refreshReconciliationWorkState(tx);
+    return tx;
+  });
   const pendingCollection = txs.filter((t) => t.paymentStatus === "paid" && !t.collectionReconciled).length;
-  const pendingPayout = txs.filter((t) => (t.status === "completed" || (t.disbursement && t.disbursement.status === "successful")) && !t.payoutReconciled).length;
+  const pendingPayout = txs.filter((t) => String((t.disbursement && t.disbursement.status) || "").toLowerCase() === "successful" && !t.payoutReconciled).length;
 
   const money = txs.reduce((acc, t) => {
     const amt = Number(t.amount || 0) || 0;
@@ -4479,18 +4563,11 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
       pendingPayoutReconciliation: pendingPayout,
       assignedReconciliation: txs.filter((t) => !!t.reconciliationWork.assignedTo).length,
       openReconciliationExceptions: txs.reduce((sum, t) => sum + openReconciliationExceptions(t).length, 0),
-      fullyReconciled: txs.filter((t) => {
-        const paid = String(t.paymentStatus || "").toLowerCase() === "paid";
-        const payoutSuccessful = String((t.disbursement && t.disbursement.status) || "").toLowerCase() === "successful";
-        const refundRequired = financialActions.some((row) => String(row.txId) === String(t.id) &&
-          ["refund","partial_refund","reversal"].includes(String(row.type)) &&
-          ["awaiting_reconciliation","reconciled"].includes(String(row.status)));
-        return (paid || payoutSuccessful || refundRequired) && (!paid || t.collectionReconciled) && (!payoutSuccessful || t.payoutReconciled) && (!refundRequired || t.refundReconciled);
-      }).length,
+      fullyReconciled: txs.filter((t) => t.reconciliationWork.status === "completed").length,
       ...money,
     },
     recentUnreconciled: txs
-      .filter((t) => !t.collectionReconciled || !t.payoutReconciled)
+      .filter((t) => reconciliationRequiredTargets(t).some((target) => target === "collection" ? !t.collectionReconciled : target === "payout" ? !t.payoutReconciled : !t.refundReconciled))
       .slice(-30)
       .reverse()
       .map((t) => ({
@@ -4519,6 +4596,7 @@ app.post("/api/admin/reconciliation/:txId/assign", requireAuth, (req, res) => {
   }
   work.assignedTo = actor;
   work.assignedAt = work.assignedAt || nowIso();
+  refreshReconciliationWorkState(tx, actor);
   reconciliationWorkEvent(tx, req, "assigned", "Accounts reconciliation record assigned.");
   logAudit(req, "reconciliation_assigned", { txId: tx.id, assignedTo: work.assignedTo });
   if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
@@ -4538,6 +4616,7 @@ app.post("/api/admin/reconciliation/:txId/release", requireAuth, (req, res) => {
   const previousOwner = work.assignedTo;
   work.assignedTo = null;
   work.assignedAt = null;
+  refreshReconciliationWorkState(tx, actor);
   reconciliationWorkEvent(tx, req, "released", `Assignment released${previousOwner ? ` from ${previousOwner}` : ""}.`);
   logAudit(req, "reconciliation_released", { txId: tx.id, previousOwner });
   if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
@@ -4558,7 +4637,7 @@ app.post("/api/admin/reconciliation/:txId/exception", requireAuth, (req, res) =>
   const categories = ["reference_missing","amount_mismatch","duplicate","partner_status_mismatch","beneficiary_mismatch","other"];
   if (!["collection","payout","refund"].includes(target)) return res.status(400).json({ error: "Select collection, payout, or refund." });
   if (!categories.includes(category)) return res.status(400).json({ error: "Select a valid discrepancy category." });
-  if (!note) return res.status(400).json({ error: "Explain the discrepancy before recording it." });
+  if (note.length < 8) return res.status(400).json({ error: "Explain the discrepancy in at least 8 characters." });
   const hasObservedAmount = body.observedAmount !== null && body.observedAmount !== undefined && String(body.observedAmount).trim() !== "" && Number.isFinite(Number(body.observedAmount));
   const row = {
     id: `REC-EXC-${uuid()}`,
@@ -4567,6 +4646,8 @@ app.post("/api/admin/reconciliation/:txId/exception", requireAuth, (req, res) =>
     note,
     partnerReference: String(body.partnerReference || "").trim() || null,
     observedAmount: hasObservedAmount ? Number(body.observedAmount) : null,
+    statementSource: String(body.statementSource || "").trim().toLowerCase() || null,
+    statementDate: String(body.statementDate || "").trim() || null,
     status: "open",
     openedAt: nowIso(),
     openedBy: req.user.phone,
@@ -4575,6 +4656,7 @@ app.post("/api/admin/reconciliation/:txId/exception", requireAuth, (req, res) =>
     resolutionNote: null,
   };
   tx.reconciliationWork.exceptions.push(row);
+  refreshReconciliationWorkState(tx, req.user.phone);
   tx.reconNotes.push({ at: row.openedAt, by: req.user.phone, target, status: "exception_opened", note, partnerReference: row.partnerReference, observedAmount: row.observedAmount });
   reconciliationWorkEvent(tx, req, "exception_opened", note, { target, category, exceptionId: row.id });
   recordLedger(req, tx, "reconciliation_exception_opened", { dedupe: false, notes: note, meta: { target, category, exceptionId: row.id } });
@@ -4594,11 +4676,12 @@ app.post("/api/admin/reconciliation/:txId/exception/:exceptionId/resolve", requi
   if (!row) return res.status(404).json({ error: "Reconciliation discrepancy not found" });
   if (String(row.status) === "resolved") return res.status(409).json({ error: "This discrepancy is already resolved." });
   const note = String((req.body && req.body.note) || "").trim();
-  if (!note) return res.status(400).json({ error: "Add a resolution note." });
+  if (note.length < 8) return res.status(400).json({ error: "Add a resolution note of at least 8 characters." });
   row.status = "resolved";
   row.resolvedAt = nowIso();
   row.resolvedBy = req.user.phone;
   row.resolutionNote = note;
+  refreshReconciliationWorkState(tx, req.user.phone);
   tx.reconNotes.push({ at: row.resolvedAt, by: req.user.phone, target: row.target, status: "exception_resolved", note, exceptionId: row.id });
   reconciliationWorkEvent(tx, req, "exception_resolved", note, { target: row.target, category: row.category, exceptionId: row.id });
   recordLedger(req, tx, "reconciliation_exception_resolved", { dedupe: false, notes: note, meta: { target: row.target, category: row.category, exceptionId: row.id } });
@@ -4621,6 +4704,8 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   const status = String(body.status || "reconciled").toLowerCase(); // reconciled | unreconciled
   const note = body.note ? String(body.note) : "";
   const partnerReference = String(body.partnerReference || "").trim();
+  const statementSource = String(body.statementSource || "").trim().toLowerCase();
+  const statementDate = String(body.statementDate || "").trim();
   const hasObservedAmount = body.observedAmount !== null && body.observedAmount !== undefined && String(body.observedAmount).trim() !== "";
   const observedAmount = hasObservedAmount ? Number(body.observedAmount) : NaN;
 
@@ -4632,6 +4717,9 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   if (!["reconciled","unreconciled"].includes(status)) {
     return res.status(400).json({ error: "status must be reconciled or unreconciled" });
   }
+  const currentlyReconciled = target === "collection" ? !!tx.collectionReconciled : target === "payout" ? !!tx.payoutReconciled : target === "refund" ? !!tx.refundReconciled : false;
+  if (target !== "both" && status === "reconciled" && currentlyReconciled) return res.status(409).json({ error: `The ${target} line is already reconciled. Reopen it before recording another match.` });
+  if (target !== "both" && status === "unreconciled" && !currentlyReconciled) return res.status(409).json({ error: `The ${target} line is already open for reconciliation.` });
   if (!note.trim()) return res.status(400).json({ error: "Add a reconciliation note or partner statement reference." });
   if (target === "both" && String(req.user.role) !== "admin") {
     return res.status(403).json({ error: "Collection and payout must be reconciled separately by Accounts." });
@@ -4645,6 +4733,14 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   const refundAction = financialActions.find(row => String(row.txId) === String(tx.id) &&
     ['refund','partial_refund','reversal'].includes(String(row.type)) &&
     ['awaiting_reconciliation','reconciled'].includes(String(row.status))) || null;
+  const actionTypesByTarget = {
+    collection:['collection'], payout:['payout','payout_retry'], refund:['refund','partial_refund','reversal']
+  };
+  const linkedFinanceActions = target === 'both' ? [] : financialActions.filter(row =>
+    String(row.txId) === String(tx.id) &&
+    (actionTypesByTarget[target] || []).includes(String(row.type)) &&
+    ['awaiting_reconciliation','reconciled'].includes(String(row.status))
+  );
   if (status === "reconciled" && target === "refund" && (!refundAction || String(tx.refundExecution && tx.refundExecution.status || '').toLowerCase() !== 'successful')) {
     return res.status(409).json({ error: "Refund cannot be reconciled until the licensed partner confirms it as successful." });
   }
@@ -4653,6 +4749,9 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   }
   if (status === "reconciled" && String(req.user.role || "").toLowerCase() !== "admin") {
     if (!partnerReference) return res.status(400).json({ error: "Add the partner statement or transaction reference used for this match." });
+    const allowedStatementSources = ['mtn_momo','airtel_money','bank_statement','settlement_report','other'];
+    if (!allowedStatementSources.includes(statementSource)) return res.status(400).json({ error: "Select the statement source used for this match." });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(statementDate)) return res.status(400).json({ error: "Add the statement date used for this match." });
     if (!Number.isFinite(observedAmount)) return res.status(400).json({ error: "Add the amount observed on the partner statement." });
     const expectedAmount = target === "refund" && refundAction ? Number(refundAction.amount || 0) : Number(tx.amount || 0);
     if (Math.abs(observedAmount - expectedAmount) > 0.01) {
@@ -4664,13 +4763,6 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
   if (target === "payout" || target === "both") tx.payoutReconciled = val;
   if (target === "refund") {
     tx.refundReconciled = val;
-    if (refundAction) {
-      refundAction.status = val ? 'reconciled' : 'awaiting_reconciliation';
-      refundAction.reconciliationStatus = val ? 'reconciled' : 'pending';
-      refundAction.reconciliation = {status:val ? 'reconciled' : 'reopened',at:nowIso(),byPhone:req.user.phone,note,partnerReference:partnerReference || null,observedAmount:Number.isFinite(observedAmount) ? observedAmount : null};
-      financeActionEvent(refundAction,refundAction.status,req.user,val ? 'Accounts reconciled the confirmed refund.' : 'Accounts reopened the refund reconciliation.',{txId:tx.id});
-      persistFinancialAction(refundAction);
-    }
     if (val) {
       if (tx.dispute) { tx.dispute.status = 'refunded'; tx.dispute.resolvedAt = nowIso(); }
       if (tx.caseReview) tx.caseReview.status = 'resolved';
@@ -4681,25 +4773,68 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
       markPartnerProcessing(tx,{refundStatus:'successful_pending_reconciliation'});
     }
   }
+  linkedFinanceActions.forEach((action) => {
+    action.status = val ? 'reconciled' : 'awaiting_reconciliation';
+    action.reconciliationStatus = val ? 'reconciled' : 'pending';
+    action.reconciliation = {
+      status:val ? 'reconciled' : 'reopened', at:nowIso(), byPhone:req.user.phone, byRole:req.user.role,
+      note, partnerReference:partnerReference || null,
+      statementSource:statementSource || null, statementDate:statementDate || null,
+      observedAmount:Number.isFinite(observedAmount) ? observedAmount : null
+    };
+    financeActionEvent(action,action.status,req.user,val ? `Accounts reconciled the confirmed ${target}.` : `Accounts reopened the ${target} reconciliation.`,{txId:tx.id,target});
+    persistFinancialAction(action);
+  });
+  if (target === 'collection') markPartnerProcessing(tx,{collectionReconciliationStatus:val ? 'reconciled' : 'pending'});
+  if (target === 'payout') markPartnerProcessing(tx,{payoutReconciliationStatus:val ? 'reconciled' : 'pending'});
   tx.reconUpdatedAt = nowIso();
-  if (note) tx.reconNotes.push({ at: tx.reconUpdatedAt, by: req.user.phone, target, status, note, partnerReference:partnerReference || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null });
+  const caseClosure = target === 'refund'
+    ? syncRefundCaseAfterAccountsReconciliation(tx, req, val, note, tx.reconUpdatedAt)
+    : null;
+  if (note) tx.reconNotes.push({ at: tx.reconUpdatedAt, by: req.user.phone, target, status, note, partnerReference:partnerReference || null, statementSource:statementSource || null, statementDate:statementDate || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null });
+  const work = tx.reconciliationWork;
+  if (val) {
+    const expectedAmount = target === 'refund' && refundAction ? Number(refundAction.amount || 0) : Number(tx.amount || 0);
+    work.matches.push({
+      id:`REC-MATCH-${uuid()}`, target, status:'matched', expectedAmount,
+      observedAmount:Number.isFinite(observedAmount) ? observedAmount : null,
+      variance:Number.isFinite(observedAmount) ? Number((observedAmount - expectedAmount).toFixed(2)) : null,
+      partnerReference:partnerReference || null, statementSource:statementSource || null,
+      statementDate:statementDate || null, note, matchedAt:tx.reconUpdatedAt,
+      matchedBy:req.user.phone, matchedByRole:req.user.role, reopenedAt:null, reopenedBy:null, reopenNote:null
+    });
+  } else {
+    const previousMatch = work.matches.slice().reverse().find(row => String(row.target) === target && String(row.status) === 'matched');
+    if (previousMatch) {
+      previousMatch.status = 'reopened'; previousMatch.reopenedAt = tx.reconUpdatedAt;
+      previousMatch.reopenedBy = req.user.phone; previousMatch.reopenNote = note;
+    }
+  }
+  const previousWorkStatus = work.status;
+  const workState = refreshReconciliationWorkState(tx, req.user.phone);
   reconciliationWorkEvent(tx, req, status === "reconciled" ? "match_recorded" : "match_reopened", note, {
     target,
     partnerReference: partnerReference || null,
+    statementSource: statementSource || null,
+    statementDate: statementDate || null,
     observedAmount: Number.isFinite(observedAmount) ? observedAmount : null,
   });
+  if (workState.complete && previousWorkStatus !== 'completed') {
+    reconciliationWorkEvent(tx, req, 'reconciliation_completed', 'All applicable partner-confirmed money lines are reconciled.', {targets:workState.targets});
+  }
 
   recordLedger(req, tx, "reconciliation_marked", {
     dedupe: false,
     notes: note || `Marked ${target} as ${status}`,
-    meta: { target, status, partnerReference:partnerReference || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null }
+    meta: { target, status, partnerReference:partnerReference || null, statementSource:statementSource || null, statementDate:statementDate || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null }
   });
 
   logAudit(req, "reconciliation_marked", {
-    txId: tx.id, target, status, note, partnerReference:partnerReference || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null,
+    txId: tx.id, target, status, note, partnerReference:partnerReference || null, statementSource:statementSource || null, statementDate:statementDate || null, observedAmount:Number.isFinite(observedAmount) ? observedAmount : null,
     collectionReconciled: tx.collectionReconciled,
     payoutReconciled: tx.payoutReconciled,
     refundReconciled: tx.refundReconciled,
+    reconciliationStatus: tx.reconciliationWork.status,
   });
 
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
@@ -4711,6 +4846,8 @@ app.post("/api/admin/reconciliation/:txId/mark", requireAuth, (req, res) => {
     refundReconciled: tx.refundReconciled,
     reconUpdatedAt: tx.reconUpdatedAt,
     reconNotes: tx.reconNotes,
+    reconciliationWork: tx.reconciliationWork,
+    caseClosure,
   });
 });
 
