@@ -1760,7 +1760,7 @@ async function dbInsertIncident(incidentObj) {
   const ts = incidentObj.createdAt ? new Date(incidentObj.createdAt) : new Date();
   await _pgPool.query(
     `INSERT INTO tutopay_incidents(id, ts, data) VALUES ($1, $2, $3::jsonb)
-     ON CONFLICT (id) DO NOTHING`,
+     ON CONFLICT (id) DO UPDATE SET ts=EXCLUDED.ts, data=EXCLUDED.data`,
     [id, ts, JSON.stringify(incidentObj)]
   );
 }
@@ -2843,6 +2843,8 @@ app.get("/api/admin/kyc/pending", requireAuth, (req, res) => {
       kycProfile: u.kycProfile || {},
       kycThread: sanitizeKycThread(u.kycThread),
       attachmentList: kycAttachmentEntriesFromProfile(u.kycProfile || {}),
+      complianceRecommendation: u.complianceRecommendation || null,
+      complianceWork: u.complianceWork || null,
     }));
   return res.json(pending);
 });
@@ -2892,6 +2894,13 @@ app.post("/api/admin/kyc/:phone/review", requireAuth, (req, res) => {
     kycLevel: user.kycLevel,
     reason: user.kycRejectionReason || null,
   });
+  if (user.complianceRecommendation && typeof user.complianceRecommendation === "object") {
+    user.complianceRecommendation.status = "admin_decided";
+    user.complianceRecommendation.adminDecision = user.kycStatus;
+    user.complianceRecommendation.adminNote = reason || user.kycRejectionReason || "";
+    user.complianceRecommendation.decidedAt = at;
+    user.complianceRecommendation.decidedBy = req.user.phone;
+  }
   pushKycThreadMessage(user, {
     at,
     byRole: "admin",
@@ -5001,6 +5010,36 @@ app.use((err, req, res, next) => {
   ];
   const complianceIncidents = globalThis.__tpComplianceIncidents || (globalThis.__tpComplianceIncidents = []);
 
+  function ensureComplianceWork(record){
+    record.complianceWork = record.complianceWork && typeof record.complianceWork === 'object' ? record.complianceWork : {};
+    const work = record.complianceWork;
+    work.assignedTo = work.assignedTo || null;
+    work.assignedAt = work.assignedAt || null;
+    work.history = Array.isArray(work.history) ? work.history : [];
+    return work;
+  }
+  function complianceTarget(kind, id){
+    const type = String(kind || '').toLowerCase();
+    const key = String(id || '').trim();
+    if (type === 'user') return { type, record:findUserByPhone(key) || null, id:key };
+    if (type === 'incident') return { type, record:complianceIncidents.find(row => String(row.id) === key) || null, id:key };
+    return { type, record:null, id:key };
+  }
+  async function saveComplianceTarget(target){
+    if (target.type === 'user' && target.record && dbEnabled()) {
+      try { await dbUpsertUser(target.record); } catch (_) {}
+    }
+    if (target.type === 'incident' && target.record && dbEnabled()) {
+      try { await dbInsertIncident(target.record); } catch (_) {}
+    }
+  }
+  function appendComplianceWorkHistory(work, req, event, note, extra={}){
+    const row = { id:uuid(), event, note:String(note || '').trim(), at:nowIso(), byPhone:req.user.phone, byRole:req.user.role, ...extra };
+    work.history.push(row);
+    if (work.history.length > 200) work.history.splice(0, work.history.length - 200);
+    return row;
+  }
+
   function _complianceCounts() {
     const pendingKyc = users.filter(u => u && u.role !== 'admin' && (u.kycStatus === 'pending' || u.kycStatus === 'under_review')).length;
     const disputes = issuesTxs().filter(t => !!t.disputeActive || String(t.status||'').toLowerCase()==='disputed').length;
@@ -5152,7 +5191,7 @@ app.use((err, req, res, next) => {
     res.json({ ok:true, incident: entry });
   });
 
-  app.post('/api/admin/compliance/incidents/:incidentId/status', requireAuth, (req,res)=> {
+  app.post('/api/admin/compliance/incidents/:incidentId/status', requireAuth, async (req,res)=> {
     if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
     const id = String(req.params.incidentId || '').trim();
     const incident = complianceIncidents.find(i => String(i.id) === id);
@@ -5167,6 +5206,7 @@ app.use((err, req, res, next) => {
       incident.notes = incident.notes || [];
       incident.notes.push({ at: incident.updatedAt, by: req.user.phone, note: String((req.body||{}).note).trim() });
     }
+    try { await dbInsertIncident(incident); } catch (_) {}
     logAudit(req, 'compliance_incident_status_update', { incidentId: id, status });
     res.json({ ok:true, incident });
   });
@@ -5193,11 +5233,16 @@ app.use((err, req, res, next) => {
       complianceRestricted: !!u.complianceRestricted,
       restrictionReason: u.restrictionReason || '',
       restrictedAt: u.restrictedAt || null,
+      kycSubmittedAt: u.kycSubmittedAt || null,
+      kycReviewedAt: u.kycReviewedAt || null,
       createdAt: u.createdAt || null,
       updatedAt: u.updatedAt || null,
       hasNrc: !!u.nrc,
       hasSelfie: !!(u.selfieUrl || u.selfie || u.selfieDataUrl),
       hasBusinessDocs: !!(u.businessDocUrl || u.businessDocs || u.logoUrl),
+      attachmentList: kycAttachmentEntriesFromProfile(u.kycProfile || {}),
+      complianceRecommendation: u.complianceRecommendation || null,
+      complianceWork: u.complianceWork || null,
     }));
     res.json({ ok:true, users: rows });
   });
@@ -5218,6 +5263,76 @@ app.use((err, req, res, next) => {
     try { if (dbEnabled()) await dbUpsertUser(user); } catch(e){}
     logAudit(req, 'compliance_user_restriction', { phone:user.phone, restricted, reason });
     res.json({ ok:true, user:{ phone:user.phone, role:user.role, complianceRestricted:!!user.complianceRestricted, restrictionReason:user.restrictionReason||'' } });
+  });
+
+  app.post('/api/admin/compliance/work/:kind/:id/assignment', requireAuth, async (req,res)=> {
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
+    const target = complianceTarget(req.params.kind, req.params.id);
+    if (!target.record) return res.status(404).json({ error:'Compliance work item not found' });
+    const work = ensureComplianceWork(target.record);
+    const actor = String(req.user.phone || '');
+    const admin = String(req.user.role || '').toLowerCase() === 'admin';
+    const action = String((req.body||{}).action || 'assign').toLowerCase();
+    if (action === 'assign') {
+      if (work.assignedTo && String(work.assignedTo) !== actor && !admin) return res.status(409).json({ error:`This item is already assigned to ${work.assignedTo}.` });
+      if (String(work.assignedTo || '') !== actor) {
+        work.assignedTo = actor;
+        work.assignedAt = nowIso();
+        appendComplianceWorkHistory(work, req, 'assigned', `Compliance work assigned to ${actor}.`);
+      }
+    } else if (action === 'release') {
+      if (!work.assignedTo) return res.status(409).json({ error:'This item is already unassigned.' });
+      if (String(work.assignedTo) !== actor && !admin) return res.status(403).json({ error:`Only ${work.assignedTo} or an Admin can release this item.` });
+      const note = String((req.body||{}).note || '').trim();
+      if (note.length < 3) return res.status(400).json({ error:'Add a short release reason.' });
+      const previousOwner = work.assignedTo;
+      appendComplianceWorkHistory(work, req, 'released', note, { previousOwner });
+      work.assignedTo = null;
+      work.assignedAt = null;
+    } else return res.status(400).json({ error:'action must be assign or release' });
+    target.record.updatedAt = nowIso();
+    await saveComplianceTarget(target);
+    logAudit(req, 'compliance_work_assignment', { kind:target.type, id:target.id, action, assignedTo:work.assignedTo });
+    res.json({ ok:true, work });
+  });
+
+  app.post('/api/admin/compliance/work/:kind/:id/note', requireAuth, async (req,res)=> {
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
+    const target = complianceTarget(req.params.kind, req.params.id);
+    if (!target.record) return res.status(404).json({ error:'Compliance work item not found' });
+    const work = ensureComplianceWork(target.record);
+    const actor = String(req.user.phone || '');
+    const admin = String(req.user.role || '').toLowerCase() === 'admin';
+    if (String(work.assignedTo || '') !== actor && !admin) return res.status(403).json({ error:'Assign this item to yourself before adding an internal note.' });
+    const note = String((req.body||{}).note || '').trim();
+    if (note.length < 3) return res.status(400).json({ error:'Enter an internal note.' });
+    const row = appendComplianceWorkHistory(work, req, 'internal_note', note);
+    target.record.updatedAt = row.at;
+    await saveComplianceTarget(target);
+    logAudit(req, 'compliance_work_note', { kind:target.type, id:target.id });
+    res.json({ ok:true, work });
+  });
+
+  app.post('/api/admin/compliance/users/:phone/recommend', requireAuth, async (req,res)=> {
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
+    const user = findUserByPhone(String(req.params.phone || '').trim());
+    if (!user) return res.status(404).json({ error:'User not found' });
+    const work = ensureComplianceWork(user);
+    const actor = String(req.user.phone || '');
+    const admin = String(req.user.role || '').toLowerCase() === 'admin';
+    if (String(work.assignedTo || '') !== actor && !admin) return res.status(403).json({ error:'Assign this KYC item to yourself before recording a recommendation.' });
+    const outcome = String((req.body||{}).outcome || '').toLowerCase();
+    if (!['approve','request_more','reject'].includes(outcome)) return res.status(400).json({ error:'Choose approve, request_more, or reject.' });
+    const note = String((req.body||{}).note || '').trim();
+    if (note.length < 3) return res.status(400).json({ error:'Add the reason for this recommendation.' });
+    const level = ['basic','enhanced','full'].includes(String((req.body||{}).kycLevel || '').toLowerCase()) ? String((req.body||{}).kycLevel).toLowerCase() : String(user.kycLevel || 'basic');
+    user.complianceRecommendation = { outcome, note, kycLevel:level, at:nowIso(), byPhone:req.user.phone, byRole:req.user.role, status:'awaiting_admin_decision' };
+    if (['pending','needs_more_info'].includes(String(user.kycStatus || '').toLowerCase())) user.kycStatus = 'under_review';
+    appendComplianceWorkHistory(work, req, 'kyc_recommendation', note, { outcome, kycLevel:level });
+    user.updatedAt = nowIso();
+    if (dbEnabled()) { try { await dbUpsertUser(user); } catch (_) {} }
+    logAudit(req, 'compliance_kyc_recommendation', { targetPhone:user.phone, outcome, kycLevel:level });
+    res.json({ ok:true, recommendation:user.complianceRecommendation, work, kycStatus:user.kycStatus });
   });
 
 // ---- Step 8A exports (CSV) ----
