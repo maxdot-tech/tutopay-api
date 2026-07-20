@@ -1328,6 +1328,10 @@ function ensureTxReconDefaults(tx) {
   if (!work.completedAt) work.completedAt = null;
   if (!work.completedBy) work.completedBy = null;
   if (!work.updatedAt) work.updatedAt = null;
+  if (!Array.isArray(work.expectedTargets)) work.expectedTargets = [];
+  if (!Array.isArray(work.confirmedTargets)) work.confirmedTargets = [];
+  if (!Array.isArray(work.waitingTargets)) work.waitingTargets = [];
+  if (!work.terminalPath) work.terminalPath = null;
   return tx;
 }
 
@@ -1379,25 +1383,75 @@ function reconciliationRequiredTargets(tx) {
   return targets;
 }
 
+function reconciliationLifecycle(tx) {
+  if (!tx || typeof tx !== "object") {
+    return { expectedTargets: [], terminalPath: null, financeAction: null };
+  }
+  const txStatus = String(tx.status || "").toLowerCase();
+  const payoutStatus = String((tx.disbursement && tx.disbursement.status) || "not_started").toLowerCase();
+  const actionIsLive = (row) => !["cancelled","canceled","rejected","voided"].includes(String(row && row.status || "").toLowerCase());
+  const refundActions = financialActions.filter((row) =>
+    String(row.txId) === String(tx.id) &&
+    ["refund","partial_refund","reversal"].includes(String(row.type)) &&
+    actionIsLive(row)
+  );
+  const payoutActions = financialActions.filter((row) =>
+    String(row.txId) === String(tx.id) &&
+    ["payout","payout_retry"].includes(String(row.type)) &&
+    actionIsLive(row)
+  );
+  const refundExpected = refundActions.length > 0 ||
+    ["refund_authorized","refund_executed_pending_reconciliation","refunded","partially_refunded"].includes(txStatus) ||
+    !!(tx.refundExecution && String(tx.refundExecution.status || "").toLowerCase() !== "cancelled");
+  const payoutExpected = !refundExpected && (
+    payoutActions.length > 0 ||
+    ["completed","released","seller_paid"].includes(txStatus) ||
+    ["pending","successful","failed"].includes(payoutStatus)
+  );
+  const terminalPath = refundExpected ? "refund" : (payoutExpected ? "payout" : null);
+  const expectedTargets = [];
+  if (String(tx.paymentStatus || "").toLowerCase() === "paid") expectedTargets.push("collection");
+  if (refundExpected && (payoutStatus === "successful" || !!tx.payoutReconciled)) expectedTargets.push("payout");
+  if (terminalPath) expectedTargets.push(terminalPath);
+  const actions = terminalPath === "refund" ? refundActions : (terminalPath === "payout" ? payoutActions : []);
+  const financeAction = actions.slice().sort((a,b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))[0] || null;
+  return { expectedTargets, terminalPath, financeAction };
+}
+
 function refreshReconciliationWorkState(tx, actorPhone = null) {
   ensureTxReconDefaults(tx);
   const work = tx.reconciliationWork;
   const targets = reconciliationRequiredTargets(tx);
+  const lifecycle = reconciliationLifecycle(tx);
+  const expectedTargets = lifecycle.expectedTargets;
+  const waitingTargets = expectedTargets.filter((target) => !targets.includes(target));
   const openExceptions = openReconciliationExceptions(tx);
   const matched = (target) => target === "collection" ? !!tx.collectionReconciled
     : target === "payout" ? !!tx.payoutReconciled
     : !!tx.refundReconciled;
-  const complete = targets.length > 0 && targets.every(matched) && openExceptions.length === 0;
+  const pendingTargets = targets.filter((target) => !matched(target));
+  const complete = !!lifecycle.terminalPath && expectedTargets.length > 1 &&
+    waitingTargets.length === 0 && expectedTargets.every(matched) && openExceptions.length === 0;
+  work.expectedTargets = expectedTargets.slice();
+  work.confirmedTargets = targets.slice();
+  work.waitingTargets = waitingTargets.slice();
+  work.terminalPath = lifecycle.terminalPath;
   if (complete) {
     work.status = "completed";
     work.completedAt = work.completedAt || nowIso();
     work.completedBy = actorPhone || work.completedBy || work.assignedTo || "system";
   } else {
-    work.status = openExceptions.length ? "exception" : (work.assignedTo ? "in_progress" : "pending");
+    const financeStatus = String(lifecycle.financeAction && lifecycle.financeAction.status || "").toLowerCase();
+    if (openExceptions.length) work.status = "exception";
+    else if (pendingTargets.length) work.status = work.assignedTo ? "in_progress" : "pending";
+    else if (!expectedTargets.length) work.status = "awaiting_payment";
+    else if (!lifecycle.terminalPath) work.status = "awaiting_outcome";
+    else if (waitingTargets.length) work.status = financeStatus === "processing" ? "awaiting_partner" : "awaiting_finance";
+    else work.status = work.assignedTo ? "in_progress" : "pending";
     work.completedAt = null;
     work.completedBy = null;
   }
-  return { targets, complete, openExceptions };
+  return { targets, expectedTargets, waitingTargets, pendingTargets, terminalPath:lifecycle.terminalPath, complete, openExceptions };
 }
 
 function syncRefundCaseAfterAccountsReconciliation(tx, req, reconciled, note, at = nowIso()) {
@@ -3691,6 +3745,12 @@ function maybeAutoResolveDispute(tx) {
 
 app.get("/api/transactions", requireAuth, (req, res) => {
   transactions.forEach(maybeAutoResolveDispute);
+  if (isAccountingRole(req.user.role)) {
+    transactions.forEach((tx) => {
+      ensureTxReconDefaults(tx);
+      refreshReconciliationWorkState(tx);
+    });
+  }
 
   let view = transactions;
   // Internal staff consoles need platform-wide visibility for operational work.
@@ -4567,7 +4627,7 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
       ...money,
     },
     recentUnreconciled: txs
-      .filter((t) => reconciliationRequiredTargets(t).some((target) => target === "collection" ? !t.collectionReconciled : target === "payout" ? !t.payoutReconciled : !t.refundReconciled))
+      .filter((t) => !["completed","awaiting_payment"].includes(String(t.reconciliationWork && t.reconciliationWork.status || "pending")))
       .slice(-30)
       .reverse()
       .map((t) => ({
@@ -4580,6 +4640,9 @@ app.get("/api/admin/reconciliation/summary", requireAuth, (req, res) => {
         collectionReconciled: !!t.collectionReconciled,
         payoutReconciled: !!t.payoutReconciled,
         reconUpdatedAt: t.reconUpdatedAt || null,
+        reconciliationStatus: t.reconciliationWork && t.reconciliationWork.status || "pending",
+        waitingTargets: t.reconciliationWork && t.reconciliationWork.waitingTargets || [],
+        terminalPath: t.reconciliationWork && t.reconciliationWork.terminalPath || null,
       })),
   });
 });
