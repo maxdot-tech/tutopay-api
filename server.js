@@ -5300,11 +5300,16 @@ app.use((err, req, res, next) => {
     if (status) rows = rows.filter(u => String(u.kycStatus || 'unsubmitted').toLowerCase() === status);
     if (role) rows = rows.filter(u => String(u.role || '').toLowerCase() === role);
     if (q) rows = rows.filter(u => `${u.phone||''} ${u.name||''} ${u.businessName||''} ${u.role||''} ${u.kycStatus||''}`.toLowerCase().includes(q));
-    rows = rows.slice(-limit).reverse().map(u => ({
+    rows = rows.slice(-limit).reverse().map(u => {
+      const profile = u.profile && typeof u.profile === 'object' ? u.profile : {};
+      const kyc = u.kycProfile && typeof u.kycProfile === 'object' ? u.kycProfile : {};
+      const attachmentList = kycAttachmentEntriesFromProfile(kyc);
+      return ({
       id: u.id,
       phone: u.phone,
-      name: u.name || u.fullName || '',
-      businessName: u.businessName || '',
+      name: u.name || u.fullName || profile.displayName || profile.fullName || kyc.fullName || '',
+      displayName: profile.displayName || u.name || u.fullName || kyc.fullName || '',
+      businessName: u.businessName || profile.businessName || kyc.businessName || '',
       role: u.role,
       kycLevel: u.kycLevel || 'basic',
       kycStatus: u.kycStatus || 'unsubmitted',
@@ -5316,13 +5321,27 @@ app.use((err, req, res, next) => {
       kycReviewedAt: u.kycReviewedAt || null,
       createdAt: u.createdAt || null,
       updatedAt: u.updatedAt || null,
-      hasNrc: !!u.nrc,
-      hasSelfie: !!(u.selfieUrl || u.selfie || u.selfieDataUrl),
-      hasBusinessDocs: !!(u.businessDocUrl || u.businessDocs || u.logoUrl),
-      attachmentList: kycAttachmentEntriesFromProfile(u.kycProfile || {}),
+      applicant: {
+        fullName: kyc.fullName || profile.fullName || profile.displayName || u.name || '',
+        idType: kyc.idType || '',
+        idNumber: kyc.idNumber || '',
+        address: kyc.address || '',
+        businessName: kyc.businessName || profile.businessName || u.businessName || '',
+        sellerType: kyc.sellerType || '',
+        requestedKycLevel: u.kycLevel || 'basic',
+      },
+      hasNrc: !!(kyc.idFrontUrl || kyc.passportUrl || kyc.idNumber),
+      hasSelfie: !!kyc.selfieUrl,
+      hasBusinessDocs: !!kyc.businessCertUrl,
+      hasAddressProof: !!kyc.proofOfAddressUrl,
+      attachmentList,
+      kycThread: sanitizeKycThread(u.kycThread),
+      kycHistory: Array.isArray(u.kycHistory) ? u.kycHistory.slice(-30) : [],
+      complianceAssessment: u.complianceAssessment || null,
       complianceRecommendation: u.complianceRecommendation || null,
       complianceWork: u.complianceWork || null,
-    }));
+      });
+    });
     res.json({ ok:true, users: rows });
   });
 
@@ -5392,6 +5411,49 @@ app.use((err, req, res, next) => {
     res.json({ ok:true, work });
   });
 
+  app.post('/api/admin/compliance/users/:phone/assessment', requireAuth, async (req,res)=> {
+    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
+    const user = findUserByPhone(String(req.params.phone || '').trim());
+    if (!user) return res.status(404).json({ error:'User not found' });
+    const work = ensureComplianceWork(user);
+    const actor = String(req.user.phone || '');
+    const admin = String(req.user.role || '').toLowerCase() === 'admin';
+    if (String(work.assignedTo || '') !== actor && !admin) return res.status(403).json({ error:'Assign this KYC item to yourself before saving an assessment.' });
+    const body = req.body || {};
+    const result = String(body.overallResult || '').trim().toLowerCase();
+    if (!['clear','needs_information','concern'].includes(result)) return res.status(400).json({ error:'Choose clear, needs_information, or concern.' });
+    const findings = String(body.findings || '').trim();
+    if (findings.length < 3) return res.status(400).json({ error:'Record the assessment findings.' });
+    const checkNames = [
+      'identityDocumentReviewed',
+      'identityDetailsMatch',
+      'selfieReviewed',
+      'addressReviewed',
+      'businessDocumentsReviewed',
+      'duplicateAccountChecked',
+      'riskIndicatorsChecked',
+      'screeningChecked',
+    ];
+    const checks = Object.fromEntries(checkNames.map(name => [name, !!body[name]]));
+    user.complianceAssessment = {
+      checks,
+      overallResult: result,
+      findings,
+      assessedAt: nowIso(),
+      assessedByPhone: actor,
+      assessedByRole: req.user.role,
+    };
+    appendComplianceWorkHistory(work, req, 'kyc_assessment', findings, {
+      overallResult: result,
+      checksCompleted: Object.values(checks).filter(Boolean).length,
+      checksAvailable: checkNames.length,
+    });
+    user.updatedAt = nowIso();
+    if (dbEnabled()) { try { await dbUpsertUser(user); } catch (_) {} }
+    logAudit(req, 'compliance_kyc_assessment', { targetPhone:user.phone, overallResult:result, checksCompleted:Object.values(checks).filter(Boolean).length });
+    res.json({ ok:true, assessment:user.complianceAssessment, work });
+  });
+
   app.post('/api/admin/compliance/users/:phone/recommend', requireAuth, async (req,res)=> {
     if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
     const user = findUserByPhone(String(req.params.phone || '').trim());
@@ -5400,6 +5462,7 @@ app.use((err, req, res, next) => {
     const actor = String(req.user.phone || '');
     const admin = String(req.user.role || '').toLowerCase() === 'admin';
     if (String(work.assignedTo || '') !== actor && !admin) return res.status(403).json({ error:'Assign this KYC item to yourself before recording a recommendation.' });
+    if (!user.complianceAssessment || !user.complianceAssessment.assessedAt) return res.status(409).json({ error:'Complete and save the structured Compliance assessment before recording a recommendation.' });
     const outcome = String((req.body||{}).outcome || '').toLowerCase();
     if (!['approve','request_more','reject'].includes(outcome)) return res.status(400).json({ error:'Choose approve, request_more, or reject.' });
     const note = String((req.body||{}).note || '').trim();
@@ -7106,7 +7169,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     return serveEvidenceDoc(req,res,got.doc);
   });
 
-  app.get('/api/admin/privacy/users/:phone/kyc-attachment/:key', requireAuth, requirePrivacyStaff, (req,res)=>{
+  app.get('/api/admin/privacy/users/:phone/kyc-attachment/:key', requireAuth, requirePrivacyStaff, async (req,res)=>{
     const phone = sanitizePhone(req.params.phone);
     const key = String(req.params.key || '').trim();
     const user = findUserByPhone(phone);
@@ -7117,7 +7180,23 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if (!entry || !entry.url) return res.status(404).json({ error:'KYC attachment not found' });
     logEvidenceAccess(req, { evidenceType:'kyc', source:'kyc_attachment', targetPhone:phone, docId:key, docName:entry.label||key });
     const u = String(entry.url || '');
-    if (u.startsWith('http')) return res.redirect(u);
+    if (u.startsWith('http')) {
+      try {
+        // Proxy the trusted stored file through this authenticated endpoint.
+        // A redirect would drop the staff Authorization header and could leave
+        // Admin/Compliance with an empty tab instead of the KYC document.
+        const upstream = await fetch(u);
+        if (!upstream.ok) return res.status(502).json({ error:`KYC storage returned ${upstream.status}` });
+        const bytes = Buffer.from(await upstream.arrayBuffer());
+        res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
+        res.setHeader('Content-Disposition', 'inline');
+        res.setHeader('Cache-Control', 'private, no-store');
+        return res.send(bytes);
+      } catch (error) {
+        console.error('[kyc-view] remote file could not be opened:', error && error.message ? error.message : error);
+        return res.status(502).json({ error:'The stored KYC document could not be opened.' });
+      }
+    }
     if (u.startsWith('/uploads/')) {
       const fp = path.join(uploadDir, path.basename(u));
       if (!fs.existsSync(fp)) return res.status(404).json({ error:'KYC file missing on server' });
