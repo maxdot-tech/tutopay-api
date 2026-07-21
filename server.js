@@ -2127,6 +2127,52 @@ function getEffectiveKycLevel(user) {
   return user.kycLevel || "basic";
 }
 
+// KYC documents use the same proven multipart/storage path as dispute evidence.
+// Keep the field map in one place so the initial submission and later replies
+// cannot drift into incompatible upload contracts.
+const KYC_UPLOAD_FIELD_SPECS = [
+  ["idFront", "idFrontUrl", "id-front"],
+  ["idBack", "idBackUrl", "id-back"],
+  ["passport", "passportUrl", "passport"],
+  ["selfie", "selfieUrl", "selfie"],
+  ["proofOfAddress", "proofOfAddressUrl", "proof-address"],
+  ["businessCert", "businessCertUrl", "business-cert"],
+];
+
+const receiveKycUploadFields = (req, res, next) => {
+  disputeUpload.fields(KYC_UPLOAD_FIELD_SPECS.map(([name]) => ({ name, maxCount:1 })))(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ error:"Each KYC file must be 10 MB or smaller." });
+    }
+    return res.status(400).json({ error:err.message || "KYC file upload failed." });
+  });
+};
+
+function cleanupKycMultipartFiles(files) {
+  for (const rows of Object.values(files || {})) {
+    for (const file of (Array.isArray(rows) ? rows : [])) removeTemporaryUpload(file && file.path);
+  }
+}
+
+async function persistKycMultipartFiles(files) {
+  const docs = {};
+  for (const [fieldName, destinationKey, prefix] of KYC_UPLOAD_FIELD_SPECS) {
+    const file = files && Array.isArray(files[fieldName]) ? files[fieldName][0] : null;
+    if (!file) continue;
+    const mime = String(file.mimetype || "").toLowerCase();
+    if (!(mime.startsWith("image/") || mime === "application/pdf" || mime === "application/octet-stream")) {
+      removeTemporaryUpload(file.path);
+      const error = new Error(`${file.originalname || "KYC document"} must be an image or PDF.`);
+      error.statusCode = 415;
+      throw error;
+    }
+    const stored = await persistEvidenceUpload(file, { folder:"tutopay/kyc", prefix });
+    docs[destinationKey] = stored.finalUrl;
+  }
+  return docs;
+}
+
 
 function ensureAdminUserSeed() {
   // Optional staff/admin bootstrap for controlled environments only.
@@ -2672,10 +2718,16 @@ app.get("/api/kyc/me", requireAuth, (req, res) => {
   });
 });
 
-app.post("/api/kyc/submit", requireAuth, async (req, res) => {
-  if (req.user.role === "admin") return res.status(403).json({ error: "Admin accounts do not require KYC submission." });
+app.post("/api/kyc/submit", requireAuth, receiveKycUploadFields, async (req, res) => {
+  if (req.user.role === "admin") {
+    cleanupKycMultipartFiles(req.files);
+    return res.status(403).json({ error: "Admin accounts do not require KYC submission." });
+  }
   const user = ensureUserKycDefaults(findUserByPhone(req.user.phone));
-  if (!user) return res.status(404).json({ error: "User not found" });
+  if (!user) {
+    cleanupKycMultipartFiles(req.files);
+    return res.status(404).json({ error: "User not found" });
+  }
 
   const body = req.body || {};
   const requestedKycLevel = ["basic","enhanced","full"].includes(body.requestedKycLevel) ? body.requestedKycLevel : (user.kycLevel || "basic");
@@ -2683,10 +2735,20 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
   const idNumber = String(body.idNumber || body.nrcNumber || "").trim();
   const fullName = String(body.fullName || (user.profile && (user.profile.displayName || user.profile.fullName)) || "").trim();
   if (!idType || !idNumber || !fullName) {
+    cleanupKycMultipartFiles(req.files);
     return res.status(400).json({ error: "fullName, idType, and idNumber are required for KYC submission." });
   }
 
-  const kycDocs = {};
+  let kycDocs = {};
+  try {
+    kycDocs = await persistKycMultipartFiles(req.files);
+  } catch (fileError) {
+    cleanupKycMultipartFiles(req.files);
+    console.error("[kyc] multipart upload failed:", fileError && fileError.message ? fileError.message : fileError);
+    return res.status(Number(fileError && fileError.statusCode) || (fileError && fileError.code === "EVIDENCE_STORAGE_UNAVAILABLE" ? 503 : 500)).json({
+      error:fileError.message || "KYC documents could not be stored."
+    });
+  }
   const kycDocSpecs = [
     ["idFrontDataUrl", "idFrontUrl", "id-front"],
     ["idBackDataUrl", "idBackUrl", "id-back"],
@@ -2696,6 +2758,7 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
     ["businessCertDataUrl", "businessCertUrl", "business-cert"],
   ];
   for (const [srcKey, dstKey, prefix] of kycDocSpecs) {
+    if (kycDocs[dstKey]) continue;
     const raw = body[srcKey] || body[dstKey] || "";
     if (typeof raw === "string" && raw.trim()) {
       try {
@@ -2759,14 +2822,29 @@ app.post("/api/kyc/submit", requireAuth, async (req, res) => {
 
 
 
-app.post("/api/kyc/reply", requireAuth, async (req, res) => {
-  if (req.user.role === "admin") return res.status(403).json({ error: "Admin cannot use the KYC reply endpoint." });
+app.post("/api/kyc/reply", requireAuth, receiveKycUploadFields, async (req, res) => {
+  if (req.user.role === "admin") {
+    cleanupKycMultipartFiles(req.files);
+    return res.status(403).json({ error: "Admin cannot use the KYC reply endpoint." });
+  }
   const user = ensureKycThreadDefaults(ensureUserKycDefaults(findUserByPhone(req.user.phone)));
-  if (!user) return res.status(404).json({ error: "User not found" });
+  if (!user) {
+    cleanupKycMultipartFiles(req.files);
+    return res.status(404).json({ error: "User not found" });
+  }
 
   const body = req.body || {};
   const message = String(body.message || "").trim();
-  const kycDocs = {};
+  let kycDocs = {};
+  try {
+    kycDocs = await persistKycMultipartFiles(req.files);
+  } catch (fileError) {
+    cleanupKycMultipartFiles(req.files);
+    console.error("[kyc-reply] multipart upload failed:", fileError && fileError.message ? fileError.message : fileError);
+    return res.status(Number(fileError && fileError.statusCode) || (fileError && fileError.code === "EVIDENCE_STORAGE_UNAVAILABLE" ? 503 : 500)).json({
+      error:fileError.message || "KYC documents could not be stored."
+    });
+  }
   const kycDocSpecs = [
     ["idFrontDataUrl", "idFrontUrl", "id-front"],
     ["idBackDataUrl", "idBackUrl", "id-back"],
@@ -2777,6 +2855,7 @@ app.post("/api/kyc/reply", requireAuth, async (req, res) => {
   ];
 
   for (const [srcKey, dstKey, prefix] of kycDocSpecs) {
+    if (kycDocs[dstKey]) continue;
     const raw = body[srcKey] || body[dstKey] || "";
     if (typeof raw === "string" && raw.trim()) {
       try {
