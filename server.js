@@ -2922,6 +2922,7 @@ app.get("/api/admin/kyc/pending", requireAuth, (req, res) => {
       kycProfile: u.kycProfile || {},
       kycThread: sanitizeKycThread(u.kycThread),
       attachmentList: kycAttachmentEntriesFromProfile(u.kycProfile || {}),
+      complianceAssessment: u.complianceAssessment || null,
       complianceRecommendation: u.complianceRecommendation || null,
       complianceWork: u.complianceWork || null,
     }));
@@ -5304,6 +5305,22 @@ app.use((err, req, res, next) => {
       const profile = u.profile && typeof u.profile === 'object' ? u.profile : {};
       const kyc = u.kycProfile && typeof u.kycProfile === 'object' ? u.kycProfile : {};
       const attachmentList = kycAttachmentEntriesFromProfile(kyc);
+      const normalId = String(kyc.idNumber || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+      const normalBusiness = String(kyc.businessName || profile.businessName || u.businessName || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+      const duplicateIdentityMatches = normalId ? users.filter(other => {
+        if (!other || String(other.phone) === String(u.phone)) return false;
+        const otherId = String(other.kycProfile && other.kycProfile.idNumber || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+        return !!otherId && otherId === normalId;
+      }).map(other => ({ phone:other.phone, role:other.role })) : [];
+      const duplicateBusinessMatches = normalBusiness ? users.filter(other => {
+        if (!other || String(other.phone) === String(u.phone)) return false;
+        const otherProfile = other.profile && typeof other.profile === 'object' ? other.profile : {};
+        const otherKyc = other.kycProfile && typeof other.kycProfile === 'object' ? other.kycProfile : {};
+        const otherBusiness = String(otherKyc.businessName || otherProfile.businessName || other.businessName || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+        return !!otherBusiness && otherBusiness === normalBusiness;
+      }).map(other => ({ phone:other.phone, role:other.role })) : [];
+      const userTransactions = issuesTxs().filter(tx => [tx.fromPhone,tx.buyerPhone,tx.toPhone,tx.sellerPhone].some(phone => tpAuthLocalPhone(phone) === tpAuthLocalPhone(u.phone)));
+      const openCaseCount = userTransactions.filter(tx => !!tx.disputeActive || String(tx.status || '').toLowerCase() === 'disputed').length;
       return ({
       id: u.id,
       phone: u.phone,
@@ -5337,6 +5354,15 @@ app.use((err, req, res, next) => {
       attachmentList,
       kycThread: sanitizeKycThread(u.kycThread),
       kycHistory: Array.isArray(u.kycHistory) ? u.kycHistory.slice(-30) : [],
+      reviewSignals: {
+        documentCount: attachmentList.length,
+        duplicateIdentityMatches,
+        duplicateBusinessMatches,
+        totalTransactions: userTransactions.length,
+        openCaseCount,
+        complianceRestricted: !!u.complianceRestricted,
+        restrictionReason: u.restrictionReason || '',
+      },
       complianceAssessment: u.complianceAssessment || null,
       complianceRecommendation: u.complianceRecommendation || null,
       complianceWork: u.complianceWork || null,
@@ -5434,23 +5460,34 @@ app.use((err, req, res, next) => {
       'riskIndicatorsChecked',
       'screeningChecked',
     ];
-    const checks = Object.fromEntries(checkNames.map(name => [name, !!body[name]]));
+    const allowedCheckResults = ['clear','concern','not_applicable','pending'];
+    const submittedResults = body.results && typeof body.results === 'object' ? body.results : {};
+    const results = Object.fromEntries(checkNames.map(name => {
+      const requested = String(submittedResults[name] || (body[name] ? 'clear' : 'pending')).trim().toLowerCase();
+      return [name, allowedCheckResults.includes(requested) ? requested : 'pending'];
+    }));
+    const incomplete = checkNames.filter(name => results[name] === 'pending');
+    if (incomplete.length) return res.status(400).json({ error:`Complete every assessment category. ${incomplete.length} categor${incomplete.length === 1 ? 'y is' : 'ies are'} still pending.` });
+    const checks = Object.fromEntries(checkNames.map(name => [name, results[name] !== 'pending']));
+    const screeningReference = String(body.screeningReference || '').trim();
     user.complianceAssessment = {
       checks,
+      results,
       overallResult: result,
       findings,
+      screeningReference,
       assessedAt: nowIso(),
       assessedByPhone: actor,
       assessedByRole: req.user.role,
     };
     appendComplianceWorkHistory(work, req, 'kyc_assessment', findings, {
       overallResult: result,
-      checksCompleted: Object.values(checks).filter(Boolean).length,
+      checksCompleted: checkNames.length - incomplete.length,
       checksAvailable: checkNames.length,
     });
     user.updatedAt = nowIso();
     if (dbEnabled()) { try { await dbUpsertUser(user); } catch (_) {} }
-    logAudit(req, 'compliance_kyc_assessment', { targetPhone:user.phone, overallResult:result, checksCompleted:Object.values(checks).filter(Boolean).length });
+    logAudit(req, 'compliance_kyc_assessment', { targetPhone:user.phone, overallResult:result, checksCompleted:checkNames.length - incomplete.length });
     res.json({ ok:true, assessment:user.complianceAssessment, work });
   });
 
@@ -5463,6 +5500,8 @@ app.use((err, req, res, next) => {
     const admin = String(req.user.role || '').toLowerCase() === 'admin';
     if (String(work.assignedTo || '') !== actor && !admin) return res.status(403).json({ error:'Assign this KYC item to yourself before recording a recommendation.' });
     if (!user.complianceAssessment || !user.complianceAssessment.assessedAt) return res.status(409).json({ error:'Complete and save the structured Compliance assessment before recording a recommendation.' });
+    const assessmentResults = user.complianceAssessment.results && typeof user.complianceAssessment.results === 'object' ? user.complianceAssessment.results : null;
+    if (assessmentResults && Object.values(assessmentResults).some(value => String(value) === 'pending')) return res.status(409).json({ error:'Complete every assessment category before recording a recommendation.' });
     const outcome = String((req.body||{}).outcome || '').toLowerCase();
     if (!['approve','request_more','reject'].includes(outcome)) return res.status(400).json({ error:'Choose approve, request_more, or reject.' });
     const note = String((req.body||{}).note || '').trim();
