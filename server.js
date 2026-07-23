@@ -1128,6 +1128,10 @@ const ledgerEntries = []; // immutable-ish append-only ledger for money events
 // transaction. This keeps authorisation, execution and reconciliation as
 // distinct events instead of one overloaded transaction status.
 const financialActions = [];
+// Internal staff communications are deliberately stored outside case,
+// transaction and financial-action records. A message may link to a case, but
+// it cannot change that case's workflow state.
+const staffMessages = [];
 
 // ===== PostgreSQL persistence (Railway) =====
 // If DATABASE_URL exists and pg is installed, we persist users/items/transactions/requests/audit logs.
@@ -1303,10 +1307,16 @@ CREATE TABLE IF NOT EXISTS tutopay_incidents (
   ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   data JSONB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tutopay_staff_messages (
+  id TEXT PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  data JSONB NOT NULL
+);
 CREATE INDEX IF NOT EXISTS tutopay_issue_cases_tx_idx ON tutopay_issue_cases(tx_id);
 CREATE INDEX IF NOT EXISTS tutopay_issue_actions_ts_idx ON tutopay_issue_actions(ts);
 CREATE INDEX IF NOT EXISTS tutopay_issue_actions_case_idx ON tutopay_issue_actions(case_id);
 CREATE INDEX IF NOT EXISTS tutopay_incidents_ts_idx ON tutopay_incidents(ts);
+CREATE INDEX IF NOT EXISTS tutopay_staff_messages_created_idx ON tutopay_staff_messages(created_at);
   `);
 }
 
@@ -1562,6 +1572,15 @@ async function dbLoadIntoMemory() {
     }
   } catch (e) {}
 
+  // Internal staff mail (keep the most recent 5000 messages in memory).
+  try {
+    const mail = await _pgPool.query("SELECT data FROM tutopay_staff_messages ORDER BY created_at DESC LIMIT 5000");
+    staffMessages.length = 0;
+    for (const row of (mail.rows || []).reverse()) {
+      if (row && row.data && row.data.id) staffMessages.push(row.data);
+    }
+  } catch (e) {}
+
   // Idempotency cache (optional)
   try {
     const idem = await _pgPool.query("SELECT key, request_hash, status_code, response, EXTRACT(EPOCH FROM expires_at)*1000 AS expires_ms FROM tutopay_idempotency WHERE expires_at > NOW()");
@@ -1685,6 +1704,16 @@ async function dbInsertLedger(entry) {
      VALUES ($1, $2, $3, $4, $5::jsonb)
      ON CONFLICT (id) DO NOTHING`,
     [id, ts, entry.txId ? String(entry.txId) : null, entry.eventType || null, JSON.stringify(entry)]
+  );
+}
+
+async function dbUpsertStaffMessage(message) {
+  if (!_pgPool || !message || !message.id) return;
+  await _pgPool.query(
+    `INSERT INTO tutopay_staff_messages(id, created_at, data)
+     VALUES ($1, $2, $3::jsonb)
+     ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`,
+    [String(message.id), message.createdAt || nowIso(), JSON.stringify(message)]
   );
 }
 
@@ -10076,4 +10105,176 @@ async function checkFinancePartnerAction(action) {
   });
 
   console.log(`[TutoPay] Finance Workflow Phase 2 API loaded (${FINANCE_EXECUTION_MODE})`);
+})();
+
+/* ===== Internal staff communications (isolated module) ===== */
+(() => {
+  const roleLabel = role => ({
+    admin:'Admin',
+    risk_agent:'Risk Agent',
+    fraud_agent:'Fraud Agent',
+    finance_agent:'Finance Agent',
+    accounts_agent:'Accounts Agent',
+    accounts:'Accounts Agent',
+    compliance_agent:'Compliance Agent',
+    compliance_officer:'Compliance Officer',
+  })[String(role || '').toLowerCase()] || String(role || 'Staff').replace(/_/g, ' ');
+
+  const requireInternalStaff = (req,res,next) => {
+    if (!req.user || !isInternalStaffRole(req.user.role)) return res.status(403).json({ error:'Internal staff access required.' });
+    next();
+  };
+
+  function staffDirectoryRows() {
+    return users
+      .filter(user => user && !user.disabled && isInternalStaffRole(user.role))
+      .map(user => ({
+        phone:String(user.phone || ''),
+        name:String(user.name || user.fullName || user.profile?.displayName || user.phone || ''),
+        role:String(user.role || ''),
+        roleLabel:roleLabel(user.role),
+      }))
+      .filter(row => row.phone)
+      .sort((a,b) => `${a.roleLabel} ${a.name}`.localeCompare(`${b.roleLabel} ${b.name}`));
+  }
+
+  function resolveStaffCaseLink(rawValue) {
+    const raw = String(rawValue || '').trim();
+    if (!raw) return null;
+    const store = globalThis.__tpIssueCaseStore;
+    let state = null;
+    if (store && typeof store.get === 'function') {
+      state = store.get(raw) || store.get(raw.toUpperCase()) || null;
+      if (!state && typeof store.values === 'function') {
+        state = Array.from(store.values()).find(row => String(row?.caseId || '').toLowerCase() === raw.toLowerCase()) || null;
+      }
+    }
+    const rawTxId = raw.toUpperCase().startsWith('CASE-') ? raw.slice(5) : raw;
+    let tx = transactions.find(row => String(row?.id || '').toLowerCase() === rawTxId.toLowerCase()) || null;
+    if (!state && tx && tx.dispute) {
+      state = { caseId:`CASE-${tx.id}`, txId:tx.id, status:tx.disputeActive ? 'open' : (tx.dispute?.status || tx.status || 'recorded') };
+    }
+    if (state && !tx) tx = transactions.find(row => String(row?.id || '') === String(state.txId || '')) || null;
+    if (!state) return null;
+    return {
+      caseId:String(state.caseId || `CASE-${state.txId || rawTxId}`),
+      txId:String(state.txId || tx?.id || rawTxId),
+      status:String(state.status || tx?.caseReview?.status || tx?.dispute?.status || tx?.status || 'recorded'),
+      title:String(tx?.itemSnapshot?.title || tx?.itemTitle || tx?.itemCode || 'Transaction case'),
+    };
+  }
+
+  function messageVisibleTo(message, reqUser) {
+    const phone = String(reqUser?.phone || '');
+    if (!phone || !message) return false;
+    if (String(message.senderPhone || '') === phone) return true;
+    if (String(message.recipientType || '') === 'all_staff') return true;
+    return String(message.toPhone || '') === phone;
+  }
+
+  function messageView(message, reqUser) {
+    const readBy = Array.isArray(message.readBy) ? message.readBy : [];
+    const phone = String(reqUser?.phone || '');
+    return {
+      id:message.id,
+      kind:message.kind || 'message',
+      senderPhone:message.senderPhone,
+      senderName:message.senderName || message.senderPhone,
+      senderRole:message.senderRole,
+      senderRoleLabel:roleLabel(message.senderRole),
+      recipientType:message.recipientType,
+      toPhone:message.toPhone || null,
+      toName:message.toName || null,
+      subject:message.subject,
+      body:message.body,
+      caseLink:message.caseLink || null,
+      replyToId:message.replyToId || null,
+      createdAt:message.createdAt,
+      isRead:String(message.senderPhone || '') === phone || readBy.includes(phone),
+      readCount:readBy.length,
+    };
+  }
+
+  app.get('/api/staff/communications', requireAuth, requireInternalStaff, (req,res) => {
+    const relevant = staffMessages
+      .filter(message => messageVisibleTo(message, req.user))
+      .slice()
+      .sort((a,b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+      .slice(0, 500);
+    const views = relevant.map(message => messageView(message, req.user));
+    const unreadCount = views.filter(message => String(message.senderPhone || '') !== String(req.user.phone || '') && !message.isRead).length;
+    res.json({
+      ok:true,
+      messages:views,
+      unreadCount,
+      directory:staffDirectoryRows(),
+      permissions:{
+        canSendAll:true,
+        canPublishAnnouncement:String(req.user.role || '').toLowerCase() === 'admin',
+      },
+    });
+  });
+
+  app.post('/api/staff/communications', requireAuth, requireInternalStaff, async (req,res) => {
+    const body = req.body || {};
+    const kind = String(body.kind || 'message').trim().toLowerCase();
+    if (!['message','announcement'].includes(kind)) return res.status(400).json({ error:'Choose message or announcement.' });
+    const admin = String(req.user.role || '').toLowerCase() === 'admin';
+    if (kind === 'announcement' && !admin) return res.status(403).json({ error:'Only Admin can publish a staff announcement.' });
+    const recipientType = kind === 'announcement' ? 'all_staff' : String(body.recipientType || 'staff').trim().toLowerCase();
+    if (!['staff','all_staff'].includes(recipientType)) return res.status(400).json({ error:'Choose an individual staff member or all staff.' });
+    let target = null;
+    if (recipientType === 'staff') {
+      const toPhone = String(body.toPhone || '').trim();
+      target = users.find(user => String(user?.phone || '') === toPhone && !user.disabled && isInternalStaffRole(user.role)) || null;
+      if (!target) return res.status(404).json({ error:'The selected staff recipient is unavailable.' });
+      if (String(target.phone || '') === String(req.user.phone || '')) return res.status(400).json({ error:'Choose another staff recipient.' });
+    }
+    const subject = String(body.subject || '').trim().slice(0, 140);
+    const text = String(body.body || '').trim().slice(0, 3000);
+    if (subject.length < 3) return res.status(400).json({ error:'Add a subject of at least 3 characters.' });
+    if (text.length < 3) return res.status(400).json({ error:'Write a message of at least 3 characters.' });
+    const caseValue = String(body.caseId || '').trim();
+    const caseLink = caseValue ? resolveStaffCaseLink(caseValue) : null;
+    if (caseValue && !caseLink) return res.status(404).json({ error:'That case number could not be found. Check it before sending.' });
+    const sender = users.find(user => String(user?.phone || '') === String(req.user.phone || '')) || req.user;
+    const message = {
+      id:uuid(),
+      kind,
+      senderPhone:String(req.user.phone || ''),
+      senderName:String(sender?.name || sender?.fullName || sender?.profile?.displayName || req.user.phone || ''),
+      senderRole:String(req.user.role || ''),
+      recipientType,
+      toPhone:target ? String(target.phone || '') : null,
+      toName:target ? String(target.name || target.fullName || target.profile?.displayName || target.phone || '') : null,
+      subject,
+      body:text,
+      caseLink,
+      replyToId:body.replyToId ? String(body.replyToId) : null,
+      createdAt:nowIso(),
+      readBy:[],
+    };
+    staffMessages.push(message);
+    if (staffMessages.length > 5000) staffMessages.splice(0, staffMessages.length - 5000);
+    try { await dbUpsertStaffMessage(message); } catch (error) { console.warn('[staff-mail] save failed:', error && error.message ? error.message : error); }
+    logAudit(req, kind === 'announcement' ? 'staff_announcement_published' : 'staff_message_sent', {
+      messageId:message.id,
+      recipientType,
+      toPhone:message.toPhone,
+      caseId:caseLink?.caseId || null,
+    });
+    res.json({ ok:true, message:messageView(message, req.user) });
+  });
+
+  app.post('/api/staff/communications/:id/read', requireAuth, requireInternalStaff, async (req,res) => {
+    const message = staffMessages.find(row => String(row?.id || '') === String(req.params.id || ''));
+    if (!message || !messageVisibleTo(message, req.user)) return res.status(404).json({ error:'Message not found.' });
+    const phone = String(req.user.phone || '');
+    message.readBy = Array.isArray(message.readBy) ? message.readBy : [];
+    if (String(message.senderPhone || '') !== phone && !message.readBy.includes(phone)) message.readBy.push(phone);
+    try { await dbUpsertStaffMessage(message); } catch (error) { console.warn('[staff-mail] read state save failed:', error && error.message ? error.message : error); }
+    res.json({ ok:true, message:messageView(message, req.user) });
+  });
+
+  console.log('[TutoPay] Internal staff communications API loaded');
 })();
