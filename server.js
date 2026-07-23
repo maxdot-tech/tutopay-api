@@ -5365,14 +5365,160 @@ app.use((err, req, res, next) => {
       },
       complianceAssessment: u.complianceAssessment || null,
       complianceRecommendation: u.complianceRecommendation || null,
+      complianceConductAssessment: u.complianceConductAssessment || null,
+      complianceConductHistory: Array.isArray(u.complianceConductHistory) ? u.complianceConductHistory.slice(-30) : [],
+      complianceSanctionRecommendation: u.complianceSanctionRecommendation || null,
+      complianceSanctionHistory: Array.isArray(u.complianceSanctionHistory) ? u.complianceSanctionHistory.slice(-30) : [],
+      complianceMonitoring: u.complianceMonitoring || null,
+      complianceWarning: u.complianceWarning || null,
       complianceWork: u.complianceWork || null,
       });
     });
     res.json({ ok:true, users: rows });
   });
 
+  app.post('/api/admin/compliance/users/:phone/conduct-assessment', requireAuth, async (req,res)=> {
+    if (!['compliance_agent','compliance_officer'].includes(String(req.user.role || '').toLowerCase())) {
+      return res.status(403).json({ error:'Only a Compliance officer may record this assessment.' });
+    }
+    const user = findUserByPhone(String(req.params.phone || '').trim());
+    if (!user) return res.status(404).json({ error:'User not found' });
+    if (!['buyer','seller'].includes(String(user.role || '').toLowerCase())) return res.status(400).json({ error:'Standards and conduct assessments apply to buyer/seller accounts.' });
+    const body = req.body || {};
+    const categories = ['identityCompliance','transactionConduct','caseCooperation','evidenceResponsiveness','communicationConduct','policyAdherence'];
+    const allowedResults = ['compliant','monitor','concern','insufficient_evidence'];
+    const submitted = body.results && typeof body.results === 'object' ? body.results : {};
+    const results = Object.fromEntries(categories.map(key => {
+      const value = String(submitted[key] || '').trim().toLowerCase();
+      return [key, allowedResults.includes(value) ? value : ''];
+    }));
+    const incomplete = categories.filter(key => !results[key]);
+    if (incomplete.length) return res.status(400).json({ error:`Complete every standards category. ${incomplete.length} still missing.` });
+    const overallResult = String(body.overallResult || '').trim().toLowerCase();
+    if (!['compliant','monitor','concern'].includes(overallResult)) return res.status(400).json({ error:'Choose compliant, monitor, or concern as the overall result.' });
+    const findings = String(body.findings || '').trim();
+    if (findings.length < 8) return res.status(400).json({ error:'Record clear findings of at least 8 characters.' });
+    const assessment = {
+      id: uuid(),
+      results,
+      overallResult,
+      findings,
+      assessedAt: nowIso(),
+      assessedByPhone: String(req.user.phone || ''),
+      assessedByRole: String(req.user.role || ''),
+    };
+    user.complianceConductAssessment = assessment;
+    user.complianceConductHistory = Array.isArray(user.complianceConductHistory) ? user.complianceConductHistory : [];
+    user.complianceConductHistory.push(assessment);
+    if (user.complianceConductHistory.length > 100) user.complianceConductHistory.splice(0, user.complianceConductHistory.length - 100);
+    user.updatedAt = assessment.assessedAt;
+    if (dbEnabled()) { try { await dbUpsertUser(user); } catch (_) {} }
+    logAudit(req, 'compliance_conduct_assessment', { targetPhone:user.phone, overallResult, results });
+    res.json({ ok:true, assessment });
+  });
+
+  app.post('/api/admin/compliance/users/:phone/sanction-recommendation', requireAuth, async (req,res)=> {
+    if (!['compliance_agent','compliance_officer'].includes(String(req.user.role || '').toLowerCase())) {
+      return res.status(403).json({ error:'Only a Compliance officer may submit this recommendation.' });
+    }
+    const user = findUserByPhone(String(req.params.phone || '').trim());
+    if (!user) return res.status(404).json({ error:'User not found' });
+    if (!['buyer','seller'].includes(String(user.role || '').toLowerCase())) return res.status(400).json({ error:'Compliance recommendations apply to buyer/seller accounts.' });
+    if (!user.complianceConductAssessment || !user.complianceConductAssessment.assessedAt) return res.status(409).json({ error:'Save the structured standards and conduct assessment before sending a recommendation.' });
+    if (user.complianceSanctionRecommendation && user.complianceSanctionRecommendation.status === 'awaiting_admin_decision') {
+      return res.status(409).json({ error:'This user already has a recommendation awaiting an Admin decision.' });
+    }
+    const outcome = String((req.body||{}).outcome || '').trim().toLowerCase();
+    const allowed = ['no_action','enhanced_monitoring','formal_warning','temporary_restriction','clear_restriction'];
+    if (!allowed.includes(outcome)) return res.status(400).json({ error:'Choose a valid Compliance recommendation.' });
+    if (outcome === 'clear_restriction' && !user.complianceRestricted) return res.status(409).json({ error:'This account is not currently restricted.' });
+    const reason = String((req.body||{}).reason || '').trim();
+    if (reason.length < 8) return res.status(400).json({ error:'Give Admin a clear recommendation reason of at least 8 characters.' });
+    const recommendation = {
+      id: uuid(),
+      outcome,
+      reason,
+      assessmentId: user.complianceConductAssessment.id || null,
+      at: nowIso(),
+      byPhone: String(req.user.phone || ''),
+      byRole: String(req.user.role || ''),
+      status: 'awaiting_admin_decision',
+    };
+    user.complianceSanctionRecommendation = recommendation;
+    user.complianceSanctionHistory = Array.isArray(user.complianceSanctionHistory) ? user.complianceSanctionHistory : [];
+    user.complianceSanctionHistory.push({ event:'recommended', ...recommendation });
+    if (user.complianceSanctionHistory.length > 100) user.complianceSanctionHistory.splice(0, user.complianceSanctionHistory.length - 100);
+    user.updatedAt = recommendation.at;
+    if (dbEnabled()) { try { await dbUpsertUser(user); } catch (_) {} }
+    logAudit(req, 'compliance_sanction_recommendation', { targetPhone:user.phone, recommendationId:recommendation.id, outcome });
+    res.json({ ok:true, recommendation });
+  });
+
+  app.post('/api/admin/compliance/users/:phone/sanction-decision', requireAuth, async (req,res)=> {
+    if (String(req.user.role || '').toLowerCase() !== 'admin') return res.status(403).json({ error:'Only Admin may make the final Compliance action decision.' });
+    const user = findUserByPhone(String(req.params.phone || '').trim());
+    if (!user) return res.status(404).json({ error:'User not found' });
+    const recommendation = user.complianceSanctionRecommendation;
+    if (!recommendation || recommendation.status !== 'awaiting_admin_decision') return res.status(409).json({ error:'There is no pending Compliance recommendation for this user.' });
+    const decision = String((req.body||{}).decision || '').trim().toLowerCase();
+    if (!['approve','reject'].includes(decision)) return res.status(400).json({ error:'Choose approve or reject.' });
+    const note = String((req.body||{}).note || '').trim();
+    if (note.length < 3) return res.status(400).json({ error:'Record the Admin decision reason.' });
+    const decidedAt = nowIso();
+    recommendation.status = decision === 'approve' ? 'approved' : 'rejected';
+    recommendation.decidedAt = decidedAt;
+    recommendation.decidedByPhone = String(req.user.phone || '');
+    recommendation.decidedByRole = String(req.user.role || '');
+    recommendation.decisionNote = note;
+    if (decision === 'approve') {
+      if (recommendation.outcome === 'temporary_restriction') {
+        user.complianceRestricted = true;
+        user.restrictionReason = recommendation.reason;
+        user.restrictedAt = decidedAt;
+        user.restrictedBy = String(req.user.phone || '');
+        user.restrictionType = 'temporary_pending_admin_review';
+      } else if (recommendation.outcome === 'clear_restriction') {
+        user.complianceRestricted = false;
+        user.restrictionReason = '';
+        user.restrictedAt = null;
+        user.restrictedBy = '';
+        user.restrictionType = '';
+      } else if (recommendation.outcome === 'enhanced_monitoring') {
+        user.complianceMonitoring = { active:true, reason:recommendation.reason, approvedAt:decidedAt, approvedBy:String(req.user.phone || '') };
+      } else if (recommendation.outcome === 'formal_warning') {
+        user.complianceWarning = { active:true, reason:recommendation.reason, approvedAt:decidedAt, approvedBy:String(req.user.phone || '') };
+      }
+    }
+    user.complianceSanctionHistory = Array.isArray(user.complianceSanctionHistory) ? user.complianceSanctionHistory : [];
+    user.complianceSanctionHistory.push({
+      event: decision === 'approve' ? 'admin_approved' : 'admin_rejected',
+      recommendationId: recommendation.id,
+      outcome: recommendation.outcome,
+      note,
+      at: decidedAt,
+      byPhone: String(req.user.phone || ''),
+      byRole: String(req.user.role || ''),
+    });
+    if (user.complianceSanctionHistory.length > 100) user.complianceSanctionHistory.splice(0, user.complianceSanctionHistory.length - 100);
+    user.updatedAt = decidedAt;
+    if (dbEnabled()) { try { await dbUpsertUser(user); } catch (_) {} }
+    logAudit(req, 'compliance_sanction_decision', { targetPhone:user.phone, recommendationId:recommendation.id, outcome:recommendation.outcome, decision });
+    res.json({
+      ok:true,
+      decision,
+      recommendation,
+      user:{
+        phone:user.phone,
+        complianceRestricted:!!user.complianceRestricted,
+        restrictionReason:user.restrictionReason || '',
+        complianceMonitoring:user.complianceMonitoring || null,
+        complianceWarning:user.complianceWarning || null,
+      },
+    });
+  });
+
   app.post('/api/admin/compliance/users/:phone/restrict', requireAuth, async (req,res)=> {
-    if (!isComplianceRole(req.user.role)) return res.status(403).json({ error:'Compliance only' });
+    if (String(req.user.role || '').toLowerCase() !== 'admin') return res.status(403).json({ error:'Only Admin may make a final account restriction decision. Compliance must submit a recommendation.' });
     const phone = String(req.params.phone || '').trim();
     const user = findUserByPhone(phone);
     if (!user) return res.status(404).json({ error:'User not found' });
