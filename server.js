@@ -7293,11 +7293,56 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   app.post('/api/public/share-link-events',(req,res)=>acceptEvent(req,res,false));
   app.post('/api/share-link-events',requireAuth,(req,res)=>acceptEvent(req,res,true));
 
+  function linkedTransactionOutcomes(events){
+    const requestEvents=events.filter(row=>row.eventType==='request_sent' && row.actorPhone);
+    const usedTxIds=new Set();
+    const rows=[];
+    const txTime=tx=>new Date(tx.createdAt||tx.startedAt||tx.updatedAt||0).getTime()||0;
+    const eventTime=row=>new Date(row.createdAt||0).getTime()||0;
+    requestEvents.slice().sort((a,b)=>eventTime(a)-eventTime(b)).forEach(event=>{
+      const match=(Array.isArray(transactions)?transactions:[])
+        .filter(tx=>{
+          if(usedTxIds.has(String(tx.id||''))) return false;
+          const buyer=phone(tx.buyerPhone||tx.fromPhone);
+          const seller=phone(tx.sellerPhone||tx.toPhone);
+          const code=clean(tx.itemCode||tx.code||(tx.itemSnapshot&&tx.itemSnapshot.code),100);
+          if(buyer!==phone(event.actorPhone) || seller!==phone(event.sellerPhone)) return false;
+          if(event.itemCode && code!==clean(event.itemCode,100)) return false;
+          return txTime(tx) >= Math.max(0,eventTime(event)-300000);
+        })
+        .sort((a,b)=>txTime(a)-txTime(b))[0];
+      if(!match) return;
+      usedTxIds.add(String(match.id||''));
+      const status=clean(match.status,60).toLowerCase();
+      const paymentStatus=clean(match.paymentStatus,60).toLowerCase();
+      const paid=!!match.paidAt || ['paid','successful','success','completed'].includes(paymentStatus);
+      const completed=!!match.completedAt || ['completed','complete','released','successful','success'].includes(status);
+      const disputed=!!match.disputeActive || ['disputed','under_review','case_open'].includes(status);
+      rows.push({
+        eventKey:event.eventKey, requestAt:event.createdAt, txId:clean(match.id,120),
+        itemCode:clean(match.itemCode||match.code||(match.itemSnapshot&&match.itemSnapshot.code),100),
+        buyerPhone:phone(match.buyerPhone||match.fromPhone), sellerPhone:phone(match.sellerPhone||match.toPhone),
+        amount:Number(match.amount||0)||0, currency:clean(match.currency||'ZMW',12),
+        status:clean(match.status,60), paymentStatus:clean(match.paymentStatus,60),
+        createdAt:match.createdAt||match.startedAt||'', paidAt:match.paidAt||'', completedAt:match.completedAt||'',
+        paid, completed, disputed
+      });
+    });
+    return rows;
+  }
+
   app.get('/api/admin/pilot/share-analytics',requireAuth,requireShareAnalyticsStaff,async(req,res)=>{
     const events=await listEvents();
     const count=type=>events.filter(row=>row.eventType===type).length;
     const views=count('link_view'), signupStarts=count('signup_started'), authenticatedReturns=count('authenticated_return'), requests=count('request_sent');
     const pct=(value,total)=>total?Math.round(value*1000/total)/10:0;
+    const outcomes=linkedTransactionOutcomes(events);
+    const transactionsStarted=outcomes.length;
+    const paidTransactions=outcomes.filter(row=>row.paid).length;
+    const completedTransactions=outcomes.filter(row=>row.completed).length;
+    const disputedTransactions=outcomes.filter(row=>row.disputed).length;
+    const attributedValue=Math.round(outcomes.reduce((sum,row)=>sum+Number(row.amount||0),0)*100)/100;
+    const completedValue=Math.round(outcomes.filter(row=>row.completed).reduce((sum,row)=>sum+Number(row.amount||0),0)*100)/100;
     const group=(field)=>{
       const map=new Map();
       events.forEach(row=>{const key=clean(row[field]||'unknown',100);if(key&&key!=='unknown')map.set(key,(map.get(key)||0)+1);});
@@ -7306,15 +7351,18 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     res.json({
       ok:true, generatedAt:nowIso(),
       funnel:{ views, signupStarts, authenticatedReturns, requests, signupStartRate:pct(signupStarts,views), authenticatedReturnRate:pct(authenticatedReturns,views), requestConversionRate:pct(requests,views) },
+      outcomes:{ transactionsStarted, paidTransactions, completedTransactions, disputedTransactions, attributedValue, completedValue, transactionConversionRate:pct(transactionsStarted,views), completionConversionRate:pct(completedTransactions,views), requestToTransactionRate:pct(transactionsStarted,requests), currency:'ZMW' },
       topItems:group('itemCode'), topSellers:group('sellerPhone'),
+      recentOutcomes:outcomes.slice().sort((a,b)=>String(b.createdAt||'').localeCompare(String(a.createdAt||''))).slice(0,30),
       recent:events.slice(0,30).map(row=>({eventType:row.eventType,itemCode:row.itemCode,sellerPhone:row.sellerPhone,source:row.source,actorRole:row.actorRole,createdAt:row.createdAt}))
     });
   });
 
   app.get('/api/admin/pilot/share-analytics.csv',requireAuth,requireShareAnalyticsStaff,async(req,res)=>{
     const events=await listEvents();
-    const rows=[['time','event_type','item_code','seller_phone','source','actor_role']];
-    events.forEach(row=>rows.push([row.createdAt,row.eventType,row.itemCode,row.sellerPhone,row.source,row.actorRole]));
+    const outcomeByKey=new Map(linkedTransactionOutcomes(events).map(row=>[row.eventKey,row]));
+    const rows=[['time','event_type','item_code','seller_phone','source','actor_role','transaction_id','transaction_status','payment_status','amount_zmw','paid','completed','disputed']];
+    events.forEach(row=>{const out=outcomeByKey.get(row.eventKey)||{};rows.push([row.createdAt,row.eventType,row.itemCode,row.sellerPhone,row.source,row.actorRole,out.txId||'',out.status||'',out.paymentStatus||'',out.amount||'',out.paid===true?'yes':out.paid===false?'no':'',out.completed===true?'yes':out.completed===false?'no':'',out.disputed===true?'yes':out.disputed===false?'no':'']);});
     const csvValue=value=>{const text=String(value==null?'':value);return /[",\n]/.test(text)?`"${text.replace(/"/g,'""')}"`:text;};
     res.setHeader('Content-Type','text/csv');
     res.setHeader('Content-Disposition','attachment; filename="tutopay-share-link-conversions.csv"');
