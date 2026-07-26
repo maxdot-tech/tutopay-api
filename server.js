@@ -1132,6 +1132,10 @@ const financialActions = [];
 // transaction and financial-action records. A message may link to a case, but
 // it cannot change that case's workflow state.
 const staffMessages = [];
+// Unified staff tasks are derived from the authoritative work queues. Only a
+// staff member's read/acknowledgement state is stored here, so this module
+// cannot conflict with case, Finance, Accounts or Compliance workflow state.
+const staffTaskStates = [];
 
 // ===== PostgreSQL persistence (Railway) =====
 // If DATABASE_URL exists and pg is installed, we persist users/items/transactions/requests/audit logs.
@@ -1312,11 +1316,20 @@ CREATE TABLE IF NOT EXISTS tutopay_staff_messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   data JSONB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tutopay_staff_task_state (
+  state_id TEXT PRIMARY KEY,
+  staff_phone TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  data JSONB NOT NULL
+);
 CREATE INDEX IF NOT EXISTS tutopay_issue_cases_tx_idx ON tutopay_issue_cases(tx_id);
 CREATE INDEX IF NOT EXISTS tutopay_issue_actions_ts_idx ON tutopay_issue_actions(ts);
 CREATE INDEX IF NOT EXISTS tutopay_issue_actions_case_idx ON tutopay_issue_actions(case_id);
 CREATE INDEX IF NOT EXISTS tutopay_incidents_ts_idx ON tutopay_incidents(ts);
 CREATE INDEX IF NOT EXISTS tutopay_staff_messages_created_idx ON tutopay_staff_messages(created_at);
+CREATE INDEX IF NOT EXISTS tutopay_staff_task_state_phone_idx ON tutopay_staff_task_state(staff_phone);
+CREATE INDEX IF NOT EXISTS tutopay_staff_task_state_task_idx ON tutopay_staff_task_state(task_id);
   `);
 }
 
@@ -1581,6 +1594,16 @@ async function dbLoadIntoMemory() {
     }
   } catch (e) {}
 
+  // Staff task read/acknowledgement state. Tasks themselves remain derived
+  // from the authoritative operational records.
+  try {
+    const taskState = await _pgPool.query("SELECT data FROM tutopay_staff_task_state ORDER BY updated_at DESC LIMIT 10000");
+    staffTaskStates.length = 0;
+    for (const row of (taskState.rows || []).reverse()) {
+      if (row && row.data && row.data.stateId) staffTaskStates.push(row.data);
+    }
+  } catch (e) {}
+
   // Idempotency cache (optional)
   try {
     const idem = await _pgPool.query("SELECT key, request_hash, status_code, response, EXTRACT(EPOCH FROM expires_at)*1000 AS expires_ms FROM tutopay_idempotency WHERE expires_at > NOW()");
@@ -1714,6 +1737,24 @@ async function dbUpsertStaffMessage(message) {
      VALUES ($1, $2, $3::jsonb)
      ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`,
     [String(message.id), message.createdAt || nowIso(), JSON.stringify(message)]
+  );
+}
+
+async function dbUpsertStaffTaskState(state) {
+  if (!_pgPool || !state || !state.stateId) return;
+  await _pgPool.query(
+    `INSERT INTO tutopay_staff_task_state(state_id, staff_phone, task_id, updated_at, data)
+     VALUES ($1, $2, $3, $4, $5::jsonb)
+     ON CONFLICT (state_id) DO UPDATE SET
+       updated_at=EXCLUDED.updated_at,
+       data=EXCLUDED.data`,
+    [
+      String(state.stateId),
+      String(state.staffPhone || ""),
+      String(state.taskId || ""),
+      state.updatedAt || nowIso(),
+      JSON.stringify(state),
+    ]
   );
 }
 
@@ -10277,4 +10318,456 @@ async function checkFinancePartnerAction(action) {
   });
 
   console.log('[TutoPay] Internal staff communications API loaded');
+})();
+
+/* ===== Unified staff tasks and alerts (isolated derived-work module) ===== */
+(() => {
+  const STAFF_ROLES = new Set([
+    'admin',
+    'risk_agent',
+    'fraud_agent',
+    'finance_agent',
+    'accounts_agent',
+    'accounts',
+    'compliance_agent',
+    'compliance_officer',
+  ]);
+  const FINANCE_TASK_STATUSES = new Set([
+    'authorized',
+    'assigned',
+    'validated',
+    'processing',
+    'on_hold',
+    'failed',
+    'awaiting_admin_clarification',
+  ]);
+  const TERMINAL_CASE_STATUSES = new Set(['resolved', 'closed', 'cancelled', 'canceled', 'rejected']);
+  const RISK_WAITING_STATUSES = new Set([
+    'awaiting_buyer',
+    'awaiting_seller',
+    'awaiting_both',
+    'awaiting_customer',
+    'waiting_user',
+    'awaiting_admin_approval',
+    'awaiting_finance_execution',
+    'refund_executed_pending_reconciliation',
+  ]);
+  const PRIORITY_WEIGHT = { critical:0, high:1, medium:2, normal:3, low:4 };
+
+  const requireStaff = (req, res, next) => {
+    const role = String(req.user && req.user.role || '').toLowerCase();
+    if (!req.user || !STAFF_ROLES.has(role)) return res.status(403).json({ error:'Internal staff access required.' });
+    next();
+  };
+  const clean = value => String(value == null ? '' : value).trim();
+  const lower = value => clean(value).toLowerCase();
+  const iso = value => {
+    const parsed = Date.parse(value || '');
+    return parsed ? new Date(parsed).toISOString() : null;
+  };
+  const plusHours = (value, hours) => {
+    const base = Date.parse(value || '') || Date.now();
+    return new Date(base + Number(hours || 0) * 3600000).toISOString();
+  };
+  const taskVersion = task => clean(task.updatedAt || task.createdAt || task.id);
+  const stateIdFor = (phone, taskId) => `${clean(phone)}|${clean(taskId)}`;
+  const findState = (phone, taskId) => staffTaskStates.find(row =>
+    clean(row && row.staffPhone) === clean(phone) &&
+    clean(row && row.taskId) === clean(taskId)
+  ) || null;
+
+  function saveState(phone, task, mode) {
+    const taskId = clean(task.id);
+    const version = taskVersion(task);
+    const stateId = stateIdFor(phone, taskId);
+    let state = findState(phone, taskId);
+    if (!state) {
+      state = {
+        stateId,
+        staffPhone:clean(phone),
+        taskId,
+        readAt:null,
+        readVersion:null,
+        acknowledgedAt:null,
+        acknowledgedVersion:null,
+        updatedAt:nowIso(),
+      };
+      staffTaskStates.push(state);
+    }
+    const at = nowIso();
+    state.readAt = at;
+    state.readVersion = version;
+    if (mode === 'acknowledge') {
+      state.acknowledgedAt = at;
+      state.acknowledgedVersion = version;
+    }
+    state.updatedAt = at;
+    if (staffTaskStates.length > 10000) staffTaskStates.splice(0, staffTaskStates.length - 10000);
+    return state;
+  }
+
+  function transactionFor(id) {
+    return transactions.find(row => clean(row && row.id) === clean(id)) || null;
+  }
+
+  function txTitle(tx) {
+    return clean(
+      tx && tx.itemSnapshot && tx.itemSnapshot.title ||
+      tx && tx.itemTitle ||
+      tx && tx.itemCode ||
+      'Transaction'
+    );
+  }
+
+  function baseTask(input) {
+    const createdAt = iso(input.createdAt) || nowIso();
+    const updatedAt = iso(input.updatedAt) || createdAt;
+    return {
+      id:clean(input.id),
+      category:clean(input.category || 'work'),
+      recordType:clean(input.recordType || 'record'),
+      recordId:clean(input.recordId),
+      caseId:clean(input.caseId) || null,
+      txId:clean(input.txId) || null,
+      targetPhone:clean(input.targetPhone) || null,
+      title:clean(input.title || 'Staff task'),
+      summary:clean(input.summary || ''),
+      status:clean(input.status || 'open'),
+      priority:lower(input.priority || 'normal') || 'normal',
+      assignedTo:clean(input.assignedTo) || null,
+      dueAt:iso(input.dueAt),
+      createdAt,
+      updatedAt,
+      openHint:clean(input.openHint || ''),
+      openLabel:clean(input.openLabel || 'Open record'),
+    };
+  }
+
+  function riskTasks(user, role) {
+    const phone = clean(user.phone);
+    const store = globalThis.__tpIssueCaseStore;
+    if (!store || typeof store.values !== 'function') return [];
+    const tasks = [];
+    for (const state of store.values()) {
+      if (!state) continue;
+      const status = lower(state.status || 'open');
+      if (TERMINAL_CASE_STATUSES.has(status)) continue;
+      const assignedTo = clean(state.assignedTo);
+      const tx = transactionFor(state.txId);
+      const pendingAdmin = !!state.pendingAdminApproval || status === 'awaiting_admin_approval';
+      const isAdmin = role === 'admin';
+      if (isAdmin) {
+        if (!pendingAdmin && !state.slaOverdue) continue;
+      } else {
+        if (pendingAdmin || RISK_WAITING_STATUSES.has(status)) continue;
+        if (assignedTo && assignedTo !== phone) continue;
+      }
+      const caseId = clean(state.caseId || (state.txId ? `CASE-${state.txId}` : ''));
+      const overdueOversight = isAdmin && !pendingAdmin && !!state.slaOverdue;
+      tasks.push(baseTask({
+        id:`task:case:${caseId}:${isAdmin ? (pendingAdmin ? 'admin-review' : 'sla-oversight') : 'agent-review'}`,
+        category:isAdmin ? 'admin_review' : 'case_review',
+        recordType:'case',
+        recordId:caseId,
+        caseId,
+        txId:state.txId,
+        title:overdueOversight ? `Overdue case: ${txTitle(tx)}` : (pendingAdmin ? `Review recommendation: ${txTitle(tx)}` : `Review case: ${txTitle(tx)}`),
+        summary:clean(state.nextStep || state.lastActionNote || state.complaintCategory || `Case is ${status.replace(/_/g, ' ')}.`),
+        status,
+        priority:state.priority || (overdueOversight ? 'critical' : 'high'),
+        assignedTo:isAdmin ? null : assignedTo,
+        dueAt:state.slaDeadlineAt || plusHours(state.createdAt, 24),
+        createdAt:state.createdAt || tx && tx.createdAt,
+        updatedAt:state.updatedAt || state.lastActionAt || tx && tx.updatedAt,
+        openHint:'cases',
+        openLabel:'Open case',
+      }));
+    }
+    return tasks;
+  }
+
+  function financeTasks(user) {
+    const phone = clean(user.phone);
+    return financialActions
+      .filter(action => {
+        const status = lower(action && action.status);
+        const owner = clean(action && action.assignedTo);
+        return action && FINANCE_TASK_STATUSES.has(status) && (!owner || owner === phone);
+      })
+      .map(action => {
+        const tx = transactionFor(action.txId);
+        const amount = Number(action.amount || 0).toLocaleString('en-ZM', { maximumFractionDigits:2 });
+        const status = lower(action.status);
+        return baseTask({
+          id:`task:finance:${action.actionId}`,
+          category:status === 'failed' || status === 'on_hold' ? 'finance_exception' : 'finance_action',
+          recordType:'finance_action',
+          recordId:action.actionId,
+          caseId:action.caseId,
+          txId:action.txId,
+          targetPhone:action.beneficiaryPhone,
+          title:`${clean(action.type).replace(/_/g, ' ')} · ZMW ${amount}`,
+          summary:`${txTitle(tx)} · ${status.replace(/_/g, ' ')}`,
+          status,
+          priority:action.priority || (status === 'failed' ? 'critical' : 'high'),
+          assignedTo:action.assignedTo,
+          dueAt:plusHours(action.createdAt, status === 'failed' ? 8 : 24),
+          createdAt:action.createdAt,
+          updatedAt:action.updatedAt,
+          openHint:'finance',
+          openLabel:'Open finance action',
+        });
+      });
+  }
+
+  function accountsTasks(user) {
+    const phone = clean(user.phone);
+    const tasks = [];
+    for (const tx of transactions) {
+      ensureTxReconDefaults(tx);
+      // Reuse the same lifecycle calculation as the Accounts console so
+      // unpaid or waiting-on-Finance records do not appear as Accounts work.
+      refreshReconciliationWorkState(tx);
+      const work = tx.reconciliationWork || {};
+      const status = lower(work.status || 'pending');
+      const owner = clean(work.assignedTo);
+      if (!['pending', 'in_progress', 'exception'].includes(status)) continue;
+      if (owner && owner !== phone) continue;
+      const openExceptions = Array.isArray(work.exceptions)
+        ? work.exceptions.filter(row => lower(row && row.status || 'open') === 'open').length
+        : 0;
+      tasks.push(baseTask({
+        id:`task:accounts:${tx.id}`,
+        category:status === 'exception' ? 'reconciliation_exception' : 'reconciliation',
+        recordType:'reconciliation',
+        recordId:tx.id,
+        txId:tx.id,
+        title:`Reconcile: ${txTitle(tx)}`,
+        summary:openExceptions ? `${openExceptions} open discrepanc${openExceptions === 1 ? 'y' : 'ies'}.` : `Statement matching is ${status.replace(/_/g, ' ')}.`,
+        status,
+        priority:status === 'exception' ? 'high' : 'normal',
+        assignedTo:work.assignedTo,
+        dueAt:plusHours(work.updatedAt || tx.updatedAt || tx.createdAt, status === 'exception' ? 12 : 24),
+        createdAt:tx.createdAt,
+        updatedAt:work.updatedAt || tx.updatedAt,
+        openHint:'accounts',
+        openLabel:'Open reconciliation',
+      }));
+    }
+    return tasks;
+  }
+
+  function complianceTasks(user) {
+    const phone = clean(user.phone);
+    const tasks = [];
+    for (const target of users) {
+      if (!target || !['buyer', 'seller'].includes(lower(target.role))) continue;
+      const status = lower(target.kycStatus);
+      const recommendation = target.complianceRecommendation || {};
+      const sanction = target.complianceSanctionRecommendation || {};
+      if (lower(recommendation.status) === 'awaiting_admin_decision' || lower(sanction.status) === 'awaiting_admin_decision') continue;
+      if (!['pending', 'submitted', 'under_review'].includes(status)) continue;
+      const work = target.complianceWork || {};
+      const owner = clean(work.assignedTo);
+      if (owner && owner !== phone) continue;
+      const displayName = clean(target.name || target.fullName || target.phone);
+      tasks.push(baseTask({
+        id:`task:compliance:kyc:${target.phone}`,
+        category:'kyc_review',
+        recordType:'compliance_kyc',
+        recordId:`kyc:user:${target.phone}`,
+        targetPhone:target.phone,
+        title:`KYC review: ${displayName}`,
+        summary:`${clean(target.role)} account · ${status.replace(/_/g, ' ')}`,
+        status,
+        priority:status === 'submitted' ? 'high' : 'normal',
+        assignedTo:work.assignedTo,
+        dueAt:plusHours(target.kycSubmittedAt || target.updatedAt || target.createdAt, 48),
+        createdAt:target.createdAt,
+        updatedAt:work.updatedAt || target.updatedAt || target.kycSubmittedAt,
+        openHint:'compliance',
+        openLabel:'Open KYC review',
+      }));
+    }
+    const incidents = globalThis.__tpComplianceIncidents || [];
+    for (const incident of incidents) {
+      if (!incident || ['closed', 'resolved'].includes(lower(incident.status))) continue;
+      const work = incident.complianceWork || {};
+      const owner = clean(work.assignedTo);
+      if (owner && owner !== phone) continue;
+      const severity = lower(incident.severity || incident.priority || 'medium');
+      const hours = severity === 'critical' ? 12 : severity === 'high' ? 24 : severity === 'low' ? 72 : 48;
+      tasks.push(baseTask({
+        id:`task:compliance:incident:${incident.id}`,
+        category:'compliance_incident',
+        recordType:'compliance_incident',
+        recordId:`incident:${incident.id}`,
+        title:`Incident: ${clean(incident.title || incident.category || incident.type || incident.id)}`,
+        summary:clean(incident.summary || incident.description || `Incident is ${lower(incident.status || 'open')}.`),
+        status:incident.status || 'open',
+        priority:severity,
+        assignedTo:work.assignedTo,
+        dueAt:incident.dueAt || plusHours(incident.createdAt || incident.ts, hours),
+        createdAt:incident.createdAt || incident.ts,
+        updatedAt:work.updatedAt || incident.updatedAt || incident.ts,
+        openHint:'compliance',
+        openLabel:'Open incident',
+      }));
+    }
+    return tasks;
+  }
+
+  function adminComplianceTasks() {
+    const tasks = [];
+    for (const target of users) {
+      if (!target || !['buyer', 'seller'].includes(lower(target.role))) continue;
+      const displayName = clean(target.name || target.fullName || target.phone);
+      const recommendation = target.complianceRecommendation || null;
+      if (recommendation && lower(recommendation.status) === 'awaiting_admin_decision') {
+        tasks.push(baseTask({
+          id:`task:admin:kyc:${target.phone}:${recommendation.at || 'pending'}`,
+          category:'admin_compliance',
+          recordType:'compliance_kyc_admin',
+          recordId:`kyc:user:${target.phone}`,
+          targetPhone:target.phone,
+          title:`KYC decision: ${displayName}`,
+          summary:`Compliance recommends ${clean(recommendation.outcome).replace(/_/g, ' ')}.`,
+          status:'awaiting_admin_decision',
+          priority:'high',
+          dueAt:plusHours(recommendation.at, 24),
+          createdAt:recommendation.at,
+          updatedAt:recommendation.at,
+          openHint:'compliance',
+          openLabel:'Review KYC recommendation',
+        }));
+      }
+      const sanction = target.complianceSanctionRecommendation || null;
+      if (sanction && lower(sanction.status) === 'awaiting_admin_decision') {
+        tasks.push(baseTask({
+          id:`task:admin:conduct:${target.phone}:${sanction.id || sanction.at || 'pending'}`,
+          category:'admin_compliance',
+          recordType:'compliance_sanction_admin',
+          recordId:`conduct:user:${target.phone}`,
+          targetPhone:target.phone,
+          title:`Conduct decision: ${displayName}`,
+          summary:`Compliance recommends ${clean(sanction.outcome).replace(/_/g, ' ')}.`,
+          status:'awaiting_admin_decision',
+          priority:'high',
+          dueAt:plusHours(sanction.at, 24),
+          createdAt:sanction.at,
+          updatedAt:sanction.at,
+          openHint:'compliance',
+          openLabel:'Review conduct recommendation',
+        }));
+      }
+    }
+    for (const action of financialActions) {
+      if (!action || lower(action.status) !== 'awaiting_admin_clarification') continue;
+      tasks.push(baseTask({
+        id:`task:admin:finance:${action.actionId}`,
+        category:'admin_finance',
+        recordType:'finance_action_admin',
+        recordId:action.actionId,
+        caseId:action.caseId,
+        txId:action.txId,
+        title:`Finance clarification: ${clean(action.type).replace(/_/g, ' ')}`,
+        summary:clean(action.holds && action.holds.slice(-1)[0] && action.holds.slice(-1)[0].reason || 'Finance requires an Admin clarification.'),
+        status:action.status,
+        priority:'high',
+        dueAt:plusHours(action.updatedAt || action.createdAt, 12),
+        createdAt:action.createdAt,
+        updatedAt:action.updatedAt,
+        openHint:'finance',
+        openLabel:'Open finance action',
+      }));
+    }
+    return tasks;
+  }
+
+  function derivedTasks(user) {
+    const role = lower(user && user.role);
+    let tasks = [];
+    if (role === 'admin') tasks = riskTasks(user, role).concat(adminComplianceTasks());
+    if (role === 'risk_agent' || role === 'fraud_agent') tasks = riskTasks(user, role);
+    if (role === 'finance_agent') tasks = financeTasks(user);
+    if (role === 'accounts_agent' || role === 'accounts') tasks = accountsTasks(user);
+    if (role === 'compliance_agent' || role === 'compliance_officer') tasks = complianceTasks(user);
+    const phone = clean(user && user.phone);
+    const now = Date.now();
+    return tasks.map(task => {
+      const state = findState(phone, task.id);
+      const version = taskVersion(task);
+      const dueMs = Date.parse(task.dueAt || '') || 0;
+      return {
+        ...task,
+        isRead:!!(state && state.readVersion === version),
+        readAt:state && state.readVersion === version ? state.readAt : null,
+        isAcknowledged:!!(state && state.acknowledgedVersion === version),
+        acknowledgedAt:state && state.acknowledgedVersion === version ? state.acknowledgedAt : null,
+        overdue:!!(dueMs && dueMs < now),
+        dueSoon:!!(dueMs && dueMs >= now && dueMs <= now + 6 * 3600000),
+      };
+    }).sort((a, b) => {
+      if (a.overdue !== b.overdue) return a.overdue ? -1 : 1;
+      const priority = (PRIORITY_WEIGHT[a.priority] ?? 9) - (PRIORITY_WEIGHT[b.priority] ?? 9);
+      if (priority) return priority;
+      const aDue = Date.parse(a.dueAt || '') || Number.MAX_SAFE_INTEGER;
+      const bDue = Date.parse(b.dueAt || '') || Number.MAX_SAFE_INTEGER;
+      if (aDue !== bDue) return aDue - bDue;
+      return String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''));
+    });
+  }
+
+  function taskSummary(tasks, phone) {
+    return {
+      total:tasks.length,
+      unread:tasks.filter(task => !task.isRead).length,
+      overdue:tasks.filter(task => task.overdue).length,
+      dueSoon:tasks.filter(task => task.dueSoon).length,
+      mine:tasks.filter(task => clean(task.assignedTo) === clean(phone)).length,
+      unassigned:tasks.filter(task => !clean(task.assignedTo)).length,
+      acknowledged:tasks.filter(task => task.isAcknowledged).length,
+    };
+  }
+
+  app.get('/api/staff/tasks', requireAuth, requireStaff, (req, res) => {
+    const tasks = derivedTasks(req.user);
+    res.json({
+      ok:true,
+      generatedAt:nowIso(),
+      tasks,
+      summary:taskSummary(tasks, req.user.phone),
+    });
+  });
+
+  app.post('/api/staff/tasks/read-all', requireAuth, requireStaff, async (req, res) => {
+    const tasks = derivedTasks(req.user);
+    const states = tasks.map(task => saveState(req.user.phone, task, 'read'));
+    await Promise.all(states.map(state => dbUpsertStaffTaskState(state).catch(() => {})));
+    res.json({ ok:true, updated:states.length });
+  });
+
+  app.post('/api/staff/tasks/:taskId/read', requireAuth, requireStaff, async (req, res) => {
+    const task = derivedTasks(req.user).find(row => clean(row.id) === clean(req.params.taskId));
+    if (!task) return res.status(404).json({ error:'Task not found or no longer available.' });
+    const state = saveState(req.user.phone, task, 'read');
+    try { await dbUpsertStaffTaskState(state); } catch (_) {}
+    res.json({ ok:true, taskId:task.id, readAt:state.readAt });
+  });
+
+  app.post('/api/staff/tasks/:taskId/acknowledge', requireAuth, requireStaff, async (req, res) => {
+    const task = derivedTasks(req.user).find(row => clean(row.id) === clean(req.params.taskId));
+    if (!task) return res.status(404).json({ error:'Task not found or no longer available.' });
+    const state = saveState(req.user.phone, task, 'acknowledge');
+    try { await dbUpsertStaffTaskState(state); } catch (_) {}
+    logAudit(req, 'staff_task_acknowledged', {
+      taskId:task.id,
+      category:task.category,
+      recordType:task.recordType,
+      recordId:task.recordId,
+    });
+    res.json({ ok:true, taskId:task.id, acknowledgedAt:state.acknowledgedAt });
+  });
+
+  console.log('[TutoPay] Unified staff tasks and alerts API loaded');
 })();
