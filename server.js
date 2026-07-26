@@ -7191,6 +7191,139 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
 })();
 
+/* ===== Seller share-link conversion tracking =====
+   Records a small, non-financial acquisition funnel without changing catalogue,
+   request, authentication, payment or dispute decisions.
+*/
+(() => {
+  const memoryEvents = globalThis.__tpShareLinkEvents || (globalThis.__tpShareLinkEvents = []);
+  const allowedTypes = new Set(['link_view','signup_started','authenticated_return','request_sent']);
+  let storeReady = false;
+  const clean = (value, max=180) => String(value == null ? '' : value).trim().slice(0, max);
+  const phone = value => clean(value, 40).replace(/\s+/g, '');
+  const role = req => clean(req && req.user && req.user.role, 40).toLowerCase();
+  const requireShareAnalyticsStaff = (req,res,next) =>
+    (role(req)==='admin' || isInternalStaffRole(role(req))) ? next() : res.status(403).json({ error:'Internal staff access required.' });
+
+  async function ensureStore(){
+    if (!dbEnabled() || !_pgPool) return false;
+    if (storeReady) return true;
+    await _pgPool.query(`
+      CREATE TABLE IF NOT EXISTS tutopay_share_link_events (
+        id TEXT PRIMARY KEY,
+        event_key TEXT UNIQUE,
+        event_type TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data JSONB NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS tutopay_share_link_events_type_idx ON tutopay_share_link_events(event_type);
+      CREATE INDEX IF NOT EXISTS tutopay_share_link_events_created_idx ON tutopay_share_link_events(created_at);
+    `);
+    storeReady = true;
+    return true;
+  }
+
+  async function saveEvent(event){
+    try {
+      if (await ensureStore()) {
+        const result = await _pgPool.query(
+          `INSERT INTO tutopay_share_link_events(id,event_key,event_type,created_at,data)
+           VALUES($1,$2,$3,$4,$5::jsonb)
+           ON CONFLICT(event_key) DO NOTHING
+           RETURNING id`,
+          [event.id,event.eventKey,event.eventType,new Date(event.createdAt),JSON.stringify(event)]
+        );
+        return result.rowCount > 0;
+      }
+    } catch(error) {
+      console.warn('[share-links] database unavailable; using memory fallback:',error&&error.message?error.message:error);
+    }
+    if (memoryEvents.some(row=>row.eventKey===event.eventKey)) return false;
+    memoryEvents.push(event);
+    if (memoryEvents.length > 10000) memoryEvents.splice(0,memoryEvents.length-10000);
+    return true;
+  }
+
+  async function listEvents(limit=10000){
+    try {
+      if (await ensureStore()) {
+        const result = await _pgPool.query(
+          `SELECT data FROM tutopay_share_link_events ORDER BY created_at DESC LIMIT $1`,
+          [Math.max(1,Math.min(20000,Number(limit)||10000))]
+        );
+        return result.rows.map(row=>row.data);
+      }
+    } catch(error) {
+      console.warn('[share-links] analytics database unavailable; using memory fallback:',error&&error.message?error.message:error);
+    }
+    return memoryEvents.slice().reverse().slice(0,limit);
+  }
+
+  function eventFrom(req, authenticated){
+    const body=req.body||{};
+    const eventType=clean(body.eventType,40).toLowerCase();
+    if(!allowedTypes.has(eventType)) return { error:'Invalid share-link event.' };
+    const sessionKey=clean(body.sessionKey,120);
+    const itemCode=clean(body.itemCode,100);
+    const sellerPhone=phone(body.sellerPhone);
+    if(!sessionKey || (!itemCode && !sellerPhone)) return { error:'Missing share-link context.' };
+    const actorPhone=authenticated ? phone(req.user&&req.user.phone) : '';
+    const eventKey=crypto.createHash('sha256').update([sessionKey,eventType,itemCode,sellerPhone,actorPhone].join('|')).digest('hex');
+    return {
+      id:uuid(), eventKey, eventType, itemCode, sellerPhone,
+      source:clean(body.source||body.ref||'seller_share',80),
+      actorPhone, actorRole:authenticated?role(req):'guest',
+      createdAt:nowIso()
+    };
+  }
+
+  async function acceptEvent(req,res,authenticated){
+    try{
+      const event=eventFrom(req,authenticated);
+      if(event.error) return res.status(400).json({ error:event.error });
+      if(!authenticated && !['link_view','signup_started'].includes(event.eventType)) return res.status(403).json({ error:'Authentication required for this event.' });
+      const created=await saveEvent(event);
+      res.json({ ok:true, recorded:created });
+    }catch(error){
+      console.error('[share-links] event save failed:',error&&error.message?error.message:error);
+      res.status(500).json({ error:'Could not record share-link activity.' });
+    }
+  }
+
+  app.post('/api/public/share-link-events',(req,res)=>acceptEvent(req,res,false));
+  app.post('/api/share-link-events',requireAuth,(req,res)=>acceptEvent(req,res,true));
+
+  app.get('/api/admin/pilot/share-analytics',requireAuth,requireShareAnalyticsStaff,async(req,res)=>{
+    const events=await listEvents();
+    const count=type=>events.filter(row=>row.eventType===type).length;
+    const views=count('link_view'), signupStarts=count('signup_started'), authenticatedReturns=count('authenticated_return'), requests=count('request_sent');
+    const pct=(value,total)=>total?Math.round(value*1000/total)/10:0;
+    const group=(field)=>{
+      const map=new Map();
+      events.forEach(row=>{const key=clean(row[field]||'unknown',100);if(key&&key!=='unknown')map.set(key,(map.get(key)||0)+1);});
+      return Array.from(map.entries()).map(([key,value])=>({key,value})).sort((a,b)=>b.value-a.value).slice(0,10);
+    };
+    res.json({
+      ok:true, generatedAt:nowIso(),
+      funnel:{ views, signupStarts, authenticatedReturns, requests, signupStartRate:pct(signupStarts,views), authenticatedReturnRate:pct(authenticatedReturns,views), requestConversionRate:pct(requests,views) },
+      topItems:group('itemCode'), topSellers:group('sellerPhone'),
+      recent:events.slice(0,30).map(row=>({eventType:row.eventType,itemCode:row.itemCode,sellerPhone:row.sellerPhone,source:row.source,actorRole:row.actorRole,createdAt:row.createdAt}))
+    });
+  });
+
+  app.get('/api/admin/pilot/share-analytics.csv',requireAuth,requireShareAnalyticsStaff,async(req,res)=>{
+    const events=await listEvents();
+    const rows=[['time','event_type','item_code','seller_phone','source','actor_role']];
+    events.forEach(row=>rows.push([row.createdAt,row.eventType,row.itemCode,row.sellerPhone,row.source,row.actorRole]));
+    const csvValue=value=>{const text=String(value==null?'':value);return /[",\n]/.test(text)?`"${text.replace(/"/g,'""')}"`:text;};
+    res.setHeader('Content-Type','text/csv');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-share-link-conversions.csv"');
+    res.end(rows.map(row=>row.map(csvValue).join(',')).join('\n'));
+  });
+
+  console.log('[TutoPay] Seller share-link conversion tracking loaded');
+})();
+
 /* ===== Pilot Evidence + Reporting Pack (read-only, isolated) ===== */
 (() => {
   if (globalThis.__tpPilotEvidenceReportingPack) return;
