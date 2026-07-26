@@ -69,6 +69,27 @@ const STRICT_DB_MODE = String(process.env.STRICT_DB_MODE || ((APP_ENV === "produ
 const DB_INIT_RETRIES = Math.max(1, Number(process.env.DB_INIT_RETRIES || 10));
 const DB_INIT_RETRY_DELAY_MS = Math.max(500, Number(process.env.DB_INIT_RETRY_DELAY_MS || 3000));
 
+// Railway terminates HTTPS at its proxy. Trust one hop so request IPs and
+// security-sensitive rate limits use the real client rather than the proxy.
+app.set("trust proxy", Math.max(1, Number(process.env.TRUST_PROXY_HOPS || 1)));
+app.disable("x-powered-by");
+
+// Dependency-free API security baseline. Avoid a global CSP/CORP policy here:
+// the frontend is intentionally served from tutopay.online while this API is
+// served from api.tutopay.online.
+app.use((req, res, next) => {
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("X-Frame-Options", "DENY");
+  res.set("Referrer-Policy", "no-referrer");
+  res.set("Permissions-Policy", "camera=(), microphone=(), payment=()");
+  if (APP_ENV === "production") {
+    res.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  const sensitiveApi = /^\/api\/(?:auth|admin|finance|issues|staff|privacy|kyc|evidence)(?:\/|$)/.test(req.path || "");
+  if (sensitiveApi) res.set("Cache-Control", "private, no-store, max-age=0");
+  next();
+});
+
 
 /**
  * Simple in-memory rate limiter (no extra dependencies).
@@ -165,11 +186,11 @@ app.get('/ready', (req, res) => {
 
 app.all('/health', (req, res) => {
   // Liveness: always 200 if the HTTP server is up.
-  // Includes DB readiness info for humans (Railway healthcheck should point here).
+  // Do not expose raw connection errors on this public endpoint.
   res.status(200).json({
     ok: true,
     dbReady,
-    dbError: dbInitError ? (dbInitError.message || String(dbInitError)) : null,
+    dbStatus: dbInitError ? "unavailable" : (dbReady ? "ready" : "starting"),
     time: new Date().toISOString(),
   });
 });
@@ -379,6 +400,21 @@ function safeEq(a, b) {
   const bb = Buffer.from(String(b || ""));
   if (aa.length !== bb.length) return false;
   try { return crypto.timingSafeEqual(aa, bb); } catch { return false; }
+}
+
+const SENSITIVE_FIELD_RE = /^(?:authorization|cookie|set-cookie|password|pin|secret|token|access[_-]?token|api[_-]?key|subscription[_-]?key|ocp-apim-subscription-key)$/i;
+function redactSensitivePayload(value, depth = 0) {
+  if (depth > 7) return "[truncated]";
+  if (Array.isArray(value)) return value.slice(0, 100).map((entry) => redactSensitivePayload(entry, depth + 1));
+  if (!value || typeof value !== "object") {
+    if (typeof value === "string" && value.length > 4000) return `${value.slice(0, 4000)}…`;
+    return value;
+  }
+  const clean = {};
+  for (const [key, entry] of Object.entries(value)) {
+    clean[key] = SENSITIVE_FIELD_RE.test(String(key)) ? "[REDACTED]" : redactSensitivePayload(entry, depth + 1);
+  }
+  return clean;
 }
 
 function verifyProviderCallback(req, provider) {
@@ -750,7 +786,7 @@ function processProviderCallback(req, res, provider, kind) {
   const normStatus = normalizeCallbackStatus(info.status, provider);
 
   if (!reference) {
-    logAudit(req, "callback_invalid", { provider, kind, reason: "missing_reference", body: req.body });
+    logAudit(req, "callback_invalid", { provider, kind, reason: "missing_reference", body: redactSensitivePayload(req.body) });
     return res.status(400).json({ error: "Missing callback reference" });
   }
 
@@ -767,17 +803,18 @@ function processProviderCallback(req, res, provider, kind) {
   }
 
   ensureTxReconDefaults(tx);
+  const safeRaw = redactSensitivePayload(info.raw);
 
   if (kind === "collection") {
-    applyCollectionCallbackUpdate(tx, provider, normStatus, reference, info.raw);
+    applyCollectionCallbackUpdate(tx, provider, normStatus, reference, safeRaw);
     logAudit(req, "callback_collection_processed", { provider, txId: tx.id, reference, status: normStatus });
   } else {
     const financeAction = findFinancialActionByPartnerReference(reference);
     if (financeAction && ['refund','partial_refund','reversal'].includes(String(financeAction.type))) {
-      applyFinancePartnerResult(financeAction, tx, normStatus, reference, info.raw, {phone:'system',role:'system'});
+      applyFinancePartnerResult(financeAction, tx, normStatus, reference, safeRaw, {phone:'system',role:'system'});
     } else {
-      applyPayoutCallbackUpdate(tx, normStatus, reference, info.raw);
-      if (financeAction) applyFinancePartnerResult(financeAction, tx, normStatus, reference, info.raw, {phone:'system',role:'system'});
+      applyPayoutCallbackUpdate(tx, normStatus, reference, safeRaw);
+      if (financeAction) applyFinancePartnerResult(financeAction, tx, normStatus, reference, safeRaw, {phone:'system',role:'system'});
     }
     logAudit(req, "callback_payout_processed", { provider, txId: tx.id, reference, status: normStatus });
   }
@@ -789,7 +826,14 @@ function processProviderCallback(req, res, provider, kind) {
 
 // Legacy MTN callback path (kept for compatibility)
 app.post("/momo/callback", (req, res) => {
-  try { console.log("MoMo callback:", JSON.stringify({ headers: req.headers, body: req.body })); } catch {}
+  try {
+    const info = extractMtnCallbackFields(req.body);
+    console.log("MoMo callback:", JSON.stringify({
+      reference:info.reference || null,
+      status:info.status || null,
+      receivedAt:nowIso(),
+    }));
+  } catch {}
   return processProviderCallback(req, res, "mtn", "collection");
 });
 
@@ -1192,6 +1236,7 @@ async function dbInit() {
 
       await _pgPool.query("SELECT 1 as ok");
       await dbEnsureSchema();
+      await dbDeleteExpiredSessions();
       await dbLoadIntoMemory();
       await dbLoadOpsIntoMemory();
       await dbLoadFinancialActions();
@@ -1646,6 +1691,10 @@ async function dbLoadIntoMemory() {
 }
 
 
+function sessionTokenKey(token) {
+  return `sha256:${crypto.createHash("sha256").update(String(token || "")).digest("hex")}`;
+}
+
 async function dbUpsertSession(token, sessionObj) {
   if (!_pgPool) return;
   const expiresAtIso = sessionObj && sessionObj.expiresAt ? new Date(sessionObj.expiresAt).toISOString() : null;
@@ -1653,13 +1702,22 @@ async function dbUpsertSession(token, sessionObj) {
     `INSERT INTO tutopay_sessions (token, data, expires_at, updated_at)
      VALUES ($1, $2, $3, NOW())
      ON CONFLICT (token) DO UPDATE SET data = EXCLUDED.data, expires_at = EXCLUDED.expires_at, updated_at = NOW()`,
-    [String(token), sessionObj, expiresAtIso]
+    [sessionTokenKey(token), sessionObj, expiresAtIso]
   );
 }
 
 async function dbGetSession(token) {
   if (!_pgPool) return null;
-  const r = await _pgPool.query(`SELECT token, data, expires_at FROM tutopay_sessions WHERE token = $1 LIMIT 1`, [String(token)]);
+  const hashedToken = sessionTokenKey(token);
+  const rawToken = String(token);
+  const r = await _pgPool.query(
+    `SELECT token, data, expires_at
+       FROM tutopay_sessions
+      WHERE token = $1 OR token = $2
+      ORDER BY CASE WHEN token = $1 THEN 0 ELSE 1 END
+      LIMIT 1`,
+    [hashedToken, rawToken]
+  );
   if (!r.rows || !r.rows.length) return null;
   const row = r.rows[0];
   const data = row.data || null;
@@ -1668,12 +1726,32 @@ async function dbGetSession(token) {
   if (row.expires_at) {
     try { data.expiresAt = new Date(row.expires_at).getTime(); } catch(e){}
   }
+  if (data.expiresAt && Date.now() > data.expiresAt) {
+    await dbDeleteSession(token);
+    return null;
+  }
+  // Transparently migrate sessions created by earlier versions that stored raw bearer tokens.
+  if (String(row.token) === rawToken) {
+    await dbUpsertSession(token, data);
+    await _pgPool.query(`DELETE FROM tutopay_sessions WHERE token = $1`, [rawToken]);
+  }
   return data;
 }
 
 async function dbDeleteSession(token) {
   if (!_pgPool) return;
-  await _pgPool.query(`DELETE FROM tutopay_sessions WHERE token = $1`, [String(token)]);
+  await _pgPool.query(
+    `DELETE FROM tutopay_sessions WHERE token = $1 OR token = $2`,
+    [sessionTokenKey(token), String(token)]
+  );
+}
+
+async function dbDeleteExpiredSessions() {
+  if (!_pgPool) return 0;
+  const result = await _pgPool.query(
+    `DELETE FROM tutopay_sessions WHERE expires_at IS NOT NULL AND expires_at <= NOW()`
+  );
+  return Number(result.rowCount || 0);
 }
 
 async function dbUpsertUser(user) {
@@ -2157,6 +2235,7 @@ setInterval(() => {
     if (state.lockedUntil && now >= state.lockedUntil) { loginAttempts.delete(phone); continue; }
     if ((!state.lockedUntil) && state.firstAt && (now - state.firstAt > LOGIN_WINDOW_MS)) loginAttempts.delete(phone);
   }
+  if (dbEnabled()) dbDeleteExpiredSessions().catch(() => {});
 }, 60 * 1000).unref?.();
 
 
@@ -2339,16 +2418,24 @@ if (SEED_DEMO_USERS) {
 }
 
 if (SEED_STAFF_ADMIN) ensureAdminUserSeed();
+
+function queryExportTokenAllowed(req) {
+  if (String(req.method || "").toUpperCase() !== "GET") return false;
+  const path = String(req.path || "").toLowerCase();
+  return path.endsWith(".csv") ||
+    path.endsWith(".txt") ||
+    /\/export(?:\/|$)/.test(path);
+}
+
 // Auth middleware
 async function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const parts = auth.split(" ");
   let token = parts.length === 2 && parts[0] === "Bearer" ? parts[1] : null;
-  // Some browser download flows cannot attach Authorization headers reliably.
-  // For CSV exports we also allow token via query string: ?export_token=...
-  if (!token) {
+  // Only explicit read-only download/export endpoints may use a query token.
+  if (!token && queryExportTokenAllowed(req)) {
     const q = req.query || {};
-    token = (q.export_token || q.token || null);
+    token = q.export_token ? String(q.export_token) : null;
   }
 
   
@@ -2383,6 +2470,7 @@ if (!token || !sessions.has(token)) {
     session.disabled = !!currentUser.disabled;
     if (session.disabled) {
       sessions.delete(token);
+      if (dbEnabled()) dbDeleteSession(token).catch(() => {});
       return res.status(403).json({ error: "This account has been disabled. Please contact support." });
     }
   }
@@ -2801,11 +2889,16 @@ const token = crypto.randomBytes(24).toString("hex");
 });
 
 
-app.post("/api/auth/logout", requireAuth, (req, res) => {
+app.post("/api/auth/logout", requireAuth, async (req, res) => {
+  const token = req.authToken;
+  if (token) sessions.delete(token);
   try {
-    if (req.authToken) sessions.delete(req.authToken);
+    if (token && dbEnabled()) await dbDeleteSession(token);
     logAudit(req, "auth_logout", { phone: req.user && req.user.phone, role: req.user && req.user.role });
-  } catch (e) {}
+  } catch (e) {
+    console.error("[AUTH] Persistent sign-out failed:", e && e.message ? e.message : e);
+    return res.status(503).json({ error: "Sign-out could not be completed. Please retry." });
+  }
   return res.json({ ok: true });
 });
 
@@ -7917,6 +8010,248 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 })();
 
 
+/* ===== TutoPay: Controlled Pilot Validation backend =====
+   Isolated from payment and case decision logic. It measures existing records
+   and stores Admin pilot-cycle/checkpoint decisions for audit evidence.
+*/
+(function TP_CONTROLLED_PILOT_VALIDATION(){
+  if (globalThis.__tpControlledPilotValidation) return;
+  globalThis.__tpControlledPilotValidation = true;
+
+  const runs = globalThis.__tpPilotValidationRuns || (globalThis.__tpPilotValidationRuns = []);
+  let loaded = false;
+  const clean = (value, max=500) => String(value == null ? "" : value).trim().slice(0, max);
+  const lower = value => clean(value).toLowerCase();
+  const number = (value, fallback=0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+  const phone = value => clean(value, 40);
+  const role = req => lower(req && req.user && req.user.role);
+  const isStaff = req => role(req) === "admin" || isInternalStaffRole(role(req));
+  const requirePilotValidationStaff = (req, res, next) => isStaff(req) ? next() : res.status(403).json({ error:"Internal staff access required." });
+  const requirePilotValidationAdmin = (req, res, next) => role(req) === "admin" ? next() : res.status(403).json({ error:"Admin approval required." });
+
+  async function ensureStore(){
+    if (!dbEnabled() || !_pgPool) return false;
+    await _pgPool.query(`
+      CREATE TABLE IF NOT EXISTS tutopay_pilot_records (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        code TEXT,
+        phone TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data JSONB NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS tutopay_pilot_records_kind_idx ON tutopay_pilot_records(kind);
+    `);
+    return true;
+  }
+
+  async function loadRuns(force=false){
+    if (loaded && !force) return;
+    if (!await ensureStore()) { loaded = true; return; }
+    const result = await _pgPool.query(
+      `SELECT data FROM tutopay_pilot_records WHERE kind = 'validation_run' ORDER BY updated_at ASC`
+    );
+    runs.length = 0;
+    for (const row of result.rows || []) if (row.data) runs.push(row.data);
+    loaded = true;
+  }
+
+  async function saveRun(run){
+    if (!run || !run.id || !await ensureStore()) return;
+    await _pgPool.query(
+      `INSERT INTO tutopay_pilot_records (id, kind, data, updated_at)
+       VALUES ($1, 'validation_run', $2::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()`,
+      [String(run.id), JSON.stringify(run)]
+    );
+  }
+
+  function participants(){
+    const result = new Map();
+    for (const entry of globalThis.__tpPilotParticipants || []) {
+      if (entry && phone(entry.phone)) result.set(phone(entry.phone), Object.assign({}, entry));
+    }
+    for (const user of users || []) {
+      if (!user || !user.pilotOnboarding || !phone(user.phone)) continue;
+      result.set(phone(user.phone), Object.assign({}, result.get(phone(user.phone)) || {}, user.pilotOnboarding, {
+        phone:phone(user.phone),
+        role:lower(user.role),
+      }));
+    }
+    return Array.from(result.values());
+  }
+
+  function transactionTime(tx){
+    return Date.parse(tx && (tx.createdAt || tx.paidAt || tx.updatedAt) || "") || 0;
+  }
+
+  function completed(tx){
+    const status = lower(tx && (tx.status || tx.pilotStatus));
+    const payout = lower(tx && tx.disbursement && tx.disbursement.status);
+    return ["completed","released","seller_paid","successful"].includes(status) || payout === "successful" || !!(tx && tx.completedAt);
+  }
+
+  function snapshot(run){
+    const startMs = Date.parse(run.startAt || "") || 0;
+    const endMs = Date.parse(run.endAt || "") || Number.MAX_SAFE_INTEGER;
+    const enrolled = participants().filter(row => ["active","completed","pending"].includes(lower(row.status || "active")));
+    const sellers = enrolled.filter(row => lower(row.role) === "seller");
+    const buyers = enrolled.filter(row => lower(row.role) === "buyer");
+    const sellerPhones = new Set(sellers.map(row => phone(row.phone)));
+    const buyerPhones = new Set(buyers.map(row => phone(row.phone)));
+    const rows = (transactions || []).filter(tx => {
+      const at = transactionTime(tx);
+      if (at && (at < startMs || at > endMs)) return false;
+      const sellerPhone = phone(tx.sellerPhone || tx.toPhone);
+      const buyerPhone = phone(tx.buyerPhone || tx.fromPhone);
+      return sellerPhones.has(sellerPhone) || buyerPhones.has(buyerPhone);
+    });
+    const completedRows = rows.filter(completed);
+    const disputedRows = rows.filter(tx => !!tx.disputeActive || ["disputed","refund_requested"].includes(lower(tx.status)));
+    const openDisputes = rows.filter(tx => !!tx.disputeActive || lower(tx.status) === "disputed").length;
+    const paidRows = rows.filter(tx => lower(tx.paymentStatus) === "paid" || completed(tx));
+    const collectionMatched = paidRows.filter(tx => !!tx.collectionReconciled).length;
+    const payoutRows = completedRows.filter(tx => {
+      const payout = lower(tx && tx.disbursement && tx.disbursement.status);
+      return payout === "successful" || ["completed","released","seller_paid"].includes(lower(tx.status));
+    });
+    const payoutMatched = payoutRows.filter(tx => !!tx.payoutReconciled).length;
+    const feedback = globalThis.__tpPilotFeedback || [];
+    const feedbackTxIds = new Set(feedback.map(row => clean(row && (row.transactionId || row.txId), 120)).filter(Boolean));
+    for (const tx of rows) {
+      if (Array.isArray(tx.trustRatings) && tx.trustRatings.length) feedbackTxIds.add(String(tx.id));
+    }
+    const sellerProgress = sellers.map(seller => {
+      const sellerPhone = phone(seller.phone);
+      const sellerTransactions = rows.filter(tx => phone(tx.sellerPhone || tx.toPhone) === sellerPhone);
+      const completedCount = sellerTransactions.filter(completed).length;
+      return {
+        phone:sellerPhone,
+        name:clean(seller.name || seller.businessName || "", 120),
+        completed:completedCount,
+        total:sellerTransactions.length,
+        target:run.transactionsPerSeller,
+        passed:completedCount >= run.transactionsPerSeller,
+      };
+    }).sort((a,b) => a.passed === b.passed ? b.completed - a.completed : Number(a.passed) - Number(b.passed));
+    const disputeRate = rows.length ? Math.round((disputedRows.length / rows.length) * 1000) / 10 : 0;
+    const feedbackCoverage = completedRows.length ? Math.round((completedRows.filter(tx => feedbackTxIds.has(String(tx.id))).length / completedRows.length) * 100) : 0;
+    const gates = [
+      { key:"seller_pool", label:"Seller cohort", passed:sellers.length >= run.targetSellers, detail:`${sellers.length}/${run.targetSellers} enrolled sellers` },
+      { key:"buyer_pool", label:"Buyer cohort", passed:buyers.length >= run.targetBuyers, detail:`${buyers.length}/${run.targetBuyers} enrolled buyers` },
+      { key:"seller_targets", label:"Transactions per seller", passed:sellerProgress.length >= run.targetSellers && sellerProgress.filter(row => row.passed).length >= run.targetSellers, detail:`${sellerProgress.filter(row => row.passed).length}/${run.targetSellers} sellers reached ${run.transactionsPerSeller}` },
+      { key:"disputes", label:"Dispute control", passed:rows.length > 0 && disputeRate <= run.maxDisputeRate && openDisputes === 0, detail:`${disputeRate}% dispute rate · ${openDisputes} still open` },
+      { key:"collections", label:"Collection reconciliation", passed:paidRows.length > 0 && collectionMatched === paidRows.length, detail:`${collectionMatched}/${paidRows.length} paid collections matched` },
+      { key:"payouts", label:"Payout reconciliation", passed:payoutRows.length > 0 && payoutMatched === payoutRows.length, detail:`${payoutMatched}/${payoutRows.length} completed payouts matched` },
+      { key:"feedback", label:"Participant feedback", passed:completedRows.length > 0 && feedbackCoverage >= run.minFeedbackCoverage, detail:`${feedbackCoverage}% of completed transactions have feedback` },
+    ];
+    const passed = gates.filter(gate => gate.passed).length;
+    return {
+      generatedAt:nowIso(),
+      run:Object.assign({}, run),
+      counts:{ sellers:sellers.length, buyers:buyers.length, transactions:rows.length, completed:completedRows.length, disputed:disputedRows.length, openDisputes },
+      rates:{ disputeRate, feedbackCoverage, collectionReconciliation:paidRows.length ? Math.round(collectionMatched / paidRows.length * 100) : 0, payoutReconciliation:payoutRows.length ? Math.round(payoutMatched / payoutRows.length * 100) : 0 },
+      sellerProgress,
+      gates,
+      score:gates.length ? Math.round(passed / gates.length * 100) : 0,
+      suggestedDecision:passed === gates.length ? "ready" : "continue",
+      nonCustodialNote:"Pilot validation measures TutoPay workflow evidence. Licensed payment partners remain responsible for regulated collections, payouts, refunds and settlement.",
+    };
+  }
+
+  function safeRun(input, actor){
+    const start = input.startAt ? new Date(input.startAt) : new Date();
+    const end = input.endAt ? new Date(input.endAt) : new Date(start.getTime() + 7 * 86400000);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) return null;
+    const now = nowIso();
+    return {
+      id:uuid(),
+      label:clean(input.label || `Controlled pilot ${start.toISOString().slice(0,10)}`, 120),
+      category:clean(input.category || "general marketplace", 80),
+      location:clean(input.location || "Lusaka", 80),
+      startAt:start.toISOString(),
+      endAt:end.toISOString(),
+      targetSellers:Math.max(1, Math.min(100, Math.round(number(input.targetSellers, 10)))),
+      targetBuyers:Math.max(1, Math.min(500, Math.round(number(input.targetBuyers, 10)))),
+      transactionsPerSeller:Math.max(1, Math.min(100, Math.round(number(input.transactionsPerSeller, 10)))),
+      maxDisputeRate:Math.max(0, Math.min(100, number(input.maxDisputeRate, 10))),
+      minFeedbackCoverage:Math.max(0, Math.min(100, number(input.minFeedbackCoverage, 70))),
+      status:"active",
+      checkpoints:[],
+      createdAt:now,
+      updatedAt:now,
+      createdBy:actor,
+    };
+  }
+
+  app.get("/api/admin/pilot/validation", requireAuth, requirePilotValidationStaff, async (req, res) => {
+    await loadRuns().catch(() => {});
+    const ordered = runs.slice().sort((a,b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")));
+    const selected = ordered.find(run => run.status === "active") || ordered[0] || null;
+    res.json({ ok:true, active:selected ? snapshot(selected) : null, runs:ordered.map(run => ({ id:run.id, label:run.label, status:run.status, startAt:run.startAt, endAt:run.endAt, updatedAt:run.updatedAt, checkpoints:(run.checkpoints || []).length })) });
+  });
+
+  app.post("/api/admin/pilot/validation/runs", requireAuth, requirePilotValidationAdmin, async (req, res) => {
+    await loadRuns().catch(() => {});
+    if (runs.some(run => run.status === "active")) return res.status(409).json({ error:"Close or place the active pilot cycle on hold before creating another." });
+    const run = safeRun(req.body || {}, req.user.phone);
+    if (!run) return res.status(400).json({ error:"Pilot end date must be later than its start date." });
+    runs.push(run);
+    await saveRun(run);
+    logAudit(req, "pilot_validation_run_created", { runId:run.id, label:run.label, startAt:run.startAt, endAt:run.endAt });
+    res.json({ ok:true, validation:snapshot(run) });
+  });
+
+  app.post("/api/admin/pilot/validation/runs/:id/checkpoint", requireAuth, requirePilotValidationAdmin, async (req, res) => {
+    await loadRuns().catch(() => {});
+    const run = runs.find(row => String(row.id) === String(req.params.id));
+    if (!run) return res.status(404).json({ error:"Pilot validation cycle not found." });
+    const decision = lower((req.body || {}).decision);
+    if (!["continue","hold","ready","not_ready"].includes(decision)) return res.status(400).json({ error:"Select continue, hold, ready or not ready." });
+    const note = clean((req.body || {}).note, 2000);
+    if (note.length < 8) return res.status(400).json({ error:"Add a clear checkpoint note of at least 8 characters." });
+    const evidence = snapshot(run);
+    if (decision === "ready" && evidence.suggestedDecision !== "ready") {
+      return res.status(409).json({ error:"This cycle cannot be marked ready until every validation gate has passed." });
+    }
+    const checkpoint = { id:uuid(), decision, note, score:evidence.score, gates:evidence.gates, at:nowIso(), byPhone:req.user.phone, byRole:req.user.role };
+    run.checkpoints = Array.isArray(run.checkpoints) ? run.checkpoints : [];
+    run.checkpoints.push(checkpoint);
+    run.updatedAt = checkpoint.at;
+    if (decision === "hold") run.status = "hold";
+    if (decision === "ready") run.status = "completed";
+    await saveRun(run);
+    logAudit(req, "pilot_validation_checkpoint_recorded", { runId:run.id, decision, score:evidence.score });
+    res.json({ ok:true, checkpoint, validation:snapshot(run) });
+  });
+
+  app.post("/api/admin/pilot/validation/runs/:id/status", requireAuth, requirePilotValidationAdmin, async (req, res) => {
+    await loadRuns().catch(() => {});
+    const run = runs.find(row => String(row.id) === String(req.params.id));
+    if (!run) return res.status(404).json({ error:"Pilot validation cycle not found." });
+    const status = lower((req.body || {}).status);
+    if (!["active","hold","completed","cancelled"].includes(status)) return res.status(400).json({ error:"Invalid pilot-cycle status." });
+    if (status === "active" && runs.some(row => row.id !== run.id && row.status === "active")) return res.status(409).json({ error:"Another pilot cycle is already active." });
+    run.status = status;
+    run.updatedAt = nowIso();
+    run.updatedBy = req.user.phone;
+    await saveRun(run);
+    logAudit(req, "pilot_validation_status_changed", { runId:run.id, status });
+    res.json({ ok:true, validation:snapshot(run) });
+  });
+
+  app.get("/api/admin/pilot/validation/export", requireAuth, requirePilotValidationStaff, async (req, res) => {
+    await loadRuns().catch(() => {});
+    const run = runs.find(row => String(row.id) === String(req.query && req.query.runId)) || runs.find(row => row.status === "active") || runs[0];
+    if (!run) return res.status(404).json({ error:"No pilot validation cycle exists yet." });
+    logAudit(req, "pilot_validation_exported", { runId:run.id });
+    res.json({ ok:true, title:"TutoPay Controlled Pilot Validation Report", exportedAt:nowIso(), exportedBy:{ phone:req.user.phone, role:req.user.role }, validation:snapshot(run) });
+  });
+
+  console.log("[TutoPay] Controlled pilot validation API loaded");
+})();
+
+
 /* ===== TutoPay v1.8: PSP Integration Test Console + Settlement Simulation backend ===== */
 (function TP_PSP_INTEGRATION_BACKEND_V18(){
   const pspTestRuns = [];
@@ -8680,15 +9015,25 @@ dbInit()
     }
   });
 
-// Nice shutdown (Railway sends SIGTERM on deploy/stop)
-process.on('SIGTERM', () => {
-  console.log('[SYS] SIGTERM received, closing server...');
-  server.close(() => process.exit(0));
-});
-process.on('SIGINT', () => {
-  console.log('[SYS] SIGINT received, closing server...');
-  server.close(() => process.exit(0));
-});
+// Graceful Railway/local shutdown: stop HTTP first, then close Postgres cleanly.
+let shutdownStarted = false;
+function shutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  console.log(`[SYS] ${signal} received, closing server...`);
+  const forceTimer = setTimeout(() => process.exit(1), 10000);
+  forceTimer.unref?.();
+  server.close(async () => {
+    try {
+      if (_pgPool) await _pgPool.end();
+    } catch (error) {
+      console.error("[SYS] Database shutdown error:", error && error.message ? error.message : error);
+    }
+    process.exit(0);
+  });
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 /* =======================================================================
    TutoPay Request-First + Negotiated Discount Flow v13
    APPEND THIS BLOCK AT THE VERY END OF server.js, then redeploy Railway.
