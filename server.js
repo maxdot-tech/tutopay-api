@@ -10986,6 +10986,16 @@ async function checkFinancePartnerAction(action) {
     };
   }
 
+  // Read-only reporting surface. Management reporting consumes the exact same
+  // derived queues and deadline rules instead of recreating workflow logic.
+  globalThis.__tpStaffSlaEngine = {
+    allOperationalTasks,
+    decorate,
+    slaSummary,
+    roleLabel,
+    activeEscalation,
+  };
+
   async function syncCompletedEscalations(activeTasks) {
     const activeIds = new Set(activeTasks.map(task => clean(task.id)));
     const changed = [];
@@ -11151,4 +11161,356 @@ async function checkFinancePartnerAction(action) {
   });
 
   console.log('[TutoPay] Staff SLA and escalation control API loaded');
+})();
+
+/* ===== Admin operations reporting (isolated read-only aggregation) ===== */
+(() => {
+  const STAFF_ROLES = new Set([
+    'admin','risk_agent','fraud_agent','finance_agent',
+    'accounts_agent','accounts','compliance_agent','compliance_officer',
+  ]);
+  const clean = value => String(value == null ? '' : value).trim();
+  const lower = value => clean(value).toLowerCase();
+  const amountOf = row => Number(row && (row.amount || row.quoteAmount || row.totalAmount || 0)) || 0;
+  const dateMs = value => Date.parse(value || '') || 0;
+  const inPeriod = (value, startMs) => !startMs || dateMs(value) >= startMs;
+  const roleLabel = role => ({
+    admin:'Admin',
+    risk_agent:'Risk',
+    fraud_agent:'Risk / Fraud',
+    finance_agent:'Finance',
+    accounts_agent:'Accounts',
+    accounts:'Accounts',
+    compliance_agent:'Compliance',
+    compliance_officer:'Compliance',
+  }[lower(role)] || clean(role).replace(/_/g, ' ') || 'Staff');
+  const normalizeRole = role => {
+    const value = lower(role);
+    if (value === 'fraud_agent') return 'risk_agent';
+    if (value === 'accounts') return 'accounts_agent';
+    if (value === 'compliance_officer') return 'compliance_agent';
+    return value;
+  };
+  const isTerminalCase = status => ['resolved','closed','cancelled','canceled','rejected'].includes(lower(status));
+  const isCompletedEvent = eventType => /(resolved|completed|reconciled|approved|verified|executed|closed|decision)/i.test(clean(eventType));
+
+  function requireOperationsAdmin(req, res, next) {
+    if (!req.user || lower(req.user.role) !== 'admin') {
+      return res.status(403).json({ error:'Admin access required.' });
+    }
+    next();
+  }
+
+  function periodFromQuery(raw) {
+    const value = lower(raw || '30');
+    if (value === 'all') return { key:'all', days:null, startMs:0, startAt:null };
+    const allowed = new Set([7,30,90]);
+    const days = allowed.has(Number(value)) ? Number(value) : 30;
+    const startMs = Date.now() - days * 86400000;
+    return { key:String(days), days, startMs, startAt:new Date(startMs).toISOString() };
+  }
+
+  function currentSlaSnapshot() {
+    const engine = globalThis.__tpStaffSlaEngine;
+    if (!engine || typeof engine.allOperationalTasks !== 'function') {
+      return { tasks:[], summary:{ total:0, onSchedule:0, dueSoon:0, overdue:0, unassigned:0, escalated:0, critical:0, byRole:[] } };
+    }
+    let tasks = [];
+    try {
+      tasks = engine.allOperationalTasks()
+        .filter(task => task && task.id)
+        .map(task => engine.decorate(task));
+    } catch (_) {
+      tasks = [];
+    }
+    return { tasks, summary:engine.slaSummary(tasks) };
+  }
+
+  function caseSnapshot(startMs) {
+    const store = globalThis.__tpIssueCaseStore;
+    const rows = store && typeof store.values === 'function' ? [...store.values()].filter(Boolean) : [];
+    const opened = rows.filter(row => inPeriod(row.createdAt, startMs));
+    const resolved = rows.filter(row =>
+      isTerminalCase(row.status) &&
+      inPeriod(row.resolvedAt || row.closedAt || row.updatedAt || row.lastActionAt, startMs)
+    );
+    const outcomes = {};
+    for (const row of resolved) {
+      const key = lower(row.outcomeCode || row.adminDecision || row.resolution || row.status || 'resolved') || 'resolved';
+      outcomes[key] = (outcomes[key] || 0) + 1;
+    }
+    return {
+      total:rows.length,
+      open:rows.filter(row => !isTerminalCase(row.status)).length,
+      awaitingAdmin:rows.filter(row => lower(row.status) === 'awaiting_admin_approval' || row.pendingAdminApproval).length,
+      openedInPeriod:opened.length,
+      resolvedInPeriod:resolved.length,
+      outcomes,
+      rows,
+    };
+  }
+
+  function transactionSnapshot(startMs) {
+    const periodRows = transactions.filter(row => inPeriod(row.createdAt, startMs));
+    const completed = periodRows.filter(row => ['released','completed'].includes(lower(row.status)));
+    const disputed = periodRows.filter(row =>
+      lower(row.status) === 'disputed' || row.disputeActive || (row.dispute && row.dispute.active)
+    );
+    const paid = periodRows.filter(row => lower(row.paymentStatus) === 'paid');
+    const totalValue = periodRows.reduce((sum,row) => sum + amountOf(row), 0);
+    const completedValue = completed.reduce((sum,row) => sum + amountOf(row), 0);
+    return {
+      total:periodRows.length,
+      totalValue,
+      paid:paid.length,
+      completed:completed.length,
+      completedValue,
+      disputed:disputed.length,
+      completionRate:periodRows.length ? Math.round((completed.length / periodRows.length) * 100) : 0,
+      disputeRate:periodRows.length ? Math.round((disputed.length / periodRows.length) * 100) : 0,
+    };
+  }
+
+  function financeSnapshot(startMs) {
+    const statuses = {};
+    let value = 0;
+    let completedValue = 0;
+    const periodCompleted = [];
+    for (const action of financialActions) {
+      const status = lower(action && action.status || 'unknown') || 'unknown';
+      statuses[status] = (statuses[status] || 0) + 1;
+      value += Number(action && action.amount || 0) || 0;
+      if (['completed','reconciled','awaiting_reconciliation'].includes(status)) {
+        completedValue += Number(action && action.amount || 0) || 0;
+        if (inPeriod(action.completedAt || action.reconciledAt || action.updatedAt, startMs)) periodCompleted.push(action);
+      }
+    }
+    return {
+      total:financialActions.length,
+      value,
+      authorized:(statuses.authorized || 0) + (statuses.assigned || 0),
+      validated:statuses.validated || 0,
+      processing:statuses.processing || 0,
+      exceptions:(statuses.failed || 0) + (statuses.on_hold || 0) + (statuses.awaiting_admin_clarification || 0),
+      awaitingReconciliation:statuses.awaiting_reconciliation || 0,
+      completed:(statuses.completed || 0) + (statuses.reconciled || 0),
+      completedInPeriod:periodCompleted.length,
+      completedValue,
+      statuses,
+    };
+  }
+
+  function accountsSnapshot() {
+    const statuses = {};
+    let collectionMatched = 0;
+    let payoutMatched = 0;
+    let refundMatched = 0;
+    for (const tx of transactions) {
+      const work = tx && tx.reconciliationWork || {};
+      const status = lower(work.status || 'pending') || 'pending';
+      statuses[status] = (statuses[status] || 0) + 1;
+      if (tx && tx.collectionReconciled) collectionMatched += 1;
+      if (tx && tx.payoutReconciled) payoutMatched += 1;
+      if (tx && tx.refundReconciled) refundMatched += 1;
+    }
+    return {
+      pending:statuses.pending || 0,
+      inProgress:statuses.in_progress || 0,
+      exceptions:statuses.exception || 0,
+      completed:statuses.completed || 0,
+      collectionMatched,
+      payoutMatched,
+      refundMatched,
+      statuses,
+    };
+  }
+
+  function complianceSnapshot() {
+    const kyc = {};
+    let awaitingAdmin = 0;
+    for (const user of users) {
+      if (!user || !['buyer','seller'].includes(lower(user.role))) continue;
+      const status = lower(user.kycStatus || 'unsubmitted') || 'unsubmitted';
+      kyc[status] = (kyc[status] || 0) + 1;
+      if (lower(user.complianceRecommendation && user.complianceRecommendation.status) === 'awaiting_admin_decision') awaitingAdmin += 1;
+      if (lower(user.complianceSanctionRecommendation && user.complianceSanctionRecommendation.status) === 'awaiting_admin_decision') awaitingAdmin += 1;
+    }
+    const incidents = Array.isArray(globalThis.__tpComplianceIncidents) ? globalThis.__tpComplianceIncidents : [];
+    return {
+      pending:(kyc.pending || 0) + (kyc.submitted || 0) + (kyc.under_review || 0),
+      verified:kyc.verified || 0,
+      rejected:kyc.rejected || 0,
+      needsMoreInfo:kyc.needs_more_info || 0,
+      unsubmitted:kyc.unsubmitted || 0,
+      awaitingAdmin,
+      openIncidents:incidents.filter(row => !['closed','resolved'].includes(lower(row && row.status))).length,
+      criticalIncidents:incidents.filter(row =>
+        !['closed','resolved'].includes(lower(row && row.status)) &&
+        lower(row && (row.severity || row.priority)) === 'critical'
+      ).length,
+      kyc,
+    };
+  }
+
+  function staffPerformance(tasks, startMs) {
+    const periodAudit = auditLog.filter(row =>
+      inPeriod(row && row.timestamp, startMs) &&
+      lower(row && row.eventType) !== 'admin_operations_report_viewed'
+    );
+    return users
+      .filter(user => user && STAFF_ROLES.has(lower(user.role)))
+      .map(user => {
+        const phone = clean(user.phone);
+        const role = normalizeRole(user.role);
+        const owned = tasks.filter(task => clean(task.assignedTo) === phone);
+        const activity = periodAudit.filter(row => clean(row && row.userPhone) === phone);
+        return {
+          phone,
+          name:clean(user.name || user.fullName || user.displayName || user.profile && user.profile.displayName || phone),
+          role,
+          roleLabel:roleLabel(role),
+          activeAssignments:owned.length,
+          overdue:owned.filter(task => task.slaStage === 'overdue').length,
+          dueSoon:owned.filter(task => task.slaStage === 'due_soon').length,
+          escalated:owned.filter(task => task.hasOpenEscalation).length,
+          actions:activity.length,
+          completedActions:activity.filter(row => isCompletedEvent(row.eventType)).length,
+          lastActivity:activity.reduce((latest,row) =>
+            dateMs(row.timestamp) > dateMs(latest) ? row.timestamp : latest, null),
+        };
+      })
+      .sort((a,b) => {
+        const role = a.roleLabel.localeCompare(b.roleLabel);
+        if (role) return role;
+        return a.name.localeCompare(b.name);
+      });
+  }
+
+  function trendSnapshot(period, cases) {
+    const days = Math.min(period.days || 30, 30);
+    const points = [];
+    const byDate = new Map();
+    for (let offset = days - 1; offset >= 0; offset -= 1) {
+      const date = new Date(Date.now() - offset * 86400000).toISOString().slice(0,10);
+      const point = { date, transactions:0, casesOpened:0, staffActions:0 };
+      points.push(point);
+      byDate.set(date, point);
+    }
+    for (const tx of transactions) {
+      const point = byDate.get(clean(tx && tx.createdAt).slice(0,10));
+      if (point) point.transactions += 1;
+    }
+    for (const row of cases.rows) {
+      const point = byDate.get(clean(row && row.createdAt).slice(0,10));
+      if (point) point.casesOpened += 1;
+    }
+    for (const row of auditLog) {
+      if (!STAFF_ROLES.has(lower(row && row.userRole))) continue;
+      if (lower(row && row.eventType) === 'admin_operations_report_viewed') continue;
+      const point = byDate.get(clean(row && row.timestamp).slice(0,10));
+      if (point) point.staffActions += 1;
+    }
+    return points;
+  }
+
+  function managementAttention(tasks, finance, accounts, compliance) {
+    const rows = tasks
+      .filter(task =>
+        task.hasOpenEscalation ||
+        task.slaStage === 'overdue' ||
+        task.slaStage === 'due_soon' ||
+        !clean(task.assignedTo) ||
+        lower(task.priority) === 'critical'
+      )
+      .map(task => ({
+        id:task.id,
+        type:'task',
+        title:task.title,
+        detail:task.summary,
+        status:task.hasOpenEscalation ? 'escalated' : task.slaStage,
+        priority:task.priority,
+        role:task.ownerRole,
+        roleLabel:task.ownerRoleLabel || roleLabel(task.ownerRole),
+        assignedTo:task.assignedTo || null,
+        dueAt:task.deadlineAt || task.dueAt || null,
+        caseId:task.caseId || null,
+        txId:task.txId || null,
+        openHint:task.openHint || null,
+      }));
+    if (finance.exceptions) rows.push({
+      id:'attention:finance-exceptions', type:'summary', title:'Finance exceptions',
+      detail:`${finance.exceptions} Finance instruction(s) are failed, on hold or waiting for Admin clarification.`,
+      status:'exception', priority:'high', role:'finance_agent', roleLabel:'Finance', openHint:'finance',
+    });
+    if (accounts.exceptions) rows.push({
+      id:'attention:accounts-exceptions', type:'summary', title:'Reconciliation discrepancies',
+      detail:`${accounts.exceptions} reconciliation record(s) contain an exception.`,
+      status:'exception', priority:'high', role:'accounts_agent', roleLabel:'Accounts', openHint:'accounts',
+    });
+    if (compliance.awaitingAdmin) rows.push({
+      id:'attention:compliance-admin', type:'summary', title:'Compliance decisions awaiting Admin',
+      detail:`${compliance.awaitingAdmin} recommendation(s) require an Admin decision.`,
+      status:'awaiting_admin', priority:'high', role:'compliance_agent', roleLabel:'Compliance', openHint:'compliance',
+    });
+    return rows.slice(0, 100);
+  }
+
+  app.get('/api/admin/operations-report', requireAuth, requireOperationsAdmin, (req, res) => {
+    const period = periodFromQuery(req.query && req.query.days);
+    const sla = currentSlaSnapshot();
+    const cases = caseSnapshot(period.startMs);
+    const transactionsReport = transactionSnapshot(period.startMs);
+    const finance = financeSnapshot(period.startMs);
+    const accounts = accountsSnapshot();
+    const compliance = complianceSnapshot();
+    const deadlines = sla.tasks.filter(task => task.slaStage !== 'no_deadline').length;
+    const healthyDeadlines = sla.tasks.filter(task => ['on_schedule','due_soon'].includes(task.slaStage)).length;
+    const currentSlaHealth = deadlines ? Math.round((healthyDeadlines / deadlines) * 100) : 100;
+    const staff = staffPerformance(sla.tasks, period.startMs);
+    const response = {
+      ok:true,
+      generatedAt:nowIso(),
+      period:{
+        key:period.key,
+        days:period.days,
+        startAt:period.startAt,
+        endAt:nowIso(),
+        label:period.days ? `Last ${period.days} days` : 'All available records',
+      },
+      headline:{
+        openWork:sla.summary.total,
+        overdue:sla.summary.overdue,
+        escalated:sla.summary.escalated,
+        unassigned:sla.summary.unassigned,
+        currentSlaHealth,
+        casesResolved:cases.resolvedInPeriod,
+        financeCompleted:finance.completedInPeriod,
+      },
+      sla:sla.summary,
+      transactions:transactionsReport,
+      cases:{
+        total:cases.total,
+        open:cases.open,
+        awaitingAdmin:cases.awaitingAdmin,
+        openedInPeriod:cases.openedInPeriod,
+        resolvedInPeriod:cases.resolvedInPeriod,
+        outcomes:cases.outcomes,
+      },
+      finance,
+      accounts,
+      compliance,
+      staff,
+      attention:managementAttention(sla.tasks, finance, accounts, compliance),
+      trend:trendSnapshot(period, cases),
+      definitions:{
+        currentSlaHealth:'Share of active work with a deadline that is not overdue.',
+        completedMetrics:'Period totals are based on available transaction, case, Finance and audit timestamps.',
+        reportingMode:'Read-only. This report cannot assign work, decide cases, change KYC, reconcile records or move money.',
+      },
+    };
+    logAudit(req, 'admin_operations_report_viewed', { period:period.key });
+    res.json(response);
+  });
+
+  console.log('[TutoPay] Admin operations reporting API loaded');
 })();
