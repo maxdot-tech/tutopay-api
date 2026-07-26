@@ -7951,9 +7951,20 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     }
     return rows.sort((a,b)=>String(b.createdAt||'').localeCompare(String(a.createdAt||'')));
   }
+  function pilotFeedbackRows(participantPhones){
+    if (!(participantPhones instanceof Set)) return allPilotFeedback();
+    return allPilotFeedback().filter(f =>
+      participantPhones.has(phone(f.phone || f.userPhone || f.raterPhone)) ||
+      participantPhones.has(phone(f.targetPhone)));
+  }
   function feedbackForPhone(ph){ const p=phone(ph); return allPilotFeedback().filter(f => phone(f.phone || f.userPhone || f.raterPhone) === p); }
-  function transactionResultRows(){
-    return (transactions || []).map(tx => {
+  function transactionResultRows(participantPhones){
+    const scoped = participantPhones instanceof Set
+      ? (transactions || []).filter(tx =>
+          participantPhones.has(phone(tx.buyerPhone || tx.fromPhone)) ||
+          participantPhones.has(phone(tx.sellerPhone || tx.toPhone)))
+      : (transactions || []);
+    return scoped.map(tx => {
       const ratings = Array.isArray(tx && tx.trustRatings) ? tx.trustRatings : [];
       const buyerRating = ratings.find(r => lc(r.raterRole) === 'buyer') || ratings.find(r => phone(r.raterPhone) === phone(tx.buyerPhone || tx.fromPhone));
       const sellerRating = ratings.find(r => lc(r.raterRole) === 'seller') || ratings.find(r => phone(r.raterPhone) === phone(tx.sellerPhone || tx.toPhone));
@@ -8011,9 +8022,22 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const consent = participants.filter(p => !!p.consentAccepted);
     const phones = new Set(participants.map(p=>phone(p.phone)));
     const pilotTxs = transactions.filter(t => phones.has(phone(t.buyerPhone || t.fromPhone)) || phones.has(phone(t.sellerPhone || t.toPhone)));
-    const completed = pilotTxs.filter(t => ['completed','released','successful'].includes(lc(t.status || t.pilotStatus || ''))).length;
+    const completed = pilotTxs.filter(t => ['completed','released','seller_paid','successful'].includes(lc(t.status || t.pilotStatus || '')) || !!t.completedAt).length;
     const disputed = pilotTxs.filter(t => t.disputeActive || ['disputed','refund_requested'].includes(lc(t.status || ''))).length;
-    const fb = allPilotFeedback();
+    const fb = pilotFeedbackRows(phones);
+    const completionRate = pilotTxs.length ? Math.round(completed * 1000 / pilotTxs.length) / 10 : 0;
+    const disputeRate = pilotTxs.length ? Math.round(disputed * 1000 / pilotTxs.length) / 10 : 0;
+    const feedbackCoverage = completed ? Math.min(100, Math.round(fb.length * 1000 / completed) / 10) : 0;
+    const wouldUseAgain = fb.filter(x=>!!x.wouldUseAgain).length;
+    const wouldUseAgainRate = fb.length ? Math.round(wouldUseAgain * 1000 / fb.length) / 10 : 0;
+    const completionHours = pilotTxs.map(tx => {
+      const start = Date.parse(tx.createdAt || tx.paidAt || '');
+      const end = Date.parse(tx.completedAt || tx.releasedAt || '');
+      return Number.isFinite(start) && Number.isFinite(end) && end >= start ? (end - start) / 3600000 : null;
+    }).filter(value => value != null);
+    const averageCompletionHours = completionHours.length
+      ? Math.round(completionHours.reduce((sum,value)=>sum+value,0) * 10 / completionHours.length) / 10
+      : null;
     const flags = [
       { label:'Invite-code onboarding active', ok:invites.length>0, detail:`${invites.length} invite codes created`, action:'Generate buyer and seller pilot invite codes.', weight:2 },
       { label:'Pilot seller pool started', ok:sellers.length>=1, detail:`${sellers.length} sellers enrolled`, action:'Recruit at least 5 sellers in one high-trust category.', weight:2 },
@@ -8026,7 +8050,21 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const totalWeight = flags.reduce((s,f)=>s+n(f.weight,1),0) || 1;
     const score = Math.round(flags.filter(f=>f.ok).reduce((s,f)=>s+n(f.weight,1),0)*100/totalWeight);
     const avgFeedback = fb.length ? Math.round(fb.reduce((s,x)=>s+n(x.overallRating || x.trustRating || x.easeRating,0),0)/fb.length*10)/10 : null;
-    return { ok:true, generatedAt:nowIso(), stage:APP_STAGE, inviteRequired:PILOT_INVITES_REQUIRED, score, band:score>=85?'Pilot onboarding strong':score>=70?'Pilot onboarding moderate':score>=50?'Pilot onboarding early':'Pilot onboarding weak', counts:{ invites:invites.length, activeInvites:invites.filter(i=>i.status==='active').length, participants:participants.length, activeParticipants:active.length, buyers:buyers.length, sellers:sellers.length, consentAccepted:consent.length, feedback:fb.length, participantTransactions:pilotTxs.length, completedTransactions:completed, disputedTransactions:disputed }, feedback:{ total:fb.length, average:avgFeedback, wouldUseAgain:fb.filter(x=>!!x.wouldUseAgain).length, latest:fb.slice(-10).reverse() }, flags, actionPlan:flags.filter(f=>!f.ok).sort((a,b)=>n(b.weight,1)-n(a.weight,1)).map(f=>({ issue:f.label, detail:f.detail, action:f.action })), participants, invites };
+    const resultGates = [
+      { key:'volume', label:'Controlled transaction volume', passed:pilotTxs.length>=20, current:pilotTxs.length, target:'20 or more transactions' },
+      { key:'completion', label:'Transaction completion', passed:completionRate>=80, current:`${completionRate}%`, target:'80% or higher' },
+      { key:'disputes', label:'Dispute control', passed:disputeRate<=10, current:`${disputeRate}%`, target:'10% or lower' },
+      { key:'feedback', label:'Feedback coverage', passed:feedbackCoverage>=70, current:`${feedbackCoverage}%`, target:'70% or higher' },
+      { key:'satisfaction', label:'Participant satisfaction', passed:avgFeedback!=null&&avgFeedback>=4, current:avgFeedback==null?'No rating':`${avgFeedback}/5`, target:'4/5 or higher' },
+      { key:'consent', label:'Participant consent', passed:participants.length>0&&consent.length===participants.length, current:`${consent.length}/${participants.length}`, target:'All participants' },
+      { key:'open_disputes', label:'No unresolved pilot disputes', passed:disputed===0, current:disputed, target:'0 open disputes' }
+    ];
+    const passedResultGates = resultGates.filter(g=>g.passed).length;
+    const hardReady = pilotTxs.length>=20 && completionRate>=80 && disputeRate<=10 && feedbackCoverage>=70 && avgFeedback!=null && avgFeedback>=4 && participants.length>0 && consent.length===participants.length && disputed===0;
+    const conditionalReady = pilotTxs.length>=5 && completionRate>=60 && disputeRate<=20 && feedbackCoverage>=40 && participants.length>0;
+    const pilotOutcome = hardReady ? 'ready' : (conditionalReady ? 'ready_with_conditions' : 'not_ready');
+    const pilotOutcomeLabel = hardReady ? 'Ready for partner review' : (conditionalReady ? 'Ready with conditions' : 'Not ready');
+    return { ok:true, generatedAt:nowIso(), stage:APP_STAGE, inviteRequired:PILOT_INVITES_REQUIRED, score, band:score>=85?'Pilot onboarding strong':score>=70?'Pilot onboarding moderate':score>=50?'Pilot onboarding early':'Pilot onboarding weak', pilotOutcome:{ code:pilotOutcome, label:pilotOutcomeLabel, passedGates:passedResultGates, totalGates:resultGates.length, gates:resultGates }, counts:{ invites:invites.length, activeInvites:invites.filter(i=>i.status==='active').length, participants:participants.length, activeParticipants:active.length, buyers:buyers.length, sellers:sellers.length, consentAccepted:consent.length, feedback:fb.length, participantTransactions:pilotTxs.length, completedTransactions:completed, disputedTransactions:disputed }, results:{ completionRate, disputeRate, feedbackCoverage, averageCompletionHours, totalValue:pilotTxs.reduce((sum,tx)=>sum+n(tx.amount,0),0) }, feedback:{ total:fb.length, average:avgFeedback, wouldUseAgain, wouldUseAgainRate, latest:fb.slice(0,10) }, flags, actionPlan:flags.filter(f=>!f.ok).sort((a,b)=>n(b.weight,1)-n(a.weight,1)).map(f=>({ issue:f.label, detail:f.detail, action:f.action })), participants, invites };
   }
 
   app.get('/api/pilot/invites/:code/validate', async (req,res)=>{
@@ -8121,20 +8159,22 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     pilotFeedback.push(entry); await pilotDbUpsert('feedback',entry).catch(()=>{}); logAudit(req,'pilot_feedback_staff_added',{phone:ph,feedbackId:entry.id}); res.json({ ok:true, feedback:entry });
   });
 
-  app.get('/api/admin/pilot/onboarding/export', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const o=overview(); logAudit(req,'pilot_onboarding_exported',{participants:o.counts.participants,invites:o.counts.invites}); res.json({ ok:true, title:'TutoPay Controlled Pilot Onboarding Evidence Pack', generatedAt:nowIso(), generatedBy:{phone:req.user.phone,role:req.user.role}, nonCustodialStatement:'TutoPay manages participant onboarding, transaction workflow, evidence, confirmations, disputes, audit records and reconciliation metadata. Customer funds remain processed, held, settled, refunded or reversed by licensed PSP/mobile-money/banking partners.', overview:o, invites:o.invites, participants:o.participants, feedback:allPilotFeedback().slice(0,1000), transactionResults:transactionResultRows().slice(0,2000), nextRecommendedEvidence:['Recruit a balanced pool of buyer and seller participants through invite codes.','Collect pilot consent and feedback from every participant.','Run controlled transactions and reconcile against PSP records.','Export pilot onboarding and pilot metrics packs for PSP/investor discussions.'] }); });
+  app.get('/api/admin/pilot/onboarding/export', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const o=overview(); const pilotPhones=new Set(o.participants.map(p=>phone(p.phone))); logAudit(req,'pilot_onboarding_exported',{participants:o.counts.participants,invites:o.counts.invites,outcome:o.pilotOutcome.code}); res.json({ ok:true, title:'TutoPay Controlled Pilot Results and Feedback Pack', generatedAt:nowIso(), generatedBy:{phone:req.user.phone,role:req.user.role}, nonCustodialStatement:'TutoPay manages participant onboarding, transaction workflow, evidence, confirmations, disputes, audit records and reconciliation metadata. Customer funds remain processed, held, settled, refunded or reversed by licensed PSP/mobile-money/banking partners.', pilotOutcome:o.pilotOutcome, resultSummary:o.results, feedbackSummary:o.feedback, overview:o, invites:o.invites, participants:o.participants, feedback:pilotFeedbackRows(pilotPhones).slice(0,1000), transactionResults:transactionResultRows(pilotPhones).slice(0,2000), nextRecommendedEvidence:o.pilotOutcome.code==='ready'?['Verify the exported results and feedback against the controlled pilot records.','Attach reconciliation evidence, compliance policies and the transaction-flow diagram.','Prepare the pack for PSP/BoZ pre-engagement review.']:o.pilotOutcome.gates.filter(g=>!g.passed).map(g=>`${g.label}: reach ${g.target} (current ${g.current}).`) }); });
 
   app.get('/api/admin/pilot/results.csv', requireAuth, requirePilotStaff, async (req,res)=>{
     await pilotDbLoad().catch(()=>{});
+    const pilotPhones=new Set(allParticipants().map(p=>phone(p.phone)));
     const rows=[['tx_id','item_code','buyer_phone','seller_phone','amount','currency','status','payment_status','completed','dispute_active','created_at','paid_at','completed_at','buyer_rated','buyer_rating','buyer_trust','buyer_would_trade_again','buyer_comment','seller_rated','seller_rating','seller_trust','seller_would_trade_again','seller_comment','feedback_count']];
-    for(const r of transactionResultRows()) rows.push([r.txId,r.itemCode,r.buyerPhone,r.sellerPhone,r.amount,r.currency,r.status,r.paymentStatus,r.completed,r.disputeActive,r.createdAt,r.paidAt,r.completedAt,r.buyerRated,r.buyerRating,r.buyerTrust,r.buyerWouldTradeAgain,r.buyerComment,r.sellerRated,r.sellerRating,r.sellerTrust,r.sellerWouldTradeAgain,r.sellerComment,r.feedbackCount]);
+    for(const r of transactionResultRows(pilotPhones)) rows.push([r.txId,r.itemCode,r.buyerPhone,r.sellerPhone,r.amount,r.currency,r.status,r.paymentStatus,r.completed,r.disputeActive,r.createdAt,r.paidAt,r.completedAt,r.buyerRated,r.buyerRating,r.buyerTrust,r.buyerWouldTradeAgain,r.buyerComment,r.sellerRated,r.sellerRating,r.sellerTrust,r.sellerWouldTradeAgain,r.sellerComment,r.feedbackCount]);
     res.setHeader('Content-Type','text/csv');
     res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-transaction-results.csv"');
     res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n'));
   });
   app.get('/api/admin/pilot/feedback.csv', requireAuth, requirePilotStaff, async (req,res)=>{
     await pilotDbLoad().catch(()=>{});
+    const pilotPhones=new Set(allParticipants().map(p=>phone(p.phone)));
     const rows=[['source','time','phone','role','transaction_id','target_phone','target_role','overall_rating','trust_rating','payment_confidence','communication','reliability','would_use_again','comment']];
-    for(const f of allPilotFeedback()) rows.push([f.source||'pilot_feedback',f.createdAt||'',f.phone||'',f.role||'',f.transactionId||'',f.targetPhone||'',f.targetRole||'',f.overallRating||'',f.trustRating||'',f.paymentConfidence||'',f.communication||'',f.reliability||'',f.wouldUseAgain?'yes':'no',f.comments||'']);
+    for(const f of pilotFeedbackRows(pilotPhones)) rows.push([f.source||'pilot_feedback',f.createdAt||'',f.phone||'',f.role||'',f.transactionId||'',f.targetPhone||'',f.targetRole||'',f.overallRating||'',f.trustRating||'',f.paymentConfidence||'',f.communication||'',f.reliability||'',f.wouldUseAgain?'yes':'no',f.comments||'']);
     res.setHeader('Content-Type','text/csv');
     res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-feedback.csv"');
     res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n'));
