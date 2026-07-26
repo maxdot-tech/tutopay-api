@@ -1136,6 +1136,9 @@ const staffMessages = [];
 // staff member's read/acknowledgement state is stored here, so this module
 // cannot conflict with case, Finance, Accounts or Compliance workflow state.
 const staffTaskStates = [];
+// SLA escalation records sit beside the task centre. They reference derived
+// tasks but never replace or mutate the authoritative workflow record.
+const staffSlaEscalations = [];
 
 // ===== PostgreSQL persistence (Railway) =====
 // If DATABASE_URL exists and pg is installed, we persist users/items/transactions/requests/audit logs.
@@ -1323,6 +1326,14 @@ CREATE TABLE IF NOT EXISTS tutopay_staff_task_state (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   data JSONB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tutopay_staff_sla_escalations (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  data JSONB NOT NULL
+);
 CREATE INDEX IF NOT EXISTS tutopay_issue_cases_tx_idx ON tutopay_issue_cases(tx_id);
 CREATE INDEX IF NOT EXISTS tutopay_issue_actions_ts_idx ON tutopay_issue_actions(ts);
 CREATE INDEX IF NOT EXISTS tutopay_issue_actions_case_idx ON tutopay_issue_actions(case_id);
@@ -1330,6 +1341,8 @@ CREATE INDEX IF NOT EXISTS tutopay_incidents_ts_idx ON tutopay_incidents(ts);
 CREATE INDEX IF NOT EXISTS tutopay_staff_messages_created_idx ON tutopay_staff_messages(created_at);
 CREATE INDEX IF NOT EXISTS tutopay_staff_task_state_phone_idx ON tutopay_staff_task_state(staff_phone);
 CREATE INDEX IF NOT EXISTS tutopay_staff_task_state_task_idx ON tutopay_staff_task_state(task_id);
+CREATE INDEX IF NOT EXISTS tutopay_staff_sla_task_idx ON tutopay_staff_sla_escalations(task_id);
+CREATE INDEX IF NOT EXISTS tutopay_staff_sla_status_idx ON tutopay_staff_sla_escalations(status);
   `);
 }
 
@@ -1604,6 +1617,16 @@ async function dbLoadIntoMemory() {
     }
   } catch (e) {}
 
+  // Staff SLA escalations are operational alerts only. They do not replace
+  // case, Finance, Accounts or Compliance workflow state.
+  try {
+    const slaRows = await _pgPool.query("SELECT data FROM tutopay_staff_sla_escalations ORDER BY updated_at DESC LIMIT 10000");
+    staffSlaEscalations.length = 0;
+    for (const row of (slaRows.rows || []).reverse()) {
+      if (row && row.data && row.data.id) staffSlaEscalations.push(row.data);
+    }
+  } catch (e) {}
+
   // Idempotency cache (optional)
   try {
     const idem = await _pgPool.query("SELECT key, request_hash, status_code, response, EXTRACT(EPOCH FROM expires_at)*1000 AS expires_ms FROM tutopay_idempotency WHERE expires_at > NOW()");
@@ -1754,6 +1777,26 @@ async function dbUpsertStaffTaskState(state) {
       String(state.taskId || ""),
       state.updatedAt || nowIso(),
       JSON.stringify(state),
+    ]
+  );
+}
+
+async function dbUpsertStaffSlaEscalation(escalation) {
+  if (!_pgPool || !escalation || !escalation.id) return;
+  await _pgPool.query(
+    `INSERT INTO tutopay_staff_sla_escalations(id, task_id, status, created_at, updated_at, data)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+     ON CONFLICT (id) DO UPDATE SET
+       status=EXCLUDED.status,
+       updated_at=EXCLUDED.updated_at,
+       data=EXCLUDED.data`,
+    [
+      String(escalation.id),
+      String(escalation.taskId || ""),
+      String(escalation.status || "open"),
+      escalation.createdAt || nowIso(),
+      escalation.updatedAt || nowIso(),
+      JSON.stringify(escalation),
     ]
   );
 }
@@ -10687,7 +10730,17 @@ async function checkFinancePartnerAction(action) {
   function derivedTasks(user) {
     const role = lower(user && user.role);
     let tasks = [];
-    if (role === 'admin') tasks = riskTasks(user, role).concat(adminComplianceTasks());
+    if (role === 'admin') {
+      tasks = riskTasks(user, role).concat(adminComplianceTasks());
+      // The SLA module contributes Admin oversight alerts through this narrow
+      // provider hook. The underlying operational records remain authoritative.
+      try {
+        const slaTasks = typeof globalThis.__tpSlaAdminTasksProvider === 'function'
+          ? globalThis.__tpSlaAdminTasksProvider()
+          : [];
+        if (Array.isArray(slaTasks)) tasks = tasks.concat(slaTasks);
+      } catch (_) {}
+    }
     if (role === 'risk_agent' || role === 'fraud_agent') tasks = riskTasks(user, role);
     if (role === 'finance_agent') tasks = financeTasks(user);
     if (role === 'accounts_agent' || role === 'accounts') tasks = accountsTasks(user);
@@ -10730,6 +10783,17 @@ async function checkFinancePartnerAction(action) {
     };
   }
 
+  // Stable integration surface for the isolated SLA module. Exposing only the
+  // derived task functions avoids copying queue logic into a second subsystem.
+  globalThis.__tpStaffTaskEngine = {
+    STAFF_ROLES,
+    derivedTasks,
+    taskSummary,
+    clean,
+    lower,
+    iso,
+  };
+
   app.get('/api/staff/tasks', requireAuth, requireStaff, (req, res) => {
     const tasks = derivedTasks(req.user);
     res.json({
@@ -10770,4 +10834,321 @@ async function checkFinancePartnerAction(action) {
   });
 
   console.log('[TutoPay] Unified staff tasks and alerts API loaded');
+})();
+
+/* ===== Staff SLA and escalation control (isolated task-centre extension) ===== */
+(() => {
+  const STAFF_ROLES = new Set([
+    'admin','risk_agent','fraud_agent','finance_agent',
+    'accounts_agent','accounts','compliance_agent','compliance_officer',
+  ]);
+  const ESCALATION_REASONS = {
+    blocked_dependency:'Blocked by another team or dependency',
+    no_response:'Required response has not arrived',
+    partner_delay:'Payment-partner or statement delay',
+    policy_risk:'Policy, fraud or compliance risk',
+    technical_failure:'Technical failure prevents completion',
+    deadline_risk:'Deadline is likely to be missed',
+    other:'Other operational blocker',
+  };
+  const clean = value => String(value == null ? '' : value).trim();
+  const lower = value => clean(value).toLowerCase();
+  const roleLabel = role => ({
+    admin:'Admin',
+    risk_agent:'Risk',
+    fraud_agent:'Risk / Fraud',
+    finance_agent:'Finance',
+    accounts_agent:'Accounts',
+    accounts:'Accounts',
+    compliance_agent:'Compliance',
+    compliance_officer:'Compliance',
+  }[lower(role)] || clean(role).replace(/_/g, ' ') || 'Staff');
+  const activeEscalation = escalation => ['open','acknowledged'].includes(lower(escalation && escalation.status));
+  const taskEngine = () => globalThis.__tpStaffTaskEngine || null;
+
+  function requireSlaStaff(req, res, next) {
+    const role = lower(req.user && req.user.role);
+    if (!req.user || !STAFF_ROLES.has(role)) return res.status(403).json({ error:'Internal staff access required.' });
+    next();
+  }
+  function requireSlaAdmin(req, res, next) {
+    if (!req.user || lower(req.user.role) !== 'admin') return res.status(403).json({ error:'Admin access required.' });
+    next();
+  }
+
+  function escalationAdminTasks() {
+    return staffSlaEscalations.filter(activeEscalation).map(escalation => ({
+      id:`task:sla:${escalation.id}`,
+      category:'sla_escalation',
+      recordType:'sla_escalation',
+      recordId:escalation.id,
+      caseId:escalation.caseId || null,
+      txId:escalation.txId || null,
+      targetPhone:escalation.requestedBy || null,
+      title:`Escalation: ${clean(escalation.taskSnapshot && escalation.taskSnapshot.title || escalation.taskId)}`,
+      summary:`${roleLabel(escalation.requestedByRole)} · ${ESCALATION_REASONS[escalation.reasonCode] || escalation.reasonCode}`,
+      status:escalation.status,
+      priority:escalation.priority || 'high',
+      assignedTo:null,
+      dueAt:escalation.adminDueAt || new Date((Date.parse(escalation.createdAt) || Date.now()) + 4 * 3600000).toISOString(),
+      createdAt:escalation.createdAt,
+      updatedAt:escalation.updatedAt,
+      openHint:'sla',
+      openLabel:'Open SLA control',
+    }));
+  }
+  globalThis.__tpSlaAdminTasksProvider = escalationAdminTasks;
+
+  function allOperationalTasks() {
+    const engine = taskEngine();
+    if (!engine) return [];
+    const people = users
+      .filter(user => user && STAFF_ROLES.has(lower(user.role)))
+      .map(user => ({ phone:clean(user.phone), role:lower(user.role) }));
+    // Synthetic role users make unassigned queues visible even if no staff
+    // account for that role is currently logged in.
+    ['risk_agent','finance_agent','accounts_agent','compliance_agent'].forEach(role => {
+      people.push({ phone:`__unassigned_${role}__`, role });
+    });
+    const unique = new Map();
+    for (const person of people) {
+      let rows = [];
+      try { rows = engine.derivedTasks(person); } catch (_) {}
+      for (const task of rows || []) {
+        if (!task || !task.id || task.recordType === 'sla_escalation') continue;
+        const row = { ...task, ownerRole:person.role, ownerRoleLabel:roleLabel(person.role) };
+        const previous = unique.get(task.id);
+        if (!previous || (!previous.assignedTo && row.assignedTo)) unique.set(task.id, row);
+      }
+    }
+    return [...unique.values()];
+  }
+
+  function timing(task) {
+    const now = Date.now();
+    const createdMs = Date.parse(task.createdAt || task.updatedAt || '') || now;
+    const dueMs = Date.parse(task.dueAt || '') || 0;
+    if (!dueMs) return {
+      slaStage:'no_deadline', remainingMs:null, overdueByMs:0,
+      elapsedPercent:0, deadlineAt:null,
+    };
+    const remainingMs = dueMs - now;
+    const totalMs = Math.max(1, dueMs - createdMs);
+    const elapsedPercent = Math.max(0, Math.min(100, Math.round(((now - createdMs) / totalMs) * 100)));
+    return {
+      slaStage:remainingMs < 0 ? 'overdue' : remainingMs <= 6 * 3600000 ? 'due_soon' : 'on_schedule',
+      remainingMs,
+      overdueByMs:Math.max(0, -remainingMs),
+      elapsedPercent,
+      deadlineAt:new Date(dueMs).toISOString(),
+    };
+  }
+
+  function decorate(task) {
+    const escalations = staffSlaEscalations
+      .filter(row => clean(row && row.taskId) === clean(task.id))
+      .sort((a,b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    const latest = escalations[0] || null;
+    return {
+      ...task,
+      ...timing(task),
+      ownerRole:task.ownerRole || null,
+      ownerRoleLabel:task.ownerRoleLabel || roleLabel(task.ownerRole),
+      escalation:latest,
+      hasOpenEscalation:!!escalations.find(activeEscalation),
+      escalationCount:escalations.length,
+    };
+  }
+
+  function slaSummary(tasks) {
+    const byRole = {};
+    for (const task of tasks) {
+      const key = task.ownerRole || 'unknown';
+      if (!byRole[key]) byRole[key] = {
+        role:key, label:task.ownerRoleLabel || roleLabel(key),
+        total:0, overdue:0, dueSoon:0, unassigned:0, escalated:0,
+      };
+      byRole[key].total += 1;
+      if (task.slaStage === 'overdue') byRole[key].overdue += 1;
+      if (task.slaStage === 'due_soon') byRole[key].dueSoon += 1;
+      if (!task.assignedTo) byRole[key].unassigned += 1;
+      if (task.hasOpenEscalation) byRole[key].escalated += 1;
+    }
+    return {
+      total:tasks.length,
+      onSchedule:tasks.filter(task => task.slaStage === 'on_schedule').length,
+      dueSoon:tasks.filter(task => task.slaStage === 'due_soon').length,
+      overdue:tasks.filter(task => task.slaStage === 'overdue').length,
+      unassigned:tasks.filter(task => !task.assignedTo).length,
+      escalated:tasks.filter(task => task.hasOpenEscalation).length,
+      critical:tasks.filter(task => lower(task.priority) === 'critical').length,
+      byRole:Object.values(byRole).sort((a,b) => a.label.localeCompare(b.label)),
+    };
+  }
+
+  async function syncCompletedEscalations(activeTasks) {
+    const activeIds = new Set(activeTasks.map(task => clean(task.id)));
+    const changed = [];
+    for (const escalation of staffSlaEscalations) {
+      if (!activeEscalation(escalation) || activeIds.has(clean(escalation.taskId))) continue;
+      escalation.status = 'resolved';
+      escalation.resolutionCode = 'workflow_completed';
+      escalation.resolutionNote = 'The underlying workflow task is no longer active.';
+      escalation.resolvedBy = 'SYSTEM';
+      escalation.resolvedAt = nowIso();
+      escalation.updatedAt = escalation.resolvedAt;
+      changed.push(escalation);
+    }
+    await Promise.all(changed.map(row => dbUpsertStaffSlaEscalation(row).catch(() => {})));
+  }
+
+  function sortSla(tasks) {
+    const stageWeight = { overdue:0, due_soon:1, on_schedule:2, no_deadline:3 };
+    return tasks.sort((a,b) => {
+      if (a.hasOpenEscalation !== b.hasOpenEscalation) return a.hasOpenEscalation ? -1 : 1;
+      const stage = (stageWeight[a.slaStage] ?? 9) - (stageWeight[b.slaStage] ?? 9);
+      if (stage) return stage;
+      return (Date.parse(a.deadlineAt || '') || Number.MAX_SAFE_INTEGER) -
+        (Date.parse(b.deadlineAt || '') || Number.MAX_SAFE_INTEGER);
+    });
+  }
+
+  app.get('/api/staff/sla', requireAuth, requireSlaStaff, async (req, res) => {
+    const engine = taskEngine();
+    if (!engine) return res.status(503).json({ error:'Task engine is not ready.' });
+    const isAdmin = lower(req.user.role) === 'admin';
+    const allTasks = allOperationalTasks();
+    await syncCompletedEscalations(allTasks);
+    let tasks;
+    if (isAdmin) {
+      tasks = allTasks;
+      const taskIds = new Set(tasks.map(task => clean(task.id)));
+      // Keep unresolved escalations visible even if their source task vanished
+      // between requests, until the automatic workflow resolution is saved.
+      for (const escalation of staffSlaEscalations.filter(activeEscalation)) {
+        if (taskIds.has(clean(escalation.taskId))) continue;
+        tasks.push({
+          ...(escalation.taskSnapshot || {}),
+          id:escalation.taskId,
+          sourceUnavailable:true,
+          ownerRole:escalation.requestedByRole,
+          ownerRoleLabel:roleLabel(escalation.requestedByRole),
+        });
+      }
+    } else {
+      tasks = engine.derivedTasks(req.user).map(task => ({
+        ...task,
+        ownerRole:lower(req.user.role),
+        ownerRoleLabel:roleLabel(req.user.role),
+      }));
+    }
+    tasks = sortSla(tasks.filter(task => task && task.id).map(decorate));
+    res.json({
+      ok:true,
+      generatedAt:nowIso(),
+      permissions:{
+        canEscalate:!isAdmin,
+        canAcknowledgeEscalation:isAdmin,
+        canResolveEscalation:isAdmin,
+      },
+      reasons:ESCALATION_REASONS,
+      summary:slaSummary(tasks),
+      tasks,
+    });
+  });
+
+  app.post('/api/staff/sla/tasks/:taskId/escalate', requireAuth, requireSlaStaff, async (req, res) => {
+    if (lower(req.user.role) === 'admin') return res.status(403).json({ error:'Admin oversees escalations and cannot escalate a task to itself.' });
+    const engine = taskEngine();
+    if (!engine) return res.status(503).json({ error:'Task engine is not ready.' });
+    const task = engine.derivedTasks(req.user).find(row => clean(row.id) === clean(req.params.taskId));
+    if (!task) return res.status(404).json({ error:'Task not found or no longer available.' });
+    if (!clean(task.assignedTo) || clean(task.assignedTo) !== clean(req.user.phone)) {
+      return res.status(409).json({ error:'Assign this work to yourself before escalating it.' });
+    }
+    const reasonCode = lower(req.body && req.body.reasonCode);
+    const note = clean(req.body && req.body.note).slice(0, 1200);
+    if (!ESCALATION_REASONS[reasonCode]) return res.status(400).json({ error:'Select a valid escalation reason.' });
+    if (note.length < 5) return res.status(400).json({ error:'Add a short note explaining the blocker.' });
+    const version = clean(task.updatedAt || task.createdAt || task.id);
+    const existing = staffSlaEscalations.find(row =>
+      activeEscalation(row) &&
+      clean(row.taskId) === clean(task.id) &&
+      clean(row.taskVersion) === version
+    );
+    if (existing) return res.status(409).json({ error:'This version of the task already has an open escalation.', escalation:existing });
+    const at = nowIso();
+    const escalation = {
+      id:uuid(),
+      taskId:clean(task.id),
+      taskVersion:version,
+      taskSnapshot:{
+        id:clean(task.id), category:task.category, recordType:task.recordType,
+        recordId:task.recordId, caseId:task.caseId || null, txId:task.txId || null,
+        title:task.title, summary:task.summary, status:task.status,
+        priority:task.priority, assignedTo:task.assignedTo, dueAt:task.dueAt,
+        createdAt:task.createdAt, updatedAt:task.updatedAt, openHint:task.openHint,
+        openLabel:task.openLabel,
+      },
+      caseId:task.caseId || null,
+      txId:task.txId || null,
+      reasonCode,
+      reasonLabel:ESCALATION_REASONS[reasonCode],
+      note,
+      priority:task.overdue || lower(task.priority) === 'critical' ? 'critical' : 'high',
+      status:'open',
+      requestedBy:clean(req.user.phone),
+      requestedByRole:lower(req.user.role),
+      requestedByRoleLabel:roleLabel(req.user.role),
+      createdAt:at,
+      updatedAt:at,
+      adminDueAt:new Date(Date.now() + 4 * 3600000).toISOString(),
+    };
+    staffSlaEscalations.push(escalation);
+    if (staffSlaEscalations.length > 10000) staffSlaEscalations.splice(0, staffSlaEscalations.length - 10000);
+    try { await dbUpsertStaffSlaEscalation(escalation); } catch (_) {}
+    logAudit(req, 'staff_sla_escalated', {
+      escalationId:escalation.id, taskId:task.id, reasonCode,
+      recordType:task.recordType, recordId:task.recordId,
+    });
+    res.json({ ok:true, escalation });
+  });
+
+  app.post('/api/staff/sla/escalations/:id/acknowledge', requireAuth, requireSlaAdmin, async (req, res) => {
+    const escalation = staffSlaEscalations.find(row => clean(row.id) === clean(req.params.id));
+    if (!escalation) return res.status(404).json({ error:'Escalation not found.' });
+    if (!activeEscalation(escalation)) return res.status(409).json({ error:'This escalation is already resolved.' });
+    const at = nowIso();
+    escalation.status = 'acknowledged';
+    escalation.acknowledgedBy = clean(req.user.phone);
+    escalation.acknowledgedAt = at;
+    escalation.updatedAt = at;
+    try { await dbUpsertStaffSlaEscalation(escalation); } catch (_) {}
+    logAudit(req, 'staff_sla_escalation_acknowledged', { escalationId:escalation.id, taskId:escalation.taskId });
+    res.json({ ok:true, escalation });
+  });
+
+  app.post('/api/staff/sla/escalations/:id/resolve', requireAuth, requireSlaAdmin, async (req, res) => {
+    const escalation = staffSlaEscalations.find(row => clean(row.id) === clean(req.params.id));
+    if (!escalation) return res.status(404).json({ error:'Escalation not found.' });
+    if (!activeEscalation(escalation)) return res.status(409).json({ error:'This escalation is already resolved.' });
+    const note = clean(req.body && req.body.note).slice(0, 1200);
+    if (note.length < 5) return res.status(400).json({ error:'Add a short resolution or routing note.' });
+    const at = nowIso();
+    escalation.status = 'resolved';
+    escalation.resolutionCode = 'admin_oversight_completed';
+    escalation.resolutionNote = note;
+    escalation.resolvedBy = clean(req.user.phone);
+    escalation.resolvedAt = at;
+    escalation.updatedAt = at;
+    try { await dbUpsertStaffSlaEscalation(escalation); } catch (_) {}
+    logAudit(req, 'staff_sla_escalation_resolved', { escalationId:escalation.id, taskId:escalation.taskId });
+    res.json({
+      ok:true,
+      escalation,
+      note:'Escalation oversight is resolved. The underlying workflow record was not approved, closed or reassigned.',
+    });
+  });
+
+  console.log('[TutoPay] Staff SLA and escalation control API loaded');
 })();
