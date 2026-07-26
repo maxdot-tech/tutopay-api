@@ -7191,6 +7191,139 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
 })();
 
+/* ===== Pilot Evidence + Reporting Pack (read-only, isolated) ===== */
+(() => {
+  if (globalThis.__tpPilotEvidenceReportingPack) return;
+  globalThis.__tpPilotEvidenceReportingPack = true;
+  const clean = value => String(value == null ? '' : value).trim();
+  const lower = value => clean(value).toLowerCase();
+  const num = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const money = value => Math.round(num(value) * 100) / 100;
+  const role = req => lower(req && req.user && req.user.role);
+  const allowed = req => role(req) === 'admin' || isInternalStaffRole(role(req));
+  const gate = (req,res,next) => allowed(req) ? next() : res.status(403).json({ error:'Internal staff access required.' });
+  const terminal = new Set(['completed','released','refunded','rejected','cancelled','canceled','closed','resolved']);
+  const completed = tx => ['completed','released','seller_paid','successful'].includes(lower(tx && tx.status)) ||
+    lower(tx && tx.disbursement && tx.disbursement.status) === 'successful' || !!(tx && tx.completedAt);
+  const issueRows = () => {
+    const store = globalThis.__tpIssueCaseStore;
+    return store && typeof store.values === 'function' ? Array.from(store.values()).filter(Boolean) : [];
+  };
+  const participantRows = () => Array.from(new Map((globalThis.__tpPilotParticipants || [])
+    .filter(row => row && clean(row.phone))
+    .map(row => [clean(row.phone), row])).values());
+
+  function buildPack(req){
+    const participants = participantRows();
+    const participantPhones = new Set(participants.map(row => clean(row.phone)));
+    const pilotTx = (transactions || []).filter(tx =>
+      participantPhones.size === 0 ||
+      participantPhones.has(clean(tx && tx.buyerPhone)) ||
+      participantPhones.has(clean(tx && tx.sellerPhone))
+    );
+    const cases = issueRows().filter(row => !row.txId || pilotTx.some(tx => clean(tx.id) === clean(row.txId)));
+    const feedback = (globalThis.__tpPilotFeedback || []).filter(Boolean);
+    const paid = pilotTx.filter(tx => lower(tx.paymentStatus) === 'paid' || completed(tx));
+    const completedTx = pilotTx.filter(completed);
+    const openCases = cases.filter(row => !terminal.has(lower(row.status)));
+    const evidenceFiles = pilotTx.reduce((sum,tx) => sum + (Array.isArray(tx.disputeDocs) ? tx.disputeDocs.length : 0), 0);
+    const collectionMatched = paid.filter(tx => !!tx.collectionReconciled).length;
+    const payoutApplicable = completedTx.filter(tx => ['successful'].includes(lower(tx && tx.disbursement && tx.disbursement.status)) ||
+      ['completed','released','seller_paid'].includes(lower(tx && tx.status)));
+    const payoutMatched = payoutApplicable.filter(tx => !!tx.payoutReconciled).length;
+    const feedbackTx = new Set(feedback.map(row => clean(row.transactionId || row.txId)).filter(Boolean));
+    pilotTx.forEach(tx => { if (Array.isArray(tx.trustRatings) && tx.trustRatings.length) feedbackTx.add(clean(tx.id)); });
+    const totalValue = money(pilotTx.reduce((sum,tx) => sum + num(tx && tx.amount), 0));
+    const disputeRate = pilotTx.length ? Math.round((cases.length / pilotTx.length) * 1000) / 10 : 0;
+    const feedbackCoverage = completedTx.length ? Math.round(completedTx.filter(tx => feedbackTx.has(clean(tx.id))).length / completedTx.length * 100) : 0;
+    const controls = [
+      { key:'participants', label:'Pilot participants enrolled', passed:participants.length > 0, detail:`${participants.length} participant(s)` },
+      { key:'transactions', label:'Controlled transactions recorded', passed:pilotTx.length > 0, detail:`${pilotTx.length} transaction(s)` },
+      { key:'evidence', label:'Transaction/case evidence available', passed:evidenceFiles > 0 || cases.length === 0, detail:`${evidenceFiles} uploaded evidence file(s)` },
+      { key:'cases', label:'Disputes concluded or actively controlled', passed:openCases.length === 0, detail:`${openCases.length} open of ${cases.length} case(s)` },
+      { key:'collections', label:'Paid collections reconciled', passed:paid.length > 0 && collectionMatched === paid.length, detail:`${collectionMatched}/${paid.length} matched` },
+      { key:'payouts', label:'Applicable payouts reconciled', passed:payoutApplicable.length > 0 && payoutMatched === payoutApplicable.length, detail:`${payoutMatched}/${payoutApplicable.length} matched` },
+      { key:'feedback', label:'Participant feedback captured', passed:completedTx.length > 0 && feedbackCoverage >= 70, detail:`${feedbackCoverage}% coverage` },
+      { key:'audit', label:'Audit evidence available', passed:(auditLog || []).length > 0, detail:`${(auditLog || []).length} audit event(s)` },
+    ];
+    const score = controls.length ? Math.round(controls.filter(row => row.passed).length / controls.length * 100) : 0;
+    return {
+      ok:true,
+      title:'TutoPay Pilot Evidence + Reporting Pack',
+      generatedAt:nowIso(),
+      generatedBy:{ phone:req.user.phone, role:req.user.role },
+      scope:'Controlled pilot workflow evidence; no claim of TutoPay custody or licensed payment execution.',
+      summary:{
+        score,
+        readiness:score === 100 ? 'ready_for_partner_review' : score >= 75 ? 'evidence_nearly_ready' : 'more_evidence_required',
+        participants:participants.length,
+        sellers:participants.filter(row => lower(row.role) === 'seller').length,
+        buyers:participants.filter(row => lower(row.role) === 'buyer').length,
+        transactions:pilotTx.length,
+        completedTransactions:completedTx.length,
+        totalValueZmw:totalValue,
+        cases:cases.length,
+        openCases:openCases.length,
+        disputeRate,
+        evidenceFiles,
+        feedbackEntries:feedback.length,
+        feedbackCoverage,
+        collectionReconciliation:paid.length ? Math.round(collectionMatched / paid.length * 100) : 0,
+        payoutReconciliation:payoutApplicable.length ? Math.round(payoutMatched / payoutApplicable.length * 100) : 0,
+      },
+      controls,
+      gaps:controls.filter(row => !row.passed).map(row => ({ control:row.label, evidence:row.detail })),
+      participantEvidence:participants.map(row => ({
+        phone:clean(row.phone), role:lower(row.role), status:lower(row.status || 'active'),
+        consentAccepted:!!row.consentAccepted, category:clean(row.category), area:clean(row.area || row.location),
+      })),
+      transactionEvidence:pilotTx.map(tx => ({
+        id:clean(tx.id), itemCode:clean(tx.itemCode), buyerPhone:clean(tx.buyerPhone), sellerPhone:clean(tx.sellerPhone),
+        amount:money(tx.amount), currency:clean(tx.currency || 'ZMW'), status:lower(tx.status),
+        paymentStatus:lower(tx.paymentStatus), completed:completed(tx), disputeActive:!!tx.disputeActive,
+        evidenceFiles:Array.isArray(tx.disputeDocs) ? tx.disputeDocs.length : 0,
+        collectionReconciled:!!tx.collectionReconciled, payoutReconciled:!!tx.payoutReconciled,
+        providerReference:clean(tx.providerReference || tx.paymentReference || tx.externalId),
+        createdAt:tx.createdAt || null, completedAt:tx.completedAt || tx.releasedAt || null,
+      })),
+      caseEvidence:cases.map(row => ({
+        caseId:clean(row.caseId), txId:clean(row.txId), status:lower(row.status),
+        category:clean(row.complaintCategory || row.category), outcome:clean(row.outcomeCode || row.outcome),
+        assignedTo:clean(row.assignedTo), openedAt:row.createdAt || row.openedAt || null, updatedAt:row.updatedAt || null,
+      })),
+      feedbackEvidence:feedback.slice(0,2000).map(row => ({
+        phone:clean(row.phone || row.userPhone), role:lower(row.role), transactionId:clean(row.transactionId || row.txId),
+        overallRating:num(row.overallRating), trustRating:num(row.trustRating), wouldUseAgain:!!row.wouldUseAgain,
+        comment:clean(row.comments || row.comment).slice(0,500), createdAt:row.createdAt || null,
+      })),
+      governance:{
+        roleSeparation:'Risk investigates, Admin decides sensitive outcomes, Finance executes authorised partner actions, Accounts reconciles statements, and Compliance reviews identity/conduct.',
+        evidenceHandling:'This report inventories evidence metadata. Sensitive KYC and dispute files remain behind their existing authenticated viewers.',
+        fundsBoundary:'Licensed PSP, mobile-money or banking partners execute regulated collections, payouts, refunds and settlement.',
+      },
+    };
+  }
+
+  const csv = value => `"${String(value == null ? '' : value).replace(/"/g,'""')}"`;
+  app.get('/api/admin/pilot/evidence-report', requireAuth, gate, (req,res) => {
+    const pack = buildPack(req);
+    logAudit(req,'pilot_evidence_report_viewed',{ score:pack.summary.score, transactions:pack.summary.transactions });
+    res.json(pack);
+  });
+  app.get('/api/admin/pilot/evidence-report.csv', requireAuth, gate, (req,res) => {
+    const pack = buildPack(req);
+    const rows = [['section','metric','value','status']];
+    Object.entries(pack.summary).forEach(([key,value]) => rows.push(['summary',key,value,'']));
+    pack.controls.forEach(row => rows.push(['control',row.label,row.detail,row.passed ? 'pass' : 'gap']));
+    pack.transactionEvidence.forEach(row => rows.push(['transaction',row.id,`${row.currency} ${row.amount}`,row.status]));
+    res.setHeader('Content-Type','text/csv');
+    res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-evidence-report.csv"');
+    res.end(rows.map(row => row.map(csv).join(',')).join('\n'));
+  });
+  globalThis.__tpBuildPilotEvidencePack = buildPack;
+  console.log('[TutoPay] Pilot evidence reporting pack loaded');
+})();
+
 /* ===== TutoPay v1.4: Controlled Pilot Metrics backend ===== */
 (function TP_PILOT_METRICS_BACKEND_V14(){
   if (globalThis.__tpPilotMetricsBackendV14) return;
