@@ -23,7 +23,11 @@ function isInternalStaffRole(role) {
 }
 function isPublicRole(role) {
   const r = String(role || "").toLowerCase();
-  return r === "buyer" || r === "seller";
+  return r === "buyer" || r === "seller" || r === "service_provider";
+}
+function isProviderRole(role) {
+  const r = String(role || "").toLowerCase();
+  return r === "seller" || r === "service_provider";
 }
 // server.js
 // TutoPay backend — non-custodial transaction workflow + catalogue + requests + disputes + partner-rail payment callbacks
@@ -2124,9 +2128,13 @@ function normalizePublicProfile(rawProfile, phone) {
   const businessName = String(src.businessName || '').trim();
   const email = String(src.email || '').trim();
   const accountKind = String(src.accountKind || '').trim();
+  const serviceCategory = String(src.serviceCategory || '').trim();
+  const serviceDeliveryMode = String(src.serviceDeliveryMode || '').trim();
+  const serviceArea = String(src.serviceArea || '').trim();
+  const servicePolicyAccepted = !!src.servicePolicyAccepted;
 
   // Normalize older alias field names.
-  return { phone: phoneSafe, firstName, lastName, fullName, displayName, businessName, email, accountKind, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
+  return { phone: phoneSafe, firstName, lastName, fullName, displayName, businessName, email, accountKind, serviceCategory, serviceDeliveryMode, serviceArea, servicePolicyAccepted, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
 }
 
 function publicProfileResponseForUser(user) {
@@ -2477,6 +2485,12 @@ if (!token || !sessions.has(token)) {
 
   req.authToken = token;
   req.user = session; // { id, phone, role, kycLevel, kycStatus, expiresAt }
+  // Compatibility boundary: service providers use the proven seller workflow
+  // internally, while their persisted/public account category remains distinct.
+  if (req.user && req.user.role === "service_provider") {
+    req.user.accountRole = "service_provider";
+    req.user.role = "seller";
+  }
   next();
 }
 
@@ -2671,7 +2685,7 @@ app.post("/api/auth/signup", loginLimiter, (req, res) => {
     return res.status(409).json({ error: "An account already exists for this number. Please use Sign in instead." });
   }
 
-  const allowedRoles = ["buyer", "seller"];
+  const allowedRoles = ["buyer", "seller", "service_provider"];
   const role = allowedRoles.includes(wantedRole) ? wantedRole : "buyer";
 
   let pilotSignupResult = null;
@@ -3395,8 +3409,8 @@ app.post("/api/items", requireAuth, async (req, res) => {
       .json({ error: "Missing seller phone number" });
   }
 
-  if (req.user.role !== "seller" && req.user.role !== "admin") {
-    return res.status(403).json({ error: "Only sellers can list items." });
+  if (!isProviderRole(req.user.role) && req.user.role !== "admin") {
+    return res.status(403).json({ error: "Only sellers and service providers can create listings." });
   }
 
   if (req.user.phone !== sellerPhone && req.user.role !== "admin") {
@@ -3434,6 +3448,18 @@ const cache = new Map();
   const firstUrl = imageUrl || (convertedUrls[0] || (urlsArray[0] || ""));
   const convertedFirst = (await convert(firstUrl)) || convertedUrls[0] || "";
 
+  const listingType = req.user.accountRole === "service_provider" || String(req.body.listingType || "").toLowerCase() === "service" ? "service" : "product";
+  const serviceCategories = new Set(["home_maintenance","professional_business","technology_digital","education_tutoring","events_creative","transport_delivery","personal_care_wellness","other_review_required"]);
+  const serviceCategory = String(req.body.serviceCategory || "").trim().toLowerCase();
+  const serviceText = `${title || ""} ${details || ""} ${serviceCategory}`.toLowerCase();
+  const prohibited = ["gambling","betting","casino","alcohol","tobacco","nicotine","weapon","firearm","adult service","sexual service","illegal drug","fake document","document forgery","hack account"];
+  if (listingType === "service") {
+    if (!serviceCategories.has(serviceCategory)) return res.status(400).json({ error: "Select an approved service category." });
+    if (prohibited.some((term) => serviceText.includes(term))) return res.status(400).json({ error: "This service is not permitted on TutoPay." });
+    if (!String(req.body.deliveryMode || "").trim()) return res.status(400).json({ error: "Select how the service will be delivered." });
+    if (!String(req.body.completionEvidence || "").trim()) return res.status(400).json({ error: "State how service completion will be evidenced." });
+  }
+
   const item = {
     id: uuid(),
     code: itemNumber,
@@ -3445,8 +3471,15 @@ const cache = new Map();
     imageUrl: convertedFirst || "",
     imageUrls: convertedUrls.length ? convertedUrls : (convertedFirst ? [convertedFirst] : []),
     availability: availability || "available",
-    condition: condition || "used",
+    condition: listingType === "service" ? "service" : (condition || "used"),
     category: req.body && req.body.category ? String(req.body.category) : "",
+    listingType,
+    serviceCategory: listingType === "service" ? serviceCategory : "",
+    deliveryMode: listingType === "service" ? String(req.body.deliveryMode || "").trim() : "",
+    serviceArea: listingType === "service" ? String(req.body.serviceArea || "").trim().slice(0, 160) : "",
+    estimatedDuration: listingType === "service" ? String(req.body.estimatedDuration || "").trim().slice(0, 120) : "",
+    completionEvidence: listingType === "service" ? String(req.body.completionEvidence || "").trim().slice(0, 240) : "",
+    servicePolicyVersion: listingType === "service" ? "1.0-controlled-services" : null,
   };
 
   // v14.3.1: seller-controlled discount / negotiation rules; default is fixed price.
@@ -3488,6 +3521,12 @@ if (!item) {
     availability: item.availability,
     condition: item.condition || "used",
     category: item.category || "",
+    listingType: item.listingType || "product",
+    serviceCategory: item.serviceCategory || "",
+    deliveryMode: item.deliveryMode || "",
+    serviceArea: item.serviceArea || "",
+    estimatedDuration: item.estimatedDuration || "",
+    completionEvidence: item.completionEvidence || "",
     sellerPhone: item.sellerPhone,
   });
 });
