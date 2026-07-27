@@ -8677,6 +8677,129 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   console.log("[TutoPay] Controlled pilot validation API loaded");
 })();
 
+/* ===== Pilot launch runbook + Admin go/no-go gate =====
+   Coordinates launch operations only. It cannot approve KYC, decide cases,
+   reconcile records or initiate money movement.
+*/
+(() => {
+  if (globalThis.__tpPilotLaunchRunbookApi) return;
+  globalThis.__tpPilotLaunchRunbookApi = true;
+  const recordId="pilot-launch-runbook-current";
+  const memory=globalThis.__tpPilotLaunchRunbook || (globalThis.__tpPilotLaunchRunbook={
+    id:recordId,label:"TutoPay controlled pilot launch",status:"draft",launchAt:null,
+    coordinatorPhone:"",supportLeadPhone:"",notes:"",
+    checks:{staffBriefing:false,supportCoverage:false,escalationRoute:false,paymentPathTested:false,participantCommunication:false,stopProcedure:false},
+    decisions:[],updatedAt:null,updatedBy:""
+  });
+  let loaded=false;
+  const clean=(value,max=1000)=>String(value==null?"":value).trim().slice(0,max);
+  const lower=value=>clean(value,80).toLowerCase();
+  const phone=value=>clean(value,40).replace(/\s+/g,"");
+  const role=req=>lower(req&&req.user&&req.user.role);
+  const staffGate=(req,res,next)=>(role(req)==="admin"||isInternalStaffRole(role(req)))?next():res.status(403).json({error:"Internal staff access required."});
+  const adminGate=(req,res,next)=>role(req)==="admin"?next():res.status(403).json({error:"Admin approval required."});
+  async function ensureStore(){
+    if(!dbEnabled()||!_pgPool)return false;
+    await _pgPool.query(`CREATE TABLE IF NOT EXISTS tutopay_pilot_records (id TEXT PRIMARY KEY,kind TEXT NOT NULL,code TEXT,phone TEXT,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),data JSONB NOT NULL)`);
+    return true;
+  }
+  async function load(){
+    if(loaded)return;
+    try{
+      if(await ensureStore()){
+        const result=await _pgPool.query(`SELECT data FROM tutopay_pilot_records WHERE id=$1 AND kind='launch_runbook' LIMIT 1`,[recordId]);
+        if(result.rows&&result.rows[0]&&result.rows[0].data)Object.assign(memory,result.rows[0].data);
+      }
+    }catch(error){console.warn("[pilot-launch] load fallback:",error&&error.message?error.message:error);}
+    loaded=true;
+  }
+  async function save(){
+    try{
+      if(await ensureStore())await _pgPool.query(`INSERT INTO tutopay_pilot_records(id,kind,data,updated_at) VALUES($1,'launch_runbook',$2::jsonb,NOW()) ON CONFLICT(id) DO UPDATE SET kind='launch_runbook',data=EXCLUDED.data,updated_at=NOW()`,[recordId,JSON.stringify(memory)]);
+    }catch(error){console.warn("[pilot-launch] save fallback:",error&&error.message?error.message:error);}
+  }
+  function participants(){
+    const map=new Map();
+    for(const p of globalThis.__tpPilotParticipants||[])if(p&&phone(p.phone))map.set(phone(p.phone),Object.assign({},p));
+    for(const user of users||[]){
+      if(!user||!user.pilotOnboarding||!phone(user.phone))continue;
+      map.set(phone(user.phone),Object.assign({},map.get(phone(user.phone))||{},user.pilotOnboarding,{phone:phone(user.phone),role:lower(user.role)}));
+    }
+    return Array.from(map.values()).filter(p=>!["withdrawn","suspended"].includes(lower(p.status)));
+  }
+  function openPilotCases(participantPhones){
+    const store=globalThis.__tpIssueCaseStore;
+    if(!store||typeof store.values!=="function")return [];
+    const terminal=new Set(["completed","released","refunded","rejected","cancelled","canceled","closed","resolved"]);
+    return Array.from(store.values()).filter(row=>{
+      if(!row||terminal.has(lower(row.status)))return false;
+      const tx=(transactions||[]).find(item=>String(item.id)===String(row.txId||""));
+      const buyer=phone(row.buyerPhone||(tx&&(tx.buyerPhone||tx.fromPhone)));
+      const seller=phone(row.sellerPhone||(tx&&(tx.sellerPhone||tx.toPhone)));
+      return participantPhones.has(buyer)||participantPhones.has(seller);
+    });
+  }
+  function snapshot(){
+    const cohort=participants(), sellers=cohort.filter(p=>lower(p.role)==="seller"), buyers=cohort.filter(p=>lower(p.role)==="buyer");
+    const phones=new Set(cohort.map(p=>phone(p.phone)));
+    const ready=cohort.filter(p=>lower(p.activation&&p.activation.readinessStatus)==="ready");
+    const consent=cohort.filter(p=>!!p.consentAccepted);
+    const blockers=cohort.filter(p=>p.activation&&(lower(p.activation.blockerCode||"none")!=="none"||p.activation.followUpRequired));
+    const cases=openPilotCases(phones);
+    const c=memory.checks||{};
+    const gates=[
+      {key:"schedule",label:"Launch schedule and coordinator",passed:!!memory.launchAt&&!!phone(memory.coordinatorPhone),detail:memory.launchAt?`${memory.launchAt} · ${phone(memory.coordinatorPhone)||"coordinator missing"}`:"Launch date not set"},
+      {key:"cohort",label:"Controlled participant cohort",passed:sellers.length>=1&&buyers.length>=3,detail:`${sellers.length} seller(s) · ${buyers.length} buyer(s)`},
+      {key:"activation",label:"Participant activation",passed:cohort.length>0&&ready.length===cohort.length,detail:`${ready.length}/${cohort.length} marked ready`},
+      {key:"consent",label:"Participant consent",passed:cohort.length>0&&consent.length===cohort.length,detail:`${consent.length}/${cohort.length} consent records`},
+      {key:"blockers",label:"No unresolved activation blockers",passed:blockers.length===0,detail:`${blockers.length} participant blocker/follow-up record(s)`},
+      {key:"cases",label:"No open pilot cases",passed:cases.length===0,detail:`${cases.length} open participant case(s)`},
+      {key:"staff_briefing",label:"Staff launch briefing",passed:!!c.staffBriefing,detail:c.staffBriefing?"Confirmed":"Not confirmed"},
+      {key:"support",label:"Support coverage assigned",passed:!!c.supportCoverage&&!!phone(memory.supportLeadPhone),detail:c.supportCoverage?`Lead: ${phone(memory.supportLeadPhone)||"missing"}`:"Not confirmed"},
+      {key:"escalation",label:"Incident escalation route",passed:!!c.escalationRoute,detail:c.escalationRoute?"Confirmed":"Not confirmed"},
+      {key:"payment_test",label:"Partner payment path tested",passed:!!c.paymentPathTested,detail:c.paymentPathTested?"Confirmed":"Not confirmed"},
+      {key:"communication",label:"Participant launch communication",passed:!!c.participantCommunication,detail:c.participantCommunication?"Confirmed":"Not confirmed"},
+      {key:"stop_procedure",label:"Pause/stop procedure briefed",passed:!!c.stopProcedure,detail:c.stopProcedure?"Confirmed":"Not confirmed"}
+    ];
+    const passed=gates.filter(g=>g.passed).length;
+    return {ok:true,generatedAt:nowIso(),runbook:Object.assign({},memory,{checks:Object.assign({},c),decisions:(memory.decisions||[]).slice().reverse().slice(0,30)}),summary:{participants:cohort.length,sellers:sellers.length,buyers:buyers.length,readyParticipants:ready.length,openCases:cases.length,blockers:blockers.length,passedGates:passed,totalGates:gates.length,score:gates.length?Math.round(passed*100/gates.length):0,allPassed:passed===gates.length},gates,note:"This launch gate coordinates a controlled pilot. Licensed payment partners remain responsible for regulated funds movement."};
+  }
+  app.get("/api/admin/pilot/launch-runbook",requireAuth,staffGate,async(req,res)=>{await load();res.json(snapshot());});
+  app.post("/api/admin/pilot/launch-runbook",requireAuth,adminGate,async(req,res)=>{
+    await load();const body=req.body||{},launchAt=body.launchAt?new Date(body.launchAt):null;
+    if(launchAt&&!Number.isFinite(launchAt.getTime()))return res.status(400).json({error:"Enter a valid pilot launch date."});
+    const coordinatorPhone=phone(body.coordinatorPhone||"");
+    const supportLeadPhone=phone(body.supportLeadPhone||"");
+    for(const [label,value] of [["Coordinator",coordinatorPhone],["Support lead",supportLeadPhone]]){
+      if(!value)continue;const user=findUserByPhone(value);
+      if(!user||!isInternalStaffRole(lower(user.role)))return res.status(400).json({error:`${label} must be an internal staff account.`});
+    }
+    memory.label=clean(body.label||memory.label,160)||"TutoPay controlled pilot launch";
+    memory.launchAt=launchAt?launchAt.toISOString():null;
+    memory.coordinatorPhone=coordinatorPhone;memory.supportLeadPhone=supportLeadPhone;
+    memory.notes=clean(body.notes||"",2500);
+    const checks=body.checks||{};
+    memory.checks={staffBriefing:checks.staffBriefing===true,supportCoverage:checks.supportCoverage===true,escalationRoute:checks.escalationRoute===true,paymentPathTested:checks.paymentPathTested===true,participantCommunication:checks.participantCommunication===true,stopProcedure:checks.stopProcedure===true};
+    memory.updatedAt=nowIso();memory.updatedBy=req.user.phone;
+    await save();logAudit(req,"pilot_launch_runbook_updated",{launchAt:memory.launchAt,coordinatorPhone,supportLeadPhone,checks:memory.checks});
+    res.json(snapshot());
+  });
+  app.post("/api/admin/pilot/launch-runbook/decision",requireAuth,adminGate,async(req,res)=>{
+    await load();const body=req.body||{},decision=lower(body.decision),note=clean(body.note||"",2000);
+    if(!["hold","ready_to_launch","launched","closed"].includes(decision))return res.status(400).json({error:"Select hold, ready to launch, launched or closed."});
+    if(note.length<8)return res.status(400).json({error:"Add a clear decision note of at least 8 characters."});
+    const evidence=snapshot();
+    if(["ready_to_launch","launched"].includes(decision)&&!evidence.summary.allPassed)return res.status(409).json({error:"The pilot cannot pass the final gate until every launch control passes."});
+    if(decision==="launched"&&memory.status!=="ready_to_launch")return res.status(409).json({error:"Admin must first approve Ready to launch before confirming launch."});
+    const entry={id:uuid(),decision,note,score:evidence.summary.score,gates:evidence.gates,at:nowIso(),byPhone:req.user.phone,byRole:req.user.role};
+    memory.status=decision;memory.decisions=Array.isArray(memory.decisions)?memory.decisions:[];memory.decisions.push(entry);memory.updatedAt=entry.at;memory.updatedBy=req.user.phone;
+    await save();logAudit(req,"pilot_launch_decision_recorded",{decision,score:entry.score});
+    res.json({ok:true,decision:entry,readiness:snapshot()});
+  });
+  app.get("/api/admin/pilot/launch-runbook/export",requireAuth,staffGate,async(req,res)=>{await load();logAudit(req,"pilot_launch_runbook_exported",{status:memory.status});res.json(Object.assign({title:"TutoPay Controlled Pilot Launch Runbook",exportedAt:nowIso(),exportedBy:{phone:req.user.phone,role:req.user.role}},snapshot()));});
+  console.log("[TutoPay] Pilot launch runbook API loaded");
+})();
+
 
 /* ===== TutoPay v1.8: PSP Integration Test Console + Settlement Simulation backend ===== */
 (function TP_PSP_INTEGRATION_BACKEND_V18(){
