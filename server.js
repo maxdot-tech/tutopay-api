@@ -8797,7 +8797,128 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     res.json({ok:true,decision:entry,readiness:snapshot()});
   });
   app.get("/api/admin/pilot/launch-runbook/export",requireAuth,staffGate,async(req,res)=>{await load();logAudit(req,"pilot_launch_runbook_exported",{status:memory.status});res.json(Object.assign({title:"TutoPay Controlled Pilot Launch Runbook",exportedAt:nowIso(),exportedBy:{phone:req.user.phone,role:req.user.role}},snapshot()));});
+  globalThis.__tpPilotLaunchRunbookSnapshot=async()=>{await load();return snapshot();};
   console.log("[TutoPay] Pilot launch runbook API loaded");
+})();
+
+/* ===== Controlled Pilot Launch Kit =====
+   A read-only operating pack generated from the existing launch runbook.
+   It creates no new workflow state and cannot approve, restrict or move money.
+*/
+(() => {
+  if(globalThis.__tpPilotLaunchKitApi)return;
+  globalThis.__tpPilotLaunchKitApi=true;
+  const clean=(value,max=1000)=>String(value==null?"":value).trim().slice(0,max);
+  const lower=value=>clean(value,80).toLowerCase();
+  const esc=value=>clean(value,10000).replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+  const staffGate=(req,res,next)=>{
+    const role=lower(req&&req.user&&req.user.role);
+    return (role==="admin"||isInternalStaffRole(role))?next():res.status(403).json({error:"Internal staff access required."});
+  };
+  const launchText=value=>{
+    if(!value)return "Not scheduled";
+    const date=new Date(value);
+    return Number.isNaN(date.getTime())?"Not scheduled":date.toLocaleString("en-ZM",{dateStyle:"medium",timeStyle:"short",timeZone:"Africa/Lusaka"});
+  };
+  async function build(req){
+    const readiness=typeof globalThis.__tpPilotLaunchRunbookSnapshot==="function"
+      ?await globalThis.__tpPilotLaunchRunbookSnapshot()
+      :{runbook:{},summary:{},gates:[]};
+    const runbook=readiness.runbook||{}, summary=readiness.summary||{};
+    const coordinator=runbook.coordinatorPhone||"Not assigned";
+    const supportLead=runbook.supportLeadPhone||"Not assigned";
+    const launchAt=launchText(runbook.launchAt);
+    const commonBoundary="TutoPay coordinates transaction workflow, evidence, confirmations and support. Licensed payment partners process, hold, settle, refund or reverse customer funds.";
+    const guides=[
+      {id:"seller",title:"Seller Pilot Guide",audience:"Enrolled pilot sellers",purpose:"List genuine items, answer buyer requests clearly and follow the controlled transaction process.",steps:[
+        "Confirm your profile, KYC status, catalogue item details, price, stock and item images before sharing a link.",
+        "Share only the item-specific TutoPay link supplied from your catalogue.",
+        "Reply to each buyer request using the structured availability, delivery or collection and offer fields.",
+        "Do not mark an item delivered or collected before the agreed handover actually occurs.",
+        "Keep receipts, delivery proof and item-condition evidence available until the transaction is closed.",
+        `Report transaction problems through TutoPay support. Pilot support lead: ${supportLead}.`
+      ]},
+      {id:"buyer",title:"Buyer Pilot Guide",audience:"Enrolled pilot buyers",purpose:"Use TutoPay links and confirmations carefully so every test transaction leaves reliable evidence.",steps:[
+        "Open the seller's item-specific TutoPay link and confirm the seller, item, price and terms.",
+        "Create or use your own TutoPay account; never use another participant's account.",
+        "Send a request and review the seller's structured reply before starting a transaction.",
+        "Follow only the payment instruction shown for the controlled pilot; never send money based on an unrelated message.",
+        "Inspect the item before confirming collection or delivery.",
+        `Raise an issue from the transaction record and attach clear evidence when something is wrong. Support lead: ${supportLead}.`
+      ]},
+      {id:"staff",title:"Staff Operating Procedure",audience:"Admin, Risk, Finance, Accounts and Compliance",purpose:"Keep the pilot controlled, traceable and role-separated.",steps:[
+        `Opening lead confirms the launch window (${launchAt}), staff coverage and system availability.`,
+        "Compliance confirms participant eligibility and records recommendations; Admin makes final restriction or approval decisions.",
+        "Risk owns participant cases, evidence requests and recommendations; Admin makes final case decisions.",
+        "Finance validates and executes only authorised financial instructions through configured partner controls.",
+        "Accounts matches partner statements, records discrepancies and closes reconciliation.",
+        "Every material action must carry an audit event, internal note or case-linked communication."
+      ]},
+      {id:"evidence",title:"Dispute and Evidence Guide",audience:"Participants and case staff",purpose:"Make evidence requests specific, attributable and reviewable.",steps:[
+        "State exactly what fact is disputed and the outcome requested.",
+        "Upload the clearest available original image or document and add a short explanation.",
+        "Staff evidence requests must name the buyer, seller or both and include a response deadline.",
+        "Participant responses remain linked to the case, author and request that produced them.",
+        "Risk records findings and recommendation; Admin records the final decision and reason.",
+        "Finance and Accounts act only on the resulting authorised instruction and partner evidence."
+      ]}
+    ];
+    const openingChecklist=[
+      "Confirm the final readiness gate and Admin launch status.",
+      "Confirm coordinator, support lead and specialist staff coverage.",
+      "Check participant activation, consent, KYC and unresolved blockers.",
+      "Check PSP configuration or approved manual pilot payment procedure.",
+      "Check open cases, overdue tasks, failed callbacks and unreconciled money events.",
+      "Send the launch-day participant message and record the communication."
+    ];
+    const closingChecklist=[
+      "Review transactions created, completed, cancelled and disputed during the day.",
+      "Confirm payment, payout, refund and reconciliation exceptions are assigned.",
+      "Review participant feedback and unresolved support messages.",
+      "Record incidents, actions, owners and next response deadlines.",
+      "Confirm evidence and audit records are available.",
+      "Record continue, hold or stop recommendation for the next operating period."
+    ];
+    const escalation=[
+      {trigger:"Participant safety, fraud indicator or account misuse",owner:"Risk",next:"Admin",target:"Immediate assignment"},
+      {trigger:"KYC, sanctions, policy or identity concern",owner:"Compliance",next:"Admin",target:"Same operating day"},
+      {trigger:"Collection, refund, payout or partner-rail failure",owner:"Finance",next:"Accounts / Admin",target:"Immediate containment"},
+      {trigger:"Statement mismatch or missing partner reference",owner:"Accounts",next:"Finance / Admin",target:"Before financial closure"},
+      {trigger:"System-wide outage, data exposure or repeated callback failure",owner:"Coordinator",next:"Admin and relevant specialists",target:"Pause affected pilot activity"}
+    ];
+    const templates=[
+      {id:"seller_invite",title:"Seller invitation",text:`You have been selected for the TutoPay controlled pilot scheduled for ${launchAt}. Please complete your activation checklist, confirm your catalogue items and attend the participant briefing before sharing item links. Support: ${supportLead}.`},
+      {id:"buyer_invite",title:"Buyer invitation",text:`You have been invited to test the TutoPay controlled marketplace workflow from ${launchAt}. Use only the item link supplied by an enrolled seller, review every term before proceeding and report problems through the transaction record. Support: ${supportLead}.`},
+      {id:"staff_launch",title:"Staff launch notice",text:`Controlled pilot launch window: ${launchAt}. Coordinator: ${coordinator}. Support lead: ${supportLead}. Review assigned coverage, open tasks and the escalation matrix before the launch window begins.`},
+      {id:"incident_update",title:"Participant incident update",text:"Your report has been received and linked to the relevant TutoPay record. The assigned team is reviewing the information. Please use the case request area for any additional evidence and do not create duplicate reports."},
+      {id:"pause_notice",title:"Pilot pause notice",text:"The affected pilot activity has been paused while the team reviews an operational issue. Do not begin a new affected transaction until TutoPay sends a formal update. Existing records and evidence remain available for review."}
+    ];
+    return {
+      ok:true,generatedAt:nowIso(),generatedBy:{phone:req.user.phone,role:req.user.role},
+      title:"TutoPay Controlled Pilot Launch Kit",
+      launch:{label:runbook.label||"TutoPay controlled pilot launch",status:runbook.status||"draft",launchAt,coordinatorPhone:coordinator,supportLeadPhone:supportLead,notes:runbook.notes||""},
+      readiness:{score:summary.score||0,passedGates:summary.passedGates||0,totalGates:summary.totalGates||0,allPassed:!!summary.allPassed,participants:summary.participants||0,openCases:summary.openCases||0,blockers:summary.blockers||0},
+      guides,checklists:{opening:openingChecklist,closing:closingChecklist},escalation,templates,
+      boundaries:[commonBoundary,"This kit is operational guidance for a controlled pilot; it is not a licence, payment guarantee or substitute for PSP, legal or regulatory approval.","Admin retains final approval authority. Specialist staff act only within their assigned roles."]
+    };
+  }
+  function printHtml(kit){
+    const list=items=>`<ol>${items.map(item=>`<li>${esc(item)}</li>`).join("")}</ol>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(kit.title)}</title><style>body{font:14px/1.5 Arial,sans-serif;color:#111827;max-width:920px;margin:0 auto;padding:32px}h1,h2{color:#0b1b2b}h1{border-bottom:4px solid #eab308;padding-bottom:10px}.meta,.box{border:1px solid #cbd5e1;border-radius:10px;padding:14px;margin:12px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #cbd5e1;padding:8px;text-align:left;vertical-align:top}.tag{display:inline-block;border:1px solid #94a3b8;border-radius:99px;padding:3px 8px;font-weight:bold}@media print{body{padding:0}.page{break-before:page}.no-print{display:none}}@media(max-width:700px){.grid{grid-template-columns:1fr}}</style></head><body><button class="no-print" onclick="print()">Print / Save as PDF</button><h1>${esc(kit.title)}</h1><div class="meta"><b>${esc(kit.launch.label)}</b><br>Launch: ${esc(kit.launch.launchAt)}<br>Status: <span class="tag">${esc(kit.launch.status)}</span><br>Coordinator: ${esc(kit.launch.coordinatorPhone)} · Support: ${esc(kit.launch.supportLeadPhone)}<br>Readiness: ${esc(kit.readiness.score)}% (${esc(kit.readiness.passedGates)}/${esc(kit.readiness.totalGates)} gates)</div>${kit.guides.map((guide,index)=>`<section class="${index?"page":""}"><h2>${esc(guide.title)}</h2><p><b>Audience:</b> ${esc(guide.audience)}<br><b>Purpose:</b> ${esc(guide.purpose)}</p>${list(guide.steps)}</section>`).join("")}<section class="page"><h2>Daily Operating Checklists</h2><div class="grid"><div class="box"><h3>Opening</h3>${list(kit.checklists.opening)}</div><div class="box"><h3>Closing</h3>${list(kit.checklists.closing)}</div></div><h2>Escalation Matrix</h2><table><thead><tr><th>Trigger</th><th>Owner</th><th>Next</th><th>Target</th></tr></thead><tbody>${kit.escalation.map(row=>`<tr><td>${esc(row.trigger)}</td><td>${esc(row.owner)}</td><td>${esc(row.next)}</td><td>${esc(row.target)}</td></tr>`).join("")}</tbody></table></section><section class="page"><h2>Communication Templates</h2>${kit.templates.map(row=>`<div class="box"><h3>${esc(row.title)}</h3><p>${esc(row.text)}</p></div>`).join("")}<h2>Operating Boundaries</h2>${list(kit.boundaries)}</section></body></html>`;
+  }
+  app.get("/api/admin/pilot/launch-kit",requireAuth,staffGate,async(req,res)=>{
+    const kit=await build(req);res.json(kit);
+  });
+  app.get("/api/admin/pilot/launch-kit/export",requireAuth,staffGate,async(req,res)=>{
+    const kit=await build(req);logAudit(req,"pilot_launch_kit_exported",{format:"json",status:kit.launch.status});res.json(kit);
+  });
+  app.get("/api/admin/pilot/launch-kit/print",requireAuth,staffGate,async(req,res)=>{
+    const kit=await build(req);logAudit(req,"pilot_launch_kit_exported",{format:"html",status:kit.launch.status});
+    res.setHeader("Content-Type","text/html; charset=utf-8");
+    res.setHeader("Content-Disposition",'attachment; filename="tutopay-controlled-pilot-launch-kit.html"');
+    res.end(printHtml(kit));
+  });
+  console.log("[TutoPay] Controlled pilot launch kit API loaded");
 })();
 
 
