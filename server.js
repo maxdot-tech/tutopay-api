@@ -8178,10 +8178,45 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
       };
     }).sort((a,b)=>String(b.createdAt||b.completedAt||'').localeCompare(String(a.createdAt||a.completedAt||'')));
   }
+  function activationForParticipant(p, txs, fb){
+    const ph=phone(p.phone), participantRole=lc(p.role||'buyer');
+    const user=findUserByPhone(ph);
+    const profile=(user&&user.profile)||{};
+    const manual=Object.assign({
+      ownerPhone:'', trainingCompleted:false, shareLinkTested:false,
+      testTransactionCompleted:false, followUpRequired:false, followUpAt:null,
+      blockerCode:'none', blockerNote:'', readinessStatus:'not_started', internalNote:''
+    }, p.activation||{});
+    const kycStatus=lc((user&&(user.kycStatus||user.kyc_status))||profile.kycStatus||'unsubmitted');
+    const completedTxs=txs.filter(tx=>['completed','released','seller_paid','successful'].includes(lc(tx.status||tx.pilotStatus||''))||!!tx.completedAt);
+    const participantRequests=(requests||[]).filter(row=>participantRole==='seller'?phone(row.toPhone||row.sellerPhone)===ph:phone(row.fromPhone||row.buyerPhone)===ph);
+    const catalogueCount=participantRole==='seller'?(items||[]).filter(item=>phone(item.sellerPhone)===ph).length:0;
+    const checks=[
+      {key:'account',label:'Account created',passed:!!user,automatic:true},
+      {key:'consent',label:'Pilot consent',passed:!!p.consentAccepted,automatic:true},
+      {key:'kyc',label:'KYC ready',passed:['verified','approved','enhanced','complete','completed'].includes(kycStatus),automatic:true},
+      ...(participantRole==='seller'?[{key:'catalogue',label:'Catalogue prepared',passed:catalogueCount>0,automatic:true},{key:'share_link',label:'Share link tested',passed:!!manual.shareLinkTested,automatic:false}]:[]),
+      {key:'training',label:'Training completed',passed:!!manual.trainingCompleted,automatic:false},
+      {key:'request',label:'First request activity',passed:participantRequests.length>0,automatic:true},
+      {key:'transaction',label:'First transaction',passed:txs.length>0,automatic:true},
+      {key:'test_transaction',label:'Test transaction checked',passed:!!manual.testTransactionCompleted||completedTxs.length>0,automatic:false},
+      {key:'feedback',label:'Feedback submitted',passed:fb.length>0,automatic:true}
+    ];
+    const passed=checks.filter(row=>row.passed).length;
+    const progress=checks.length?Math.round(passed*100/checks.length):0;
+    const recommendedReadiness=progress===100&&!manual.followUpRequired&&lc(manual.blockerCode)==='none'?'ready':progress>=50?'in_progress':'not_started';
+    return Object.assign({},manual,{
+      kycStatus, catalogueCount, requestCount:participantRequests.length,
+      transactionCount:txs.length, completedTransactionCount:completedTxs.length,
+      targetTransactions:participantRole==='seller'?10:1,
+      progress, passedChecks:passed, totalChecks:checks.length, checks,
+      recommendedReadiness, updatedAt:manual.updatedAt||null, updatedBy:manual.updatedBy||''
+    });
+  }
   function participantSafe(p){
     const txs = txForPhone(p.phone);
     const fb = feedbackForPhone(p.phone);
-    return Object.assign({}, p, { txCount: txs.length, feedbackCount: fb.length, totalValue: txs.reduce((s,t)=>s+n(t.amount,0),0), lastTxAt: txs.map(t=>t.createdAt||t.updatedAt||t.paidAt).filter(Boolean).sort().pop() || null, avgFeedback: fb.length ? Math.round(fb.reduce((s,x)=>s+n(x.overallRating || x.trustRating || x.easeRating,0),0) / fb.length * 10)/10 : null });
+    return Object.assign({}, p, { txCount: txs.length, feedbackCount: fb.length, totalValue: txs.reduce((s,t)=>s+n(t.amount,0),0), lastTxAt: txs.map(t=>t.createdAt||t.updatedAt||t.paidAt).filter(Boolean).sort().pop() || null, avgFeedback: fb.length ? Math.round(fb.reduce((s,x)=>s+n(x.overallRating || x.trustRating || x.easeRating,0),0) / fb.length * 10)/10 : null, activation:activationForParticipant(p,txs,fb) });
   }
   function allParticipants(){
     const byPhone = new Map();
@@ -8330,6 +8365,43 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     logAudit(req,'pilot_participant_status_update',{phone:p.phone,status});
     res.json({ ok:true, participant:participantSafe(p) });
   });
+  app.post('/api/admin/pilot/participants/:id/activation', requireAuth, requirePilotWrite, async (req,res)=>{
+    await pilotDbLoad().catch(()=>{});
+    const id=String(req.params.id||'');
+    const p=pilotParticipants.find(x=>String(x.id)===id || phone(x.phone)===phone(id));
+    if(!p) return res.status(404).json({ error:'Participant not found' });
+    const body=req.body||{}, previous=p.activation||{};
+    const readinessStatus=lc(body.readinessStatus||previous.readinessStatus||'not_started');
+    const blockerCode=lc(body.blockerCode||previous.blockerCode||'none');
+    if(!['not_started','in_progress','ready','paused','withdrawn'].includes(readinessStatus)) return res.status(400).json({ error:'Invalid readiness status.' });
+    if(!['none','account','consent','kyc','catalogue','share_link','training','request','transaction','feedback','other'].includes(blockerCode)) return res.status(400).json({ error:'Invalid blocker category.' });
+    const ownerPhone=phone(body.ownerPhone||previous.ownerPhone||'');
+    if(ownerPhone){
+      const owner=findUserByPhone(ownerPhone);
+      if(!owner || !isInternalStaffRole(lc(owner.role))) return res.status(400).json({ error:'Activation owner must be an internal staff account.' });
+    }
+    const followUpAt=body.followUpAt?new Date(body.followUpAt):null;
+    if(followUpAt && !Number.isFinite(followUpAt.getTime())) return res.status(400).json({ error:'Invalid follow-up date.' });
+    p.activation={
+      ownerPhone,
+      trainingCompleted:body.trainingCompleted===true,
+      trainingCompletedAt:body.trainingCompleted===true?(previous.trainingCompletedAt||nowIso()):null,
+      shareLinkTested:body.shareLinkTested===true,
+      shareLinkTestedAt:body.shareLinkTested===true?(previous.shareLinkTestedAt||nowIso()):null,
+      testTransactionCompleted:body.testTransactionCompleted===true,
+      testTransactionCompletedAt:body.testTransactionCompleted===true?(previous.testTransactionCompletedAt||nowIso()):null,
+      followUpRequired:body.followUpRequired===true,
+      followUpAt:followUpAt?followUpAt.toISOString():null,
+      blockerCode, blockerNote:clean(body.blockerNote||'').slice(0,1000),
+      readinessStatus, internalNote:clean(body.internalNote||'').slice(0,2000),
+      updatedAt:nowIso(), updatedBy:req.user.phone
+    };
+    p.updatedAt=nowIso(); p.updatedBy=req.user.phone;
+    await pilotDbUpsert('participant',p).catch(()=>{});
+    const user=findUserByPhone(p.phone); if(user){ user.pilotOnboarding=p; if(dbEnabled()) dbUpsertUser(user).catch(()=>{}); }
+    logAudit(req,'pilot_participant_activation_updated',{phone:p.phone,participantId:p.id,readinessStatus,blockerCode,ownerPhone,followUpRequired:p.activation.followUpRequired});
+    res.json({ok:true,participant:participantSafe(p)});
+  });
 
   app.get('/api/admin/pilot/feedback', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); res.json({ ok:true, feedback: allPilotFeedback().slice(0,500) }); });
   app.post('/api/admin/pilot/feedback', requireAuth, requirePilotWrite, async (req,res)=>{
@@ -8360,7 +8432,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-feedback.csv"');
     res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n'));
   });
-  app.get('/api/admin/pilot/onboarding.csv', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const rows=[['type','phone_or_code','role','status','name_or_label','area','category','consent','uses_or_tx','feedback_count','created_at']]; for(const i of pilotInvites.map(inviteSafe)) rows.push(['invite',i.code,i.role,i.status,i.label,i.location,i.category,'',`${i.usedCount}/${i.maxUses}`,'',i.createdAt||'']); for(const p of allParticipants()) rows.push(['participant',p.phone,p.role,p.status,p.name||'',p.area||'',p.category||'',p.consentAccepted?'yes':'no',p.txCount||0,p.feedbackCount||0,p.createdAt||'']); res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-onboarding.csv"'); res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n')); });
+  app.get('/api/admin/pilot/onboarding.csv', requireAuth, requirePilotStaff, async (req,res)=>{ await pilotDbLoad().catch(()=>{}); const rows=[['type','phone_or_code','role','status','name_or_label','area','category','consent','uses_or_tx','feedback_count','activation_progress','readiness_status','activation_owner','blocker','follow_up_at','created_at']]; for(const i of pilotInvites.map(inviteSafe)) rows.push(['invite',i.code,i.role,i.status,i.label,i.location,i.category,'',`${i.usedCount}/${i.maxUses}`,'','','','','','',i.createdAt||'']); for(const p of allParticipants()){const a=p.activation||{};rows.push(['participant',p.phone,p.role,p.status,p.name||'',p.area||'',p.category||'',p.consentAccepted?'yes':'no',p.txCount||0,p.feedbackCount||0,a.progress||0,a.readinessStatus||'not_started',a.ownerPhone||'',a.blockerCode||'none',a.followUpAt||'',p.createdAt||'']);} res.setHeader('Content-Type','text/csv'); res.setHeader('Content-Disposition','attachment; filename="tutopay-pilot-onboarding.csv"'); res.end(rows.map(row=>row.map(csvCell).join(',')).join('\n')); });
 })();
 
 
