@@ -3704,6 +3704,12 @@ const tx = {
       : null,
   };
   ensureTxReconDefaults(tx);
+  if (typeof globalThis.__tpAttachServiceAgreementToTransaction === "function") {
+    const serviceLink = globalThis.__tpAttachServiceAgreementToTransaction(tx);
+    if (serviceLink && serviceLink.error) {
+      return res.status(409).json({ error: serviceLink.error });
+    }
+  }
 
   transactions.push(tx);
   if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
@@ -4554,9 +4560,12 @@ app.get("/api/requests", requireAuth, (req, res) => {
     return res.json(requests);
   }
 
-  const myReqs = requests.filter(
+  let myReqs = requests.filter(
     (rq) => rq.fromPhone === req.user.phone || rq.toPhone === req.user.phone
   );
+  if (typeof globalThis.__tpFilterServiceRequestsForUser === "function") {
+    myReqs = globalThis.__tpFilterServiceRequestsForUser(req.user, myReqs);
+  }
 
   res.json(myReqs);
 });
@@ -7253,7 +7262,8 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   const bookings = [];
   let loaded = false;
   let dbReady = false;
-  const activeStatuses = new Set(["pending_provider","awaiting_buyer","confirmed","in_progress"]);
+  const committedStatuses = new Set(["booked","in_progress"]);
+  const pendingStatus = "pending_provider";
   const clean = (v,n=240) => String(v == null ? "" : v).trim().slice(0,n);
   const lower = v => clean(v).toLowerCase();
   const itemByCode = code => (items || []).find(x => String(x.code || x.id) === String(code || ""));
@@ -7267,47 +7277,112 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   };
   const providerOwns = (req,item) => item && String(item.sellerPhone) === String(req.user.phone) && (req.user.role === "seller" || req.user.accountRole === "service_provider");
   const prune = () => {
-    const now = Date.now();
     for (const b of bookings) {
-      if (b.status === "pending_provider" && b.reservationExpiresAt && Date.parse(b.reservationExpiresAt) <= now) {
-        b.status = "expired";
+      // Migration from the earlier prototype: an accepted request is an
+      // agreement awaiting payment, not a booking and not provider engagement.
+      if (b.status === "confirmed") {
+        b.status = "agreement_ready";
         b.updatedAt = nowIso();
         persist("booking",b).catch(()=>{});
       }
+      if (b.transactionId) {
+        const tx = (transactions || []).find(row => String(row.id) === String(b.transactionId));
+        if (tx && String(tx.paymentStatus || "").toLowerCase() === "paid" && !committedStatuses.has(lower(b.status)) && !["completed","cancelled","declined"].includes(lower(b.status))) {
+          b.status = "booked";
+          b.paidAt = tx.paidAt || nowIso();
+          b.updatedAt = nowIso();
+          b.history = Array.isArray(b.history) ? b.history : [];
+          b.history.push({at:b.updatedAt,actor:"system",action:"escrow_payment_confirmed"});
+          persist("booking",b).catch(()=>{});
+        }
+      }
     }
   };
-  const activeForProvider = phone => {
+  const committedForProvider = phone => {
     prune();
-    return bookings.filter(b => String(b.providerPhone) === String(phone) && activeStatuses.has(lower(b.status)));
+    return bookings.filter(b => String(b.providerPhone) === String(phone) && committedStatuses.has(lower(b.status)));
   };
-  const activeForItem = code => {
+  const committedForItem = code => {
     prune();
-    return bookings.filter(b => String(b.itemCode) === String(code) && activeStatuses.has(lower(b.status)));
+    return bookings.filter(b => String(b.itemCode) === String(code) && committedStatuses.has(lower(b.status)));
+  };
+  const pendingQueue = phone => bookings
+    .filter(b => String(b.providerPhone) === String(phone) && lower(b.status) === pendingStatus)
+    .sort((a,b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  const queuePosition = booking => {
+    const queue = pendingQueue(booking.providerPhone);
+    const index = queue.findIndex(row => String(row.id) === String(booking.id));
+    return index >= 0 ? index + 1 : null;
   };
   const availabilityMode = item => lower(item.availabilityMode) || modeForHours(serviceHours(item));
   function snapshot(item){
     if (!isService(item)) return null;
     const rec = availability.get(String(item.code || item.id)) || {};
     const mode = availabilityMode(item);
-    const providerBookings = activeForProvider(item.sellerPhone);
-    const itemBookings = activeForItem(item.code || item.id);
+    const providerBookings = committedForProvider(item.sellerPhone);
+    const itemBookings = committedForItem(item.code || item.id);
     const capacityUsed = providerBookings.length;
     const liveValid = rec.liveUntil && Date.parse(rec.liveUntil) > Date.now();
     let status = mode;
     if (rec.paused) status = "paused";
-    else if (capacityUsed >= 3) status = "full";
     else if (mode === "instant" && !liveValid) status = "offline";
-    else if (mode === "instant" && providerBookings.some(b => lower(b.status) === "in_progress")) status = "live_amber";
-    else if (mode === "instant" && liveValid) status = capacityUsed ? "live_amber" : "live_green";
+    else if (mode === "instant" && providerBookings.length) status = "live_amber";
+    else if (mode === "instant" && liveValid) status = "live_green";
     const queuedHours = providerBookings.reduce((sum,b) => sum + Math.max(.25,Number(b.durationHours || 0)),0);
     return {
       mode,status,capacityUsed,capacityLimit:3,remainingSlots:Math.max(0,3-capacityUsed),
       itemBookings:itemBookings.length,liveUntil:liveValid?rec.liveUntil:null,paused:!!rec.paused,
+      pendingEnquiries:pendingQueue(item.sellerPhone).length,
       estimatedNextAvailableAt: capacityUsed ? new Date(Date.now()+queuedHours*3600000).toISOString() : nowIso(),
       updatedAt:rec.updatedAt||null
     };
   }
   globalThis.__tpServiceAvailabilityForItem = snapshot;
+  globalThis.__tpFilterServiceRequestsForUser = (user, rows) => {
+    const annotated = (rows || []).map(rq => {
+      if (!rq.serviceBookingId) return rq;
+      const booking = bookings.find(row => String(row.id) === String(rq.serviceBookingId));
+      if (!booking) return rq;
+      rq.serviceWorkflowStatus = lower(booking.status);
+      rq.serviceQueuePosition = lower(booking.status) === pendingStatus ? queuePosition(booking) : null;
+      rq.initialBuyerNote = rq.initialBuyerNote || booking.scope || "";
+      rq.serviceRequest = Object.assign({}, rq.serviceRequest || {}, {
+        neededAt: booking.neededAt,
+        location: booking.location,
+        scope: booking.scope
+      });
+      return rq;
+    });
+    if (!user || String(user.role) !== "seller") return annotated;
+    const topPendingIds = new Set(pendingQueue(user.phone).slice(0,3).map(row => String(row.requestId || "")));
+    return annotated.filter(rq => {
+      if (!rq.serviceBookingId) return true;
+      const booking = bookings.find(row => String(row.id) === String(rq.serviceBookingId));
+      if (!booking || lower(booking.status) !== pendingStatus) return true;
+      return topPendingIds.has(String(rq.id));
+    });
+  };
+  globalThis.__tpAttachServiceAgreementToTransaction = tx => {
+    const candidates = bookings
+      .filter(b => lower(b.status) === "agreement_ready"
+        && String(b.buyerPhone) === String(tx.fromPhone)
+        && String(b.providerPhone) === String(tx.toPhone)
+        && String(b.itemCode) === String(tx.itemCode))
+      .sort((a,b) => Date.parse(b.updatedAt || b.createdAt) - Date.parse(a.updatedAt || a.createdAt));
+    if (!candidates.length) return null;
+    if (committedForProvider(tx.toPhone).length >= 3) {
+      return {error:"This provider already has three paid active bookings. Please remain in the agreement queue until a slot opens."};
+    }
+    const booking = candidates[0];
+    booking.status = "payment_pending";
+    booking.transactionId = tx.id;
+    booking.updatedAt = nowIso();
+    booking.history = Array.isArray(booking.history) ? booking.history : [];
+    booking.history.push({at:booking.updatedAt,actor:"buyer",action:"escrow_created",transactionId:tx.id});
+    tx.serviceBookingId = booking.id;
+    persist("booking",booking).catch(()=>{});
+    return {bookingId:booking.id};
+  };
 
   async function ensureDb(){
     if (!dbEnabled() || !_pgPool) return false;
@@ -7353,7 +7428,9 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
         listingType:"service",serviceCategory:item.serviceCategory||"",deliveryMode:item.deliveryMode||"",
         serviceArea:item.serviceArea||"",completionEvidence:item.completionEvidence||"",
         pricingRules:item.pricingRules||item.pricingTerms||null,pricingMode:item.pricingMode||(item.pricingRules&&item.pricingRules.mode)||"fixed"},
-      itemPricingSnapshot:tpPricingSnapshotForItem(item,1),negotiationAllowed:tpPricingNegotiationAllowed({itemPricingSnapshot:tpPricingSnapshotForItem(item,1)}),notesThread:[]
+      itemPricingSnapshot:tpPricingSnapshotForItem(item,1),negotiationAllowed:tpPricingNegotiationAllowed({itemPricingSnapshot:tpPricingSnapshotForItem(item,1)}),
+      initialBuyerNote:booking.scope,
+      notesThread:[{id:uuid(),actor:"buyer",phone:booking.buyerPhone,text:booking.scope,at:booking.createdAt||nowIso(),kind:"initial_service_request"}]
     };
     requests.push(rq);
     booking.requestId=rq.id;
@@ -7366,9 +7443,9 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if(action==="decline"){rq.status="declined";rq.repliedAt=nowIso();}
     else if(action==="accept"){
       rq.status="answered";rq.repliedAt=nowIso();rq.reply={
-        price:Number(booking.agreedPrice||0)||null,itemCode:rq.itemCode,availability:"service_booking",
+        price:Number(booking.agreedPrice||0)||null,itemCode:rq.itemCode,availability:"service_agreement_awaiting_payment",
         preOrderDate:booking.proposedStartAt||booking.neededAt,preOrderNote:booking.providerNote||"",
-        collectionPoint:booking.location||"",message:`Service booking accepted for ${booking.proposedStartAt||booking.neededAt}.`
+        collectionPoint:booking.location||"",message:`Service terms agreed for ${booking.proposedStartAt||booking.neededAt}. Complete escrow payment to confirm the booking.`
       };
     }
     if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});
@@ -7402,8 +7479,15 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   });
   app.get("/api/services/bookings",requireAuth,async(req,res)=>{
     await load().catch(()=>{});prune();
-    const mine=req.user.role==="admin"?bookings:bookings.filter(b=>String(b.providerPhone)===String(req.user.phone)||String(b.buyerPhone)===String(req.user.phone));
-    res.json({ok:true,bookings:mine.slice().sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)).slice(0,200)});
+    let mine;
+    if(req.user.role==="admin") mine=bookings;
+    else if(req.user.role==="seller"){
+      const visiblePending=new Set(pendingQueue(req.user.phone).slice(0,3).map(row=>String(row.id)));
+      mine=bookings.filter(b=>String(b.providerPhone)===String(req.user.phone)
+        && (lower(b.status)!==pendingStatus||visiblePending.has(String(b.id))));
+    } else mine=bookings.filter(b=>String(b.buyerPhone)===String(req.user.phone));
+    const output=mine.map(b=>({...b,queuePosition:lower(b.status)===pendingStatus?queuePosition(b):null}));
+    res.json({ok:true,bookings:output.slice().sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)).slice(0,200)});
   });
   app.post("/api/services/:itemCode/bookings",requireAuth,async(req,res)=>{
     await load().catch(()=>{});
@@ -7411,17 +7495,17 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const item=itemByCode(req.params.itemCode);
     if(!isService(item))return res.status(404).json({error:"Service listing not found."});
     const state=snapshot(item);
-    if(["paused","offline","full"].includes(state.status))return res.status(409).json({error:state.status==="full"?"This provider is fully booked.":state.status==="paused"?"This service is paused.":"This instant service is not live."});
-    if(activeForProvider(item.sellerPhone).length>=3)return res.status(409).json({error:"This provider already has three active bookings."});
+    if(["paused","offline"].includes(state.status))return res.status(409).json({error:state.status==="paused"?"This service is paused.":"This instant service is not live."});
     const neededAt=clean(req.body&&req.body.neededAt,80), location=clean(req.body&&req.body.location,180), scope=clean(req.body&&req.body.scope,600);
     if(!neededAt||!location||scope.length<10)return res.status(400).json({error:"Required time, location and a clear service description are required."});
     const booking={id:uuid(),itemCode:String(item.code),itemTitle:item.title,buyerPhone:req.user.phone,providerPhone:item.sellerPhone,
       neededAt,location,scope,durationHours:serviceHours(item),availabilityMode:availabilityMode(item),
-      status:"pending_provider",queuePosition:activeForProvider(item.sellerPhone).length+1,
-      reservationExpiresAt:new Date(Date.now()+15*60000).toISOString(),createdAt:nowIso(),updatedAt:nowIso(),
+      status:"pending_provider",queuePosition:pendingQueue(item.sellerPhone).length+1,
+      reservationExpiresAt:null,createdAt:nowIso(),updatedAt:nowIso(),
       proposedStartAt:null,agreedPrice:null,providerNote:"",history:[{at:nowIso(),actor:"buyer",action:"booking_requested"}]};
     saveRequestForBooking(booking,item);bookings.push(booking);await persist("booking",booking);
     logAudit(req,"service_booking_requested",{bookingId:booking.id,itemCode:item.code,providerPhone:item.sellerPhone});
+    booking.queuePosition=queuePosition(booking);
     res.status(201).json({ok:true,booking,availability:snapshot(item)});
   });
   app.post("/api/services/bookings/:id/respond",requireAuth,async(req,res)=>{
@@ -7430,17 +7514,16 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if(!b)return res.status(404).json({error:"Booking not found."});
     const item=itemByCode(b.itemCode);
     if(String(req.user.phone)!==String(b.providerPhone)&&req.user.role!=="admin")return res.status(403).json({error:"Only the service provider can respond."});
-    if(!["pending_provider","awaiting_buyer"].includes(lower(b.status)))return res.status(409).json({error:"This booking is no longer awaiting a provider response."});
+    if(lower(b.status)!=="pending_provider")return res.status(409).json({error:"This enquiry is no longer awaiting a provider response."});
+    if(queuePosition(b)>3)return res.status(409).json({error:"Only the first three enquiries in the provider queue can be reviewed."});
     const action=lower(req.body&&req.body.action);
     if(action==="decline"){b.status="declined";b.providerNote=clean(req.body.note,300);updateLinkedRequest(b,"decline");}
     else if(action==="accept"||action==="revise"){
-      if(activeForProvider(b.providerPhone).filter(x=>x.id!==b.id).length>=3)return res.status(409).json({error:"Booking capacity is full."});
       b.proposedStartAt=clean(req.body.proposedStartAt||b.neededAt,80);
       b.agreedPrice=Math.max(0,Number(req.body.agreedPrice||item&&item.price||0));
       b.providerNote=clean(req.body.note,300);
-      b.status=action==="revise"?"awaiting_buyer":"confirmed";
+      b.status="awaiting_buyer";
       b.reservationExpiresAt=null;
-      if(action==="accept")updateLinkedRequest(b,"accept");
     } else return res.status(400).json({error:"Choose accept, revise or decline."});
     b.updatedAt=nowIso();b.history.push({at:nowIso(),actor:"provider",action,note:b.providerNote});
     await persist("booking",b);res.json({ok:true,booking:b,availability:snapshot(item)});
@@ -7452,7 +7535,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if(String(req.user.phone)!==String(b.buyerPhone)&&req.user.role!=="admin")return res.status(403).json({error:"Only the requesting buyer can respond."});
     if(b.status!=="awaiting_buyer")return res.status(409).json({error:"No revised terms are awaiting your response."});
     const action=lower(req.body&&req.body.action);
-    b.status=action==="accept"?"confirmed":"cancelled";b.updatedAt=nowIso();b.reservationExpiresAt=null;
+    b.status=action==="accept"?"agreement_ready":"cancelled";b.updatedAt=nowIso();b.reservationExpiresAt=null;
     b.history.push({at:nowIso(),actor:"buyer",action:`revision_${action}`});
     if(action==="accept")updateLinkedRequest(b,"accept");else updateLinkedRequest(b,"decline");
     await persist("booking",b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});
@@ -7463,7 +7546,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if(!b)return res.status(404).json({error:"Booking not found."});
     if(String(req.user.phone)!==String(b.providerPhone)&&req.user.role!=="admin")return res.status(403).json({error:"Only the service provider can update delivery status."});
     const next=lower(req.body&&req.body.status);
-    const allowed={confirmed:["in_progress","cancelled"],in_progress:["completed","cancelled"]};
+    const allowed={booked:["in_progress","cancelled"],in_progress:["completed","cancelled"]};
     if(!(allowed[lower(b.status)]||[]).includes(next))return res.status(409).json({error:"That status change is not allowed."});
     b.status=next;b.updatedAt=nowIso();b.history.push({at:nowIso(),actor:"provider",action:next});
     await persist("booking",b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});
