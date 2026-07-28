@@ -3460,6 +3460,10 @@ const cache = new Map();
     if (!serviceCategories.has(serviceCategory)) return res.status(400).json({ error: "Select an approved service category." });
     if (prohibited.some((term) => serviceText.includes(term))) return res.status(400).json({ error: "This service is not permitted on TutoPay." });
     if (!String(req.body.deliveryMode || "").trim()) return res.status(400).json({ error: "Select how the service will be delivered." });
+    if (!["stationary","mobile","stationary_mobile"].includes(String(req.body.operatingMode || "").trim())) return res.status(400).json({ error: "Select whether the provider is stationary or mobile." });
+    if (!["per_hour","per_day","per_completion"].includes(String(req.body.chargeBasis || "").trim())) return res.status(400).json({ error: "Select the service charge basis." });
+    if (!["solid","discount","negotiable"].includes(String(req.body.rateFlexibility || "").trim())) return res.status(400).json({ error: "Select the service rate terms." });
+    if (!String(req.body.serviceArea || "").trim()) return res.status(400).json({ error: "Enter the service location or coverage area." });
     if (!String(req.body.completionEvidence || "").trim()) return res.status(400).json({ error: "State how service completion will be evidenced." });
   }
 
@@ -3479,6 +3483,9 @@ const cache = new Map();
     listingType,
     serviceCategory: listingType === "service" ? serviceCategory : "",
     deliveryMode: listingType === "service" ? String(req.body.deliveryMode || "").trim() : "",
+    operatingMode: listingType === "service" ? String(req.body.operatingMode || "").trim() : "",
+    chargeBasis: listingType === "service" ? String(req.body.chargeBasis || "").trim() : "",
+    rateFlexibility: listingType === "service" ? String(req.body.rateFlexibility || "").trim() : "",
     serviceArea: listingType === "service" ? String(req.body.serviceArea || "").trim().slice(0, 160) : "",
     estimatedDuration: listingType === "service" ? String(req.body.estimatedDuration || "").trim().slice(0, 120) : "",
     estimatedDurationHours: listingType === "service" ? Math.max(.25, Number(req.body.estimatedDurationHours || 1)) : null,
@@ -3529,6 +3536,9 @@ if (!item) {
     listingType: item.listingType || "product",
     serviceCategory: item.serviceCategory || "",
     deliveryMode: item.deliveryMode || "",
+    operatingMode: item.operatingMode || "",
+    chargeBasis: item.chargeBasis || "",
+    rateFlexibility: item.rateFlexibility || "",
     serviceArea: item.serviceArea || "",
     estimatedDuration: item.estimatedDuration || "",
     estimatedDurationHours: item.estimatedDurationHours || null,
