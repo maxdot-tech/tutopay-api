@@ -4220,6 +4220,10 @@ break;
       }
       tx.status = "completed";
       tx.completedAt = now;
+      if (tx.serviceBookingId) {
+        tx.serviceFulfilmentStatus = "completed_confirmed";
+        tx.serviceBuyerConfirmedAt = now;
+      }
       tx.payoutReconciled = false;
       recordLedger(req, tx, "escrow_completed", { notes: "Buyer confirmed collection" });
       break;
@@ -4236,6 +4240,10 @@ break;
       }
       tx.status = "completed";
       tx.completedAt = now;
+      if (tx.serviceBookingId) {
+        tx.serviceFulfilmentStatus = "completed_confirmed";
+        tx.serviceBuyerConfirmedAt = now;
+      }
       tx.payoutReconciled = false;
       recordLedger(req, tx, "escrow_completed", { notes: "Buyer confirmed delivery received" });
       break;
@@ -7324,9 +7332,15 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
         if (tx && String(tx.paymentStatus || "").toLowerCase() === "paid" && !committedStatuses.has(lower(b.status)) && !["completed","cancelled","declined"].includes(lower(b.status))) {
           b.status = "booked";
           b.paidAt = tx.paidAt || nowIso();
+          b.bookedAt = b.paidAt;
           b.updatedAt = nowIso();
           b.history = Array.isArray(b.history) ? b.history : [];
           b.history.push({at:b.updatedAt,actor:"system",action:"escrow_payment_confirmed"});
+          tx.serviceFulfilmentStatus = "booked";
+          tx.serviceStartAt = b.proposedStartAt || b.neededAt || null;
+          tx.serviceDurationHours = Math.max(.25,Number(b.durationHours || 1));
+          tx.updatedAt = b.updatedAt;
+          if (dbEnabled()) dbUpsertTransaction(tx).catch(()=>{});
           persist("booking",b).catch(()=>{});
         }
       }
@@ -7465,6 +7479,19 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     booking.history = Array.isArray(booking.history) ? booking.history : [];
     booking.history.push({at:booking.updatedAt,actor:"buyer",action:"escrow_created",transactionId:tx.id});
     tx.serviceBookingId = booking.id;
+    tx.serviceFulfilmentStatus = "payment_pending";
+    tx.serviceStartAt = booking.proposedStartAt || booking.neededAt || null;
+    tx.serviceDurationHours = Math.max(.25,Number(booking.durationHours || 1));
+    tx.serviceAgreement = {
+      bookingId:booking.id,
+      requestedAt:booking.createdAt || null,
+      agreedAt:booking.updatedAt || null,
+      proposedStartAt:booking.proposedStartAt || booking.neededAt || null,
+      durationHours:Math.max(.25,Number(booking.durationHours || 1)),
+      location:booking.location || "",
+      scope:booking.scope || "",
+      providerNote:booking.providerNote || ""
+    };
     delete tx.requestedServiceBookingId;
     persist("booking",booking).catch(()=>{});
     return {bookingId:booking.id};
@@ -7679,7 +7706,33 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const next=lower(req.body&&req.body.status);
     const allowed={booked:["in_progress","cancelled"],in_progress:["completed","cancelled"]};
     if(!(allowed[lower(b.status)]||[]).includes(next))return res.status(409).json({error:"That status change is not allowed."});
-    b.status=next;b.updatedAt=nowIso();b.history.push({at:nowIso(),actor:"provider",action:next});
+    b.status=next;b.updatedAt=nowIso();b.history.push({at:b.updatedAt,actor:"provider",action:next});
+    const tx=(transactions||[]).find(row=>String(row.id)===String(b.transactionId||""));
+    if(next==="in_progress"){
+      b.serviceStartedAt=b.updatedAt;
+      b.expectedCompletionAt=new Date(Date.parse(b.serviceStartedAt)+Math.max(.25,Number(b.durationHours||1))*3600000).toISOString();
+      if(tx){
+        tx.serviceFulfilmentStatus="in_progress";
+        tx.serviceStartedAt=b.serviceStartedAt;
+        tx.serviceExpectedCompletionAt=b.expectedCompletionAt;
+        tx.updatedAt=b.updatedAt;
+      }
+    } else if(next==="completed"){
+      b.serviceCompletedAt=b.updatedAt;
+      b.buyerReviewDueAt=new Date(Date.parse(b.serviceCompletedAt)+24*3600000).toISOString();
+      if(tx){
+        tx.serviceFulfilmentStatus="completed_pending_buyer";
+        tx.serviceCompletedAt=b.serviceCompletedAt;
+        tx.serviceBuyerReviewDueAt=b.buyerReviewDueAt;
+        tx.status="delivered";
+        tx.deliveredAt=b.serviceCompletedAt;
+        tx.updatedAt=b.updatedAt;
+      }
+    } else if(next==="cancelled"&&tx){
+      tx.serviceFulfilmentStatus="cancelled";
+      tx.updatedAt=b.updatedAt;
+    }
+    if(tx&&dbEnabled())dbUpsertTransaction(tx).catch(()=>{});
     await persist("booking",b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});
   });
   load().catch(e=>console.error("[service-booking] initial load failed:",e&&e.message?e.message:e));
