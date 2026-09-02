@@ -2132,9 +2132,13 @@ function normalizePublicProfile(rawProfile, phone) {
   const serviceDeliveryMode = String(src.serviceDeliveryMode || '').trim();
   const serviceArea = String(src.serviceArea || '').trim();
   const servicePolicyAccepted = !!src.servicePolicyAccepted;
+  const serviceProviderKind = ['individual','company'].includes(String(src.serviceProviderKind || '').trim().toLowerCase())
+    ? String(src.serviceProviderKind).trim().toLowerCase()
+    : (String(src.accountKind || '').trim().toLowerCase() === 'company' ? 'company' : 'individual');
+  const serviceMultiStreamEnabled = serviceProviderKind === 'company' && !!src.serviceMultiStreamEnabled;
 
   // Normalize older alias field names.
-  return { phone: phoneSafe, firstName, lastName, fullName, displayName, businessName, email, accountKind, serviceCategory, serviceDeliveryMode, serviceArea, servicePolicyAccepted, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
+  return { phone: phoneSafe, firstName, lastName, fullName, displayName, businessName, email, accountKind, serviceCategory, serviceDeliveryMode, serviceArea, servicePolicyAccepted, serviceProviderKind, serviceMultiStreamEnabled, selfieDataUrl, logoDataUrl, selfieUrl, logoUrl };
 }
 
 function publicProfileResponseForUser(user) {
@@ -2147,6 +2151,7 @@ function publicProfileResponseForUser(user) {
     displayName: prof.displayName,
     businessName: prof.businessName,
     avatarUrl,
+    serviceReliability: typeof globalThis.__tpServiceReliabilityForProvider === "function" ? globalThis.__tpServiceReliabilityForProvider(phone) : null,
   };
 }
 
@@ -3361,7 +3366,11 @@ app.get("/api/items", (req, res) => {
   const full = String(req.query.full || '').toLowerCase();
   const wantFull = full === '1' || full === 'true' || full === 'yes';
 
-  if (wantFull) return res.json(items);
+  if (wantFull) return res.json(items.map((it) => {
+    const out = { ...it };
+    if (typeof globalThis.__tpServiceAvailabilityForItem === "function" && String(it.listingType || "").toLowerCase() === "service") out.serviceAvailability = globalThis.__tpServiceAvailabilityForItem(it);
+    return out;
+  }));
 
   const lite = items.map((it) => {
     const out = { ...it };
@@ -3390,7 +3399,9 @@ app.get("/api/items/:id", (req, res) => {
   const idOrCode = String(req.params.id || "");
   const it = items.find((x) => x.id === idOrCode) || findItem(idOrCode);
 if (!it) return res.status(404).json({ error: "Item not found" });
-  res.json(it);
+  const out = { ...it };
+  if (typeof globalThis.__tpServiceAvailabilityForItem === "function" && String(it.listingType || "").toLowerCase() === "service") out.serviceAvailability = globalThis.__tpServiceAvailabilityForItem(it);
+  res.json(out);
 });
 
 app.post("/api/items", requireAuth, async (req, res) => {
@@ -3452,6 +3463,10 @@ const cache = new Map();
   const convertedFirst = (await convert(firstUrl)) || convertedUrls[0] || "";
 
   const listingType = req.user.accountRole === "service_provider" || String(req.body.listingType || "").toLowerCase() === "service" ? "service" : "product";
+  if (listingType === "service" && typeof globalThis.__tpServiceProviderCanList === "function") {
+    const gate = globalThis.__tpServiceProviderCanList(req.user.phone);
+    if (gate && gate.ok === false) return res.status(403).json({ error: gate.error || "Service-provider privileges are currently suspended." });
+  }
   const serviceCategories = new Set(["home_maintenance","professional_business","technology_digital","education_tutoring","events_creative","transport_delivery","personal_care_wellness","other_review_required"]);
   const serviceCategory = String(req.body.serviceCategory || "").trim().toLowerCase();
   const serviceText = `${title || ""} ${details || ""} ${serviceCategory}`.toLowerCase();
@@ -3474,7 +3489,9 @@ const cache = new Map();
     details: details || "",
     price: Number(price),
     sellerPhone,
-    holdHours: holdHours ? Number(holdHours) : 24,
+    // Product holds do not apply to service bookings. Service timing is controlled
+    // by scheduled start, actual start, expected duration and the review window.
+    holdHours: listingType === "service" ? null : (holdHours ? Number(holdHours) : 24),
     imageUrl: convertedFirst || "",
     imageUrls: convertedUrls.length ? convertedUrls : (convertedFirst ? [convertedFirst] : []),
     availability: availability || "available",
@@ -3491,7 +3508,9 @@ const cache = new Map();
     estimatedDurationHours: listingType === "service" ? Math.max(.25, Number(req.body.estimatedDurationHours || 1)) : null,
     availabilityMode: listingType === "service" ? String(req.body.availabilityMode || "").trim().toLowerCase() : "",
     completionEvidence: listingType === "service" ? String(req.body.completionEvidence || "").trim().slice(0, 240) : "",
-    servicePolicyVersion: listingType === "service" ? "1.0-controlled-services" : null,
+    turnaroundMinutes: listingType === "service" ? Math.max(0, Math.min(240, Number(req.body.turnaroundMinutes || 0))) : 0,
+    serviceStreamIds: listingType === "service" ? [...new Set((Array.isArray(req.body.serviceStreamIds) ? req.body.serviceStreamIds : []).map(v => String(v || "").trim()).filter(Boolean))].slice(0, 30) : [],
+    servicePolicyVersion: listingType === "service" ? "2.0-service-engine" : null,
   };
 
   // v14.3.1: seller-controlled discount / negotiation rules; default is fixed price.
@@ -3544,6 +3563,9 @@ if (!item) {
     estimatedDurationHours: item.estimatedDurationHours || null,
     availabilityMode: item.availabilityMode || "",
     completionEvidence: item.completionEvidence || "",
+    turnaroundMinutes: Number(item.turnaroundMinutes || 0),
+    serviceStreamIds: Array.isArray(item.serviceStreamIds) ? item.serviceStreamIds : [],
+    serviceAvailability: (typeof globalThis.__tpServiceAvailabilityForItem === "function" && String(item.listingType || "").toLowerCase() === "service") ? globalThis.__tpServiceAvailabilityForItem(item) : null,
     sellerPhone: item.sellerPhone,
   });
 });
@@ -3738,6 +3760,10 @@ app.post("/api/transactions/:id/pay", requireAuth, payLimiter, idempotencyMiddle
   if (!isBuyer && !isAdmin) {
     return res.status(403).json({ error: "Only the buyer can initiate payment." });
   }
+  if (tx.serviceBookingId && typeof globalThis.__tpServicePaymentGate === "function") {
+    const gate = globalThis.__tpServicePaymentGate(tx);
+    if (gate && gate.ok === false) return res.status(409).json({ error: gate.error || "This service payment window is no longer active." });
+  }
 
   if (tx.paymentStatus === "paid" || tx.status !== "pending_payment") {
     if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
@@ -3862,6 +3888,10 @@ app.post("/api/transactions/:id/payment/requery", requireAuth, requeryLimiter, i
   if (tx.paymentStatus === "paid" || tx.status === "pending") {
     if (dbEnabled()) { dbUpsertTransaction(tx).catch(() => {}); }
     return res.json(tx);
+  }
+  if (tx.serviceBookingId && typeof globalThis.__tpServicePaymentGate === "function") {
+    const gate = globalThis.__tpServicePaymentGate(tx);
+    if (gate && gate.ok === false) return res.status(409).json({ error: gate.error || "This service payment window is no longer active." });
   }
 
   // ===== Airtel Money sandbox status check =====
@@ -4165,6 +4195,9 @@ app.post("/api/transactions/:id/action", requireAuth, idempotencyMiddleware, (re
         "Transaction is under dispute – actions are frozen until the issue is resolved.",
     });
   }
+  if (tx.serviceBookingId && ["seller_hold","seller_start_delivery","seller_mark_delivered"].includes(action) && !isAdmin) {
+    return res.status(409).json({ error: "Product delivery controls do not apply to service bookings. Use the service start/delivery controls." });
+  }
   const prevStatus = tx.status;
   const now = nowIso();
 
@@ -4230,22 +4263,29 @@ break;
     }
 
     case "buyer_confirm_received": {
-      if (
+      const serviceReleaseReady = !!tx.serviceBookingId &&
+        String(tx.serviceFulfilmentStatus || "").toLowerCase() === "ready_for_release" &&
+        !!tx.serviceClientRatingSubmittedAt;
+      if (!serviceReleaseReady && (
         tx.deliveryMethod === "self_collect" ||
         !["in_transit", "delivered"].includes(tx.status)
-      ) {
+      )) {
         return res
           .status(400)
           .json({ error: "Cannot confirm received in current state" });
       }
+      if (tx.serviceBookingId && !serviceReleaseReady) {
+        return res.status(409).json({ error: "Confirm service completion and submit the client rating before release." });
+      }
       tx.status = "completed";
       tx.completedAt = now;
       if (tx.serviceBookingId) {
-        tx.serviceFulfilmentStatus = "completed_confirmed";
+        tx.serviceFulfilmentStatus = "completed";
         tx.serviceBuyerConfirmedAt = now;
+        if (typeof globalThis.__tpServiceMarkReleased === "function") globalThis.__tpServiceMarkReleased(tx, now);
       }
       tx.payoutReconciled = false;
-      recordLedger(req, tx, "escrow_completed", { notes: "Buyer confirmed delivery received" });
+      recordLedger(req, tx, "escrow_completed", { notes: tx.serviceBookingId ? "Client rated service and confirmed protected payment release" : "Buyer confirmed delivery received" });
       break;
     }
 
@@ -7266,236 +7306,50 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
 })();
 
-/* ===== TutoPay Service Availability + Booking Queue v1 ===== */
-(function TP_SERVICE_BOOKING_V1(){
+/* ===== TutoPay Service Engine v2: streams, schedules, lifecycle and reliability ===== */
+(function TP_SERVICE_ENGINE_V2(){
+  if (globalThis.__tpServiceEngineV2Loaded) return;
+  globalThis.__tpServiceEngineV2Loaded = true;
+
   const availability = new Map();
   const bookings = [];
+  const streams = [];
   let loaded = false;
   let dbReady = false;
-  const committedStatuses = new Set(["booked","in_progress"]);
-  const pendingStatus = "pending_provider";
-  const enquiryResponseWindowMs = 24 * 60 * 60 * 1000;
-  const clean = (v,n=240) => String(v == null ? "" : v).trim().slice(0,n);
+
+  const MAX_ACTIVE_PER_STREAM = 3;
+  const ENQUIRY_RESPONSE_MS = 24 * 60 * 60 * 1000;
+  const AGREEMENT_SLOT_RESERVATION_MS = 10 * 60 * 1000;
+  const PAYMENT_WINDOW_MS = 30 * 60 * 1000;
+  const DELIVERY_REVIEW_MS = 24 * 60 * 60 * 1000;
+  const DEFAULT_SCORE_POINTS = 20;
+  const SERVICE_SCORE_MAX = 50;
+  const PENDING = 'pending_provider';
+
+  const clean = (v,n=240) => String(v == null ? '' : v).trim().slice(0,n);
   const lower = v => clean(v).toLowerCase();
-  const itemByCode = code => (items || []).find(x => String(x.code || x.id) === String(code || ""));
-  const isService = item => item && lower(item.listingType) === "service";
-  const modeForHours = hours => hours <= 5 ? "instant" : (hours <= 24 ? "time_bound" : "scheduled");
+  const clamp = (v,min,max) => Math.max(min,Math.min(max,Number(v)||0));
+  const iso = ms => new Date(ms).toISOString();
+  const itemByCode = code => (items || []).find(x => String(x.code || x.id) === String(code || ''));
+  const isService = item => item && lower(item.listingType) === 'service';
+  const userByPhone = phone => typeof findUserByPhone === 'function' ? findUserByPhone(String(phone||'')) : null;
+  const profileFor = phone => {
+    const user = userByPhone(phone);
+    return normalizePublicProfile(user && user.profile ? user.profile : {}, phone);
+  };
+  const providerKind = phone => profileFor(phone).serviceProviderKind === 'company' ? 'company' : 'individual';
+  const multiStreamEnabled = phone => providerKind(phone) === 'company' && !!profileFor(phone).serviceMultiStreamEnabled;
   const serviceHours = item => {
     const direct = Number(item && item.estimatedDurationHours);
     if (Number.isFinite(direct) && direct > 0) return direct;
-    const parsed = Number(String(item && item.estimatedDuration || "").match(/\d+(?:\.\d+)?/)?.[0]);
+    const parsed = Number(String(item && item.estimatedDuration || '').match(/\d+(?:\.\d+)?/)?.[0]);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
   };
-  const providerOwns = (req,item) => item && String(item.sellerPhone) === String(req.user.phone) && (req.user.role === "seller" || req.user.accountRole === "service_provider");
-  const queueTime = booking => {
-    const value = Date.parse(booking && booking.createdAt);
-    return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
-  };
-  const queueStableCompare = (a,b) => {
-    const sequenceDiff = Number(a.queueSequence || Number.MAX_SAFE_INTEGER) - Number(b.queueSequence || Number.MAX_SAFE_INTEGER);
-    if (sequenceDiff) return sequenceDiff;
-    const timeDiff = queueTime(a) - queueTime(b);
-    return timeDiff || String(a.id || "").localeCompare(String(b.id || ""));
-  };
-  const ensureProviderQueueSequences = phone => {
-    const rows = bookings
-      .filter(b => String(b.providerPhone) === String(phone))
-      .sort((a,b) => {
-        const timeDiff = queueTime(a) - queueTime(b);
-        return timeDiff || String(a.id || "").localeCompare(String(b.id || ""));
-      });
-    rows.forEach((booking,index) => {
-      const expected = index + 1;
-      if (Number(booking.queueSequence) !== expected) {
-        booking.queueSequence = expected;
-        persist("booking",booking).catch(()=>{});
-      }
-    });
-  };
-  const nextProviderQueueSequence = phone => {
-    ensureProviderQueueSequences(phone);
-    return bookings
-      .filter(b => String(b.providerPhone) === String(phone))
-      .reduce((max,b) => Math.max(max,Number(b.queueSequence || 0)),0) + 1;
-  };
-  const prune = () => {
-    for (const b of bookings) {
-      // Migration from the earlier prototype: an accepted request is an
-      // agreement awaiting payment, not a booking and not provider engagement.
-      if (b.status === "confirmed") {
-        b.status = "agreement_ready";
-        b.updatedAt = nowIso();
-        persist("booking",b).catch(()=>{});
-      }
-      if (b.transactionId) {
-        const tx = (transactions || []).find(row => String(row.id) === String(b.transactionId));
-        if (tx && String(tx.paymentStatus || "").toLowerCase() === "paid" && !committedStatuses.has(lower(b.status)) && !["completed","cancelled","declined"].includes(lower(b.status))) {
-          b.status = "booked";
-          b.paidAt = tx.paidAt || nowIso();
-          b.bookedAt = b.paidAt;
-          b.updatedAt = nowIso();
-          b.history = Array.isArray(b.history) ? b.history : [];
-          b.history.push({at:b.updatedAt,actor:"system",action:"escrow_payment_confirmed"});
-          tx.serviceFulfilmentStatus = "booked";
-          tx.serviceStartAt = b.proposedStartAt || b.neededAt || null;
-          tx.serviceDurationHours = Math.max(.25,Number(b.durationHours || 1));
-          tx.updatedAt = b.updatedAt;
-          if (dbEnabled()) dbUpsertTransaction(tx).catch(()=>{});
-          persist("booking",b).catch(()=>{});
-        }
-      }
-    }
-    let promoted = true;
-    while (promoted) {
-      promoted = false;
-      const providers = [...new Set(bookings
-        .filter(b => lower(b.status) === pendingStatus)
-        .map(b => String(b.providerPhone || "")))];
-      for (const providerPhone of providers) {
-        ensureProviderQueueSequences(providerPhone);
-        const queue = bookings
-          .filter(b => String(b.providerPhone) === providerPhone && lower(b.status) === pendingStatus)
-          .sort(queueStableCompare);
-        for (const b of queue.slice(0,3)) {
-          if (!b.reviewWindowStartedAt) {
-            b.reviewWindowStartedAt = nowIso();
-            b.responseDueAt = new Date(Date.now() + enquiryResponseWindowMs).toISOString();
-            b.updatedAt = nowIso();
-            b.history = Array.isArray(b.history) ? b.history : [];
-            b.history.push({at:b.updatedAt,actor:"system",action:"entered_provider_review_queue"});
-            persist("booking",b).catch(()=>{});
-          }
-          if (b.responseDueAt && Date.parse(b.responseDueAt) <= Date.now()) {
-            b.status = "timed_out";
-            b.timedOutAt = nowIso();
-            b.updatedAt = b.timedOutAt;
-            b.history = Array.isArray(b.history) ? b.history : [];
-            b.history.push({at:b.timedOutAt,actor:"system",action:"provider_response_timed_out"});
-            updateLinkedRequest(b,"timeout");
-            persist("booking",b).catch(()=>{});
-            promoted = true;
-          }
-        }
-      }
-    }
-  };
-  const committedForProvider = phone => {
-    prune();
-    return bookings.filter(b => String(b.providerPhone) === String(phone) && committedStatuses.has(lower(b.status)));
-  };
-  const committedForItem = code => {
-    prune();
-    return bookings.filter(b => String(b.itemCode) === String(code) && committedStatuses.has(lower(b.status)));
-  };
-  const pendingQueue = phone => {
-    ensureProviderQueueSequences(phone);
-    return bookings
-      .filter(b => String(b.providerPhone) === String(phone) && lower(b.status) === pendingStatus)
-      .sort(queueStableCompare);
-  };
-  const queuePosition = booking => {
-    const queue = pendingQueue(booking.providerPhone);
-    const index = queue.findIndex(row => String(row.id) === String(booking.id));
-    return index >= 0 ? index + 1 : null;
-  };
-  const availabilityMode = item => lower(item.availabilityMode) || modeForHours(serviceHours(item));
-  function snapshot(item){
-    if (!isService(item)) return null;
-    const rec = availability.get(String(item.code || item.id)) || {};
-    const mode = availabilityMode(item);
-    const providerBookings = committedForProvider(item.sellerPhone);
-    const itemBookings = committedForItem(item.code || item.id);
-    const capacityUsed = providerBookings.length;
-    const liveValid = rec.liveUntil && Date.parse(rec.liveUntil) > Date.now();
-    let status = mode;
-    if (rec.paused) status = "paused";
-    else if (mode === "instant" && !liveValid) status = "offline";
-    else if (mode === "instant" && providerBookings.length) status = "live_amber";
-    else if (mode === "instant" && liveValid) status = "live_green";
-    const queuedHours = providerBookings.reduce((sum,b) => sum + Math.max(.25,Number(b.durationHours || 0)),0);
-    return {
-      mode,status,capacityUsed,capacityLimit:3,remainingSlots:Math.max(0,3-capacityUsed),
-      itemBookings:itemBookings.length,liveUntil:liveValid?rec.liveUntil:null,paused:!!rec.paused,
-      pendingEnquiries:pendingQueue(item.sellerPhone).length,
-      estimatedNextAvailableAt: capacityUsed ? new Date(Date.now()+queuedHours*3600000).toISOString() : nowIso(),
-      updatedAt:rec.updatedAt||null
-    };
-  }
-  globalThis.__tpServiceAvailabilityForItem = snapshot;
-  globalThis.__tpFilterServiceRequestsForUser = (user, rows) => {
-    prune();
-    const annotated = (rows || []).map(rq => {
-      if (!rq.serviceBookingId) return rq;
-      const booking = bookings.find(row => String(row.id) === String(rq.serviceBookingId));
-      if (!booking) return rq;
-      rq.serviceWorkflowStatus = lower(booking.status);
-      rq.serviceQueuePosition = lower(booking.status) === pendingStatus ? queuePosition(booking) : null;
-      rq.serviceResponseDueAt = booking.responseDueAt || null;
-      rq.serviceTimedOutAt = booking.timedOutAt || null;
-      rq.initialBuyerNote = rq.initialBuyerNote || booking.scope || "";
-      rq.serviceRequest = Object.assign({}, rq.serviceRequest || {}, {
-        neededAt: booking.neededAt,
-        location: booking.location,
-        scope: booking.scope
-      });
-      return rq;
-    });
-    if (!user || String(user.role) !== "seller") return annotated;
-    const topPendingIds = new Set(pendingQueue(user.phone).slice(0,3).map(row => String(row.requestId || "")));
-    return annotated.filter(rq => {
-      if (!rq.serviceBookingId) return true;
-      const booking = bookings.find(row => String(row.id) === String(rq.serviceBookingId));
-      if (!booking || lower(booking.status) !== pendingStatus) return true;
-      return topPendingIds.has(String(rq.id));
-    });
-  };
-  globalThis.__tpAttachServiceAgreementToTransaction = tx => {
-    const explicitId = clean(tx.requestedServiceBookingId,120);
-    let booking = explicitId
-      ? bookings.find(b => String(b.id) === explicitId)
-      : bookings
-        .filter(b => lower(b.status) === "agreement_ready"
-          && String(b.buyerPhone) === String(tx.fromPhone)
-          && String(b.providerPhone) === String(tx.toPhone)
-          && String(b.itemCode) === String(tx.itemCode))
-        .sort((a,b) => Date.parse(b.updatedAt || b.createdAt) - Date.parse(a.updatedAt || a.createdAt))[0];
-    if (!booking) {
-      return explicitId ? {error:"The selected service agreement could not be found. Reopen Requests & Replies and select Proceed to escrow again."} : null;
-    }
-    if (lower(booking.status) !== "agreement_ready") {
-      return {error:"This service enquiry is not an agreed, unpaid service agreement."};
-    }
-    if (String(booking.buyerPhone) !== String(tx.fromPhone)
-      || String(booking.providerPhone) !== String(tx.toPhone)
-      || String(booking.itemCode) !== String(tx.itemCode)) {
-      return {error:"The payment details do not match the selected service agreement."};
-    }
-    if (committedForProvider(tx.toPhone).length >= 3) {
-      return {error:"This provider already has three paid active bookings. Please remain in the agreement queue until a slot opens."};
-    }
-    booking.status = "payment_pending";
-    booking.transactionId = tx.id;
-    booking.updatedAt = nowIso();
-    booking.history = Array.isArray(booking.history) ? booking.history : [];
-    booking.history.push({at:booking.updatedAt,actor:"buyer",action:"escrow_created",transactionId:tx.id});
-    tx.serviceBookingId = booking.id;
-    tx.serviceFulfilmentStatus = "payment_pending";
-    tx.serviceStartAt = booking.proposedStartAt || booking.neededAt || null;
-    tx.serviceDurationHours = Math.max(.25,Number(booking.durationHours || 1));
-    tx.serviceAgreement = {
-      bookingId:booking.id,
-      requestedAt:booking.createdAt || null,
-      agreedAt:booking.updatedAt || null,
-      proposedStartAt:booking.proposedStartAt || booking.neededAt || null,
-      durationHours:Math.max(.25,Number(booking.durationHours || 1)),
-      location:booking.location || "",
-      scope:booking.scope || "",
-      providerNote:booking.providerNote || ""
-    };
-    delete tx.requestedServiceBookingId;
-    persist("booking",booking).catch(()=>{});
-    return {bookingId:booking.id};
-  };
+  const modeForHours = hours => hours <= 5 ? 'instant' : (hours <= 24 ? 'time_bound' : 'scheduled');
+  const availabilityMode = item => lower(item && item.availabilityMode) || modeForHours(serviceHours(item));
+  const providerOwns = (req,item) => item && String(item.sellerPhone) === String(req.user.phone) && (req.user.role === 'seller' || req.user.accountRole === 'service_provider');
+  const bookingHistory = b => Array.isArray(b.history) ? b.history : (b.history=[]);
+  const streamHistory = s => Array.isArray(s.history) ? s.history : (s.history=[]);
 
   async function ensureDb(){
     if (!dbEnabled() || !_pgPool) return false;
@@ -7509,17 +7363,6 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     dbReady = true;
     return true;
   }
-  async function load(){
-    if (loaded || !dbEnabled() || !_pgPool) { loaded = true; return; }
-    await ensureDb();
-    const out = await _pgPool.query("SELECT kind,data FROM tutopay_service_booking_records ORDER BY updated_at ASC");
-    for (const row of out.rows || []) {
-      const obj = row.data || {};
-      if (row.kind === "availability" && obj.itemCode) availability.set(String(obj.itemCode),obj);
-      if (row.kind === "booking" && obj.id) bookings.push(obj);
-    }
-    loaded = true;
-  }
   async function persist(kind,obj){
     if (!dbEnabled() || !_pgPool || !obj) return;
     await ensureDb();
@@ -7531,212 +7374,324 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
       data=EXCLUDED.data,updated_at=NOW()`,
       [String(obj.id),kind,obj.itemCode||null,obj.providerPhone||null,obj.buyerPhone||null,JSON.stringify(obj)]);
   }
-  function saveRequestForBooking(booking,item){
-    const rq = {
-      id:uuid(),fromPhone:booking.buyerPhone,toPhone:booking.providerPhone,itemCode:String(item.code),
-      quantity:1,status:"open",createdAt:nowIso(),repliedAt:null,reply:null,serviceBookingId:booking.id,
-      serviceRequest:{neededAt:booking.neededAt,location:booking.location,scope:booking.scope,durationHours:booking.durationHours},
-      itemSnapshot:{code:item.code,title:item.title,details:item.details||"",price:item.price,imageUrl:item.imageUrl||"",
-        imageUrls:Array.isArray(item.imageUrls)?item.imageUrls:(item.imageUrl?[item.imageUrl]:[]),
-        listingType:"service",serviceCategory:item.serviceCategory||"",deliveryMode:item.deliveryMode||"",
-        serviceArea:item.serviceArea||"",completionEvidence:item.completionEvidence||"",
-        pricingRules:item.pricingRules||item.pricingTerms||null,pricingMode:item.pricingMode||(item.pricingRules&&item.pricingRules.mode)||"fixed"},
-      itemPricingSnapshot:tpPricingSnapshotForItem(item,1),negotiationAllowed:tpPricingNegotiationAllowed({itemPricingSnapshot:tpPricingSnapshotForItem(item,1)}),
-      initialBuyerNote:booking.scope,
-      notesThread:[{id:uuid(),actor:"buyer",phone:booking.buyerPhone,text:booking.scope,at:booking.createdAt||nowIso(),kind:"initial_service_request"}]
-    };
-    requests.push(rq);
-    booking.requestId=rq.id;
-    if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});
-    return rq;
-  }
-  function updateLinkedRequest(booking,action){
-    const rq=(requests||[]).find(x=>String(x.id)===String(booking.requestId));
-    if(!rq)return;
-    if(action==="decline"){
-      rq.status="declined";rq.repliedAt=nowIso();rq.reply={
-        itemCode:rq.itemCode,availability:"service_enquiry_declined",
-        preOrderNote:booking.providerNote||"",
-        message:booking.providerNote?`Service provider declined the enquiry: ${booking.providerNote}`:"The service provider declined this enquiry."
-      };
+  async function load(){
+    if (loaded) return;
+    if (!dbEnabled() || !_pgPool) { loaded = true; return; }
+    await ensureDb();
+    const out = await _pgPool.query('SELECT kind,data FROM tutopay_service_booking_records ORDER BY updated_at ASC');
+    for (const row of out.rows || []) {
+      const obj = row.data || {};
+      if (row.kind === 'availability' && obj.itemCode) availability.set(String(obj.itemCode),obj);
+      if (row.kind === 'booking' && obj.id) bookings.push(obj);
+      if (row.kind === 'stream' && obj.id) streams.push(obj);
     }
-    else if(action==="timeout"){
-      rq.status="timed_out";rq.repliedAt=nowIso();rq.reply=null;
-      rq.serviceWorkflowStatus="timed_out";rq.serviceQueuePosition=null;
-    }
-    else if(action==="proposal"){
-      rq.status="open";rq.repliedAt=nowIso();rq.reply={
-        price:Number(booking.agreedPrice||0)||null,itemCode:rq.itemCode,
-        availability:"service_terms_proposed",
-        preOrderDate:booking.proposedStartAt||booking.neededAt,
-        preOrderNote:booking.providerNote||"",
-        collectionPoint:booking.location||"",
-        message:"The service provider has proposed terms. Review and accept or decline them under My service enquiries."
-      };
-      rq.notesThread=Array.isArray(rq.notesThread)?rq.notesThread:[];
-      rq.notesThread.push({id:uuid(),actor:"service_provider",phone:booking.providerPhone,
-        text:booking.providerNote||"Service terms proposed.",at:rq.repliedAt,kind:"service_terms_proposed"});
-    }
-    else if(action==="accept"){
-      rq.status="answered";rq.repliedAt=nowIso();rq.reply={
-        price:Number(booking.agreedPrice||0)||null,itemCode:rq.itemCode,availability:"service_agreement_awaiting_payment",
-        preOrderDate:booking.proposedStartAt||booking.neededAt,preOrderNote:booking.providerNote||"",
-        collectionPoint:booking.location||"",message:`Service terms agreed for ${booking.proposedStartAt||booking.neededAt}. Complete escrow payment to confirm the booking.`
-      };
-    }
-    if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});
+    loaded = true;
   }
 
-  app.get("/api/services/:itemCode/availability", async(req,res)=>{
-    await load().catch(()=>{});
-    const item=itemByCode(req.params.itemCode);
-    if(!isService(item))return res.status(404).json({error:"Service listing not found."});
-    res.json({ok:true,itemCode:String(item.code),availability:snapshot(item)});
-  });
-  app.post("/api/services/:itemCode/availability",requireAuth,async(req,res)=>{
-    await load().catch(()=>{});
-    const item=itemByCode(req.params.itemCode);
-    if(!isService(item))return res.status(404).json({error:"Service listing not found."});
-    if(!providerOwns(req,item)&&req.user.role!=="admin")return res.status(403).json({error:"Only this service provider can change availability."});
-    const action=lower(req.body&&req.body.action);
-    const mode=availabilityMode(item);
-    const rec=availability.get(String(item.code))||{id:`service-availability:${item.code}`,itemCode:String(item.code),providerPhone:item.sellerPhone};
-    if(action==="pause"){rec.paused=true;rec.liveUntil=null;}
-    else if(action==="go_live"){
-      if(mode!=="instant")return res.status(400).json({error:"Go live is only available for services lasting 1–5 hours."});
-      const liveHours=[1,2,4,8].includes(Number(req.body.liveHours))?Number(req.body.liveHours):2;
-      rec.paused=false;rec.liveUntil=new Date(Date.now()+liveHours*3600000).toISOString();
-    } else if(action==="resume"){rec.paused=false;}
-    else return res.status(400).json({error:"Choose go_live, pause or resume."});
-    rec.updatedAt=nowIso();rec.updatedBy=req.user.phone;
-    availability.set(String(item.code),rec);await persist("availability",rec);
-    logAudit(req,"service_availability_updated",{itemCode:item.code,action,status:snapshot(item).status});
-    res.json({ok:true,availability:snapshot(item)});
-  });
-  app.get("/api/services/bookings",requireAuth,async(req,res)=>{
-    await load().catch(()=>{});prune();
-    let mine;
-    if(req.user.role==="admin") mine=bookings;
-    else if(req.user.role==="seller"){
-      const visiblePending=new Set(pendingQueue(req.user.phone).slice(0,3).map(row=>String(row.id)));
-      mine=bookings.filter(b=>String(b.providerPhone)===String(req.user.phone)
-        && (lower(b.status)!==pendingStatus||visiblePending.has(String(b.id))));
-    } else mine=bookings.filter(b=>String(b.buyerPhone)===String(req.user.phone));
-    const output=mine.map(b=>({...b,queuePosition:lower(b.status)===pendingStatus?queuePosition(b):null}));
-    const ordered=output.slice().sort((a,b)=>{
-      if(req.user.role==="seller"){
-        const aPending=lower(a.status)===pendingStatus, bPending=lower(b.status)===pendingStatus;
-        if(aPending!==bPending)return aPending?-1:1;
-        if(aPending&&bPending)return queueStableCompare(a,b);
-      }
-      return Date.parse(b.updatedAt||b.createdAt)-Date.parse(a.updatedAt||a.createdAt);
+  function defaultStreamId(phone){ return `stream:self:${String(phone||'').replace(/[^0-9A-Za-z_-]/g,'')}`; }
+  function ensureDefaultStream(phone){
+    const p = String(phone||'');
+    let s = streams.find(x => String(x.id) === defaultStreamId(p));
+    if (s) return s;
+    const prof = profileFor(p);
+    s = {
+      id:defaultStreamId(p), providerPhone:p, name:prof.displayName || prof.businessName || 'Primary provider',
+      roleLabel: providerKind(p)==='company' ? 'Primary service stream' : 'Service provider',
+      avatarUrl: prof.selfieUrl || prof.selfieDataUrl || prof.logoUrl || prof.logoDataUrl || '',
+      active:!multiStreamEnabled(p), suspended:false, concurrentCapacity:1, scorePoints:DEFAULT_SCORE_POINTS,
+      completedBookings:0, defaultCount:0, recentOutcomes:[], createdAt:nowIso(), updatedAt:nowIso(),
+      isDefault:true, history:[{at:nowIso(),actor:'system',action:'default_stream_created'}]
+    };
+    streams.push(s); persist('stream',s).catch(()=>{}); return s;
+  }
+  function providerStreams(phone,{includeInactive=false}={}){
+    const p=String(phone||''); ensureDefaultStream(p);
+    return streams.filter(s=>String(s.providerPhone)===p && (includeInactive || (s.active!==false && !s.suspended)));
+  }
+  function streamById(id){ return streams.find(s=>String(s.id)===String(id||'')); }
+  function eligibleStreams(item,{includeInactive=false}={}){
+    if(!isService(item)) return [];
+    const all=providerStreams(item.sellerPhone,{includeInactive});
+    const ids=Array.isArray(item.serviceStreamIds)?item.serviceStreamIds.map(String):[];
+    if(!ids.length) return all;
+    const chosen=all.filter(s=>ids.includes(String(s.id)));
+    return chosen.length ? chosen : all.filter(s=>s.isDefault);
+  }
+  function streamScore(s){
+    const points=clamp(s && s.scorePoints != null?s.scorePoints:DEFAULT_SCORE_POINTS,0,SERVICE_SCORE_MAX);
+    return {points:Number(points.toFixed(2)),stars:Number((points/10).toFixed(1)),provisional:Number(s&&s.completedBookings||0)<5};
+  }
+  function providerReliability(phone){
+    const ss=providerStreams(phone,{includeInactive:true}).filter(s=>s.active!==false || Number(s.completedBookings||0)>0);
+    if(!ss.length) return {points:DEFAULT_SCORE_POINTS,stars:2,provisional:true,completedBookings:0,streamCount:0};
+    let weight=0,total=0,completed=0;
+    for(const s of ss){ const w=Math.max(1,Number(s.completedBookings||0)); total+=streamScore(s).points*w; weight+=w; completed+=Number(s.completedBookings||0); }
+    const points=weight?total/weight:DEFAULT_SCORE_POINTS;
+    return {points:Number(points.toFixed(2)),stars:Number((points/10).toFixed(1)),provisional:completed<5,completedBookings:completed,streamCount:ss.filter(s=>s.active!==false&&!s.suspended).length};
+  }
+  function providerSuspended(phone){
+    const active=providerStreams(phone,{includeInactive:true}).filter(s=>s.active!==false&&!s.suspended&&streamScore(s).points>0);
+    return active.length===0;
+  }
+  globalThis.__tpServiceProviderCanList = phone => providerSuspended(phone)
+    ? {ok:false,error:'Service-provider privileges are suspended because no active service stream has a reliability score above zero. Request an account review before taking new bookings.'}
+    : {ok:true};
+  globalThis.__tpServiceReliabilityForProvider = providerReliability;
+
+  const queueTime = b => Number.isFinite(Date.parse(b&&b.createdAt)) ? Date.parse(b.createdAt) : Number.MAX_SAFE_INTEGER;
+  const queueStableCompare=(a,b)=>Number(a.queueSequence||Number.MAX_SAFE_INTEGER)-Number(b.queueSequence||Number.MAX_SAFE_INTEGER)||queueTime(a)-queueTime(b)||String(a.id||'').localeCompare(String(b.id||''));
+  function ensureProviderQueueSequences(phone){
+    bookings.filter(b=>String(b.providerPhone)===String(phone)).sort((a,b)=>queueTime(a)-queueTime(b)||String(a.id||'').localeCompare(String(b.id||''))).forEach((b,i)=>{
+      if(Number(b.queueSequence)!==i+1){b.queueSequence=i+1;persist('booking',b).catch(()=>{});}
     });
-    res.json({ok:true,bookings:ordered.slice(0,200)});
-  });
-  app.post("/api/services/:itemCode/bookings",requireAuth,async(req,res)=>{
-    await load().catch(()=>{});
-    if(req.user.role!=="buyer"&&req.user.role!=="admin")return res.status(403).json({error:"Only buyers can request a service booking."});
-    const item=itemByCode(req.params.itemCode);
-    if(!isService(item))return res.status(404).json({error:"Service listing not found."});
-    const state=snapshot(item);
-    if(["paused","offline"].includes(state.status))return res.status(409).json({error:state.status==="paused"?"This service is paused.":"This instant service is not live."});
-    const neededAt=clean(req.body&&req.body.neededAt,80), location=clean(req.body&&req.body.location,180), scope=clean(req.body&&req.body.scope,600);
-    if(!neededAt||!location||scope.length<10)return res.status(400).json({error:"Required time, location and a clear service description are required."});
-    const booking={id:uuid(),itemCode:String(item.code),itemTitle:item.title,buyerPhone:req.user.phone,providerPhone:item.sellerPhone,
-      neededAt,location,scope,durationHours:serviceHours(item),availabilityMode:availabilityMode(item),
-      status:"pending_provider",queueSequence:nextProviderQueueSequence(item.sellerPhone),
-      reservationExpiresAt:null,createdAt:nowIso(),updatedAt:nowIso(),
-      reviewWindowStartedAt:null,responseDueAt:null,timedOutAt:null,
-      proposedStartAt:null,agreedPrice:null,providerNote:"",history:[{at:nowIso(),actor:"buyer",action:"booking_requested"}]};
-    saveRequestForBooking(booking,item);bookings.push(booking);await persist("booking",booking);
-    prune();
-    logAudit(req,"service_booking_requested",{bookingId:booking.id,itemCode:item.code,providerPhone:item.sellerPhone});
-    booking.queuePosition=queuePosition(booking);
-    res.status(201).json({ok:true,booking,availability:snapshot(item)});
-  });
-  app.post("/api/services/bookings/:id/respond",requireAuth,async(req,res)=>{
-    await load().catch(()=>{});prune();
-    const b=bookings.find(x=>String(x.id)===String(req.params.id));
-    if(!b)return res.status(404).json({error:"Booking not found."});
-    const item=itemByCode(b.itemCode);
-    if(String(req.user.phone)!==String(b.providerPhone)&&req.user.role!=="admin")return res.status(403).json({error:"Only the service provider can respond."});
-    if(lower(b.status)!=="pending_provider")return res.status(409).json({error:"This enquiry is no longer awaiting a provider response."});
-    if(queuePosition(b)>3)return res.status(409).json({error:"Only the first three enquiries in the provider queue can be reviewed."});
-    const action=lower(req.body&&req.body.action);
-    const responseNote=clean(req.body&&req.body.note,300);
-    if(action==="decline"){
-      if(responseNote.length<3)return res.status(400).json({error:"Enter a clear reason for declining this enquiry."});
-      b.status="declined";b.providerNote=responseNote;updateLinkedRequest(b,"decline");
+  }
+  function nextProviderQueueSequence(phone){ensureProviderQueueSequences(phone);return bookings.filter(b=>String(b.providerPhone)===String(phone)).reduce((m,b)=>Math.max(m,Number(b.queueSequence||0)),0)+1;}
+  function pendingQueue(phone){ensureProviderQueueSequences(phone);return bookings.filter(b=>String(b.providerPhone)===String(phone)&&lower(b.status)===PENDING).sort(queueStableCompare);}
+  function queuePosition(b){const q=pendingQueue(b.providerPhone);const i=q.findIndex(x=>String(x.id)===String(b.id));return i>=0?i+1:null;}
+
+  const slotBlockingStatuses=new Set(['agreement_ready','payment_pending','booked','awaiting_client_start','awaiting_provider_start','in_progress','provider_delivered','awaiting_rating','ready_for_release']);
+  const committedStatuses=new Set(['booked','awaiting_client_start','awaiting_provider_start','in_progress','provider_delivered','awaiting_rating','ready_for_release']);
+  function bookingStartMs(b){
+    if(lower(b.status)==='in_progress' && b.actualStartedAt) return Date.parse(b.actualStartedAt);
+    return Date.parse(b.proposedStartAt||b.neededAt||'');
+  }
+  function bookingDurationMs(b){return Math.max(.25,Number(b.durationHours||1))*3600000;}
+  function bookingEndMs(b){
+    const start=bookingStartMs(b); if(!Number.isFinite(start)) return NaN;
+    const st=lower(b.status), turnaround=Math.max(0,Number(b.turnaroundMinutes||0))*60000;
+    if(['provider_delivered','awaiting_rating','ready_for_release','completed'].includes(st) && b.providerDeliveredAt){
+      return Date.parse(b.providerDeliveredAt) + turnaround;
     }
-    else if(action==="accept"||action==="revise"){
-      const proposedStartAt=clean(req.body&&req.body.proposedStartAt,80);
-      const agreedPrice=Number(req.body&&req.body.agreedPrice);
-      if(!proposedStartAt||!Number.isFinite(Date.parse(proposedStartAt))||Date.parse(proposedStartAt)<=Date.now()){
-        return res.status(400).json({error:"Choose a valid future service date and time."});
-      }
-      if(!Number.isFinite(agreedPrice)||agreedPrice<=0)return res.status(400).json({error:"Enter a valid service price greater than zero."});
-      if(responseNote.length<3)return res.status(400).json({error:"Enter a short message for the potential client."});
-      b.proposedStartAt=proposedStartAt;
-      b.agreedPrice=agreedPrice;
-      b.providerNote=responseNote;
-      b.status="awaiting_buyer";
-      b.reservationExpiresAt=null;
-      updateLinkedRequest(b,"proposal");
-    } else return res.status(400).json({error:"Choose accept, revise or decline."});
-    b.updatedAt=nowIso();b.history.push({at:nowIso(),actor:"provider",action,note:b.providerNote});
-    await persist("booking",b);res.json({ok:true,booking:b,availability:snapshot(item)});
-  });
-  app.post("/api/services/bookings/:id/buyer-response",requireAuth,async(req,res)=>{
-    await load().catch(()=>{});
-    const b=bookings.find(x=>String(x.id)===String(req.params.id));
-    if(!b)return res.status(404).json({error:"Booking not found."});
-    if(String(req.user.phone)!==String(b.buyerPhone)&&req.user.role!=="admin")return res.status(403).json({error:"Only the requesting buyer can respond."});
-    if(b.status!=="awaiting_buyer")return res.status(409).json({error:"No revised terms are awaiting your response."});
-    const action=lower(req.body&&req.body.action);
-    b.status=action==="accept"?"agreement_ready":"cancelled";b.updatedAt=nowIso();b.reservationExpiresAt=null;
-    b.history.push({at:nowIso(),actor:"buyer",action:`revision_${action}`});
-    if(action==="accept")updateLinkedRequest(b,"accept");else updateLinkedRequest(b,"decline");
-    await persist("booking",b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});
-  });
-  app.post("/api/services/bookings/:id/status",requireAuth,async(req,res)=>{
-    await load().catch(()=>{});
-    const b=bookings.find(x=>String(x.id)===String(req.params.id));
-    if(!b)return res.status(404).json({error:"Booking not found."});
-    if(String(req.user.phone)!==String(b.providerPhone)&&req.user.role!=="admin")return res.status(403).json({error:"Only the service provider can update delivery status."});
-    const next=lower(req.body&&req.body.status);
-    const allowed={booked:["in_progress","cancelled"],in_progress:["completed","cancelled"]};
-    if(!(allowed[lower(b.status)]||[]).includes(next))return res.status(409).json({error:"That status change is not allowed."});
-    b.status=next;b.updatedAt=nowIso();b.history.push({at:b.updatedAt,actor:"provider",action:next});
-    const tx=(transactions||[]).find(row=>String(row.id)===String(b.transactionId||""));
-    if(next==="in_progress"){
-      b.serviceStartedAt=b.updatedAt;
-      b.expectedCompletionAt=new Date(Date.parse(b.serviceStartedAt)+Math.max(.25,Number(b.durationHours||1))*3600000).toISOString();
-      if(tx){
-        tx.serviceFulfilmentStatus="in_progress";
-        tx.serviceStartedAt=b.serviceStartedAt;
-        tx.serviceExpectedCompletionAt=b.expectedCompletionAt;
-        tx.updatedAt=b.updatedAt;
-      }
-    } else if(next==="completed"){
-      b.serviceCompletedAt=b.updatedAt;
-      b.buyerReviewDueAt=new Date(Date.parse(b.serviceCompletedAt)+24*3600000).toISOString();
-      if(tx){
-        tx.serviceFulfilmentStatus="completed_pending_buyer";
-        tx.serviceCompletedAt=b.serviceCompletedAt;
-        tx.serviceBuyerReviewDueAt=b.buyerReviewDueAt;
-        tx.status="delivered";
-        tx.deliveredAt=b.serviceCompletedAt;
-        tx.updatedAt=b.updatedAt;
-      }
-    } else if(next==="cancelled"&&tx){
-      tx.serviceFulfilmentStatus="cancelled";
-      tx.updatedAt=b.updatedAt;
+    if(st==='in_progress' && b.expectedCompletionAt){
+      // An overdue service is still occupying its stream until delivery is confirmed.
+      // Extend the projected busy window on each check rather than pretending the stream
+      // became free merely because the original estimate passed.
+      return Math.max(Date.parse(b.expectedCompletionAt), Date.now()+15*60000) + turnaround;
     }
-    if(tx&&dbEnabled())dbUpsertTransaction(tx).catch(()=>{});
-    await persist("booking",b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});
-  });
-  load().catch(e=>console.error("[service-booking] initial load failed:",e&&e.message?e.message:e));
-  console.log("[TutoPay] Service availability and booking queue loaded");
+    return start + bookingDurationMs(b) + turnaround;
+  }
+  function overlaps(aStart,aEnd,bStart,bEnd){return Number.isFinite(aStart)&&Number.isFinite(aEnd)&&Number.isFinite(bStart)&&Number.isFinite(bEnd)&&aStart<bEnd&&bStart<aEnd;}
+  function activeSlotReservation(b){
+    if(lower(b.status)!=='agreement_ready') return true;
+    return !!b.reservationExpiresAt && Date.parse(b.reservationExpiresAt)>Date.now();
+  }
+  function streamOverlapCount(streamId,startAt,durationHours,turnaroundMinutes,ignoreBookingId){
+    const start=Date.parse(startAt||''); if(!Number.isFinite(start)) return 999;
+    const end=start+Math.max(.25,Number(durationHours||1))*3600000+Math.max(0,Number(turnaroundMinutes||0))*60000;
+    return bookings.filter(b=>String(b.streamId||'')===String(streamId||'')&&String(b.id)!==String(ignoreBookingId||'')&&slotBlockingStatuses.has(lower(b.status))&&activeSlotReservation(b)&&overlaps(start,end,bookingStartMs(b),bookingEndMs(b))).length;
+  }
+  function streamCanTake(s,startAt,durationHours,turnaroundMinutes,ignoreBookingId){
+    if(!s||s.active===false||s.suspended||streamScore(s).points<=0)return {ok:false,reason:'Stream is paused or suspended.'};
+    const activeCount=bookings.filter(b=>String(b.streamId||'')===String(s.id)&&committedStatuses.has(lower(b.status))).length;
+    if(activeCount>=MAX_ACTIVE_PER_STREAM)return {ok:false,reason:`This stream already has ${MAX_ACTIVE_PER_STREAM} active paid bookings.`};
+    const cap=Math.max(1,Math.min(20,Number(s.concurrentCapacity||1)));
+    const overlap=streamOverlapCount(s.id,startAt,durationHours,turnaroundMinutes,ignoreBookingId);
+    if(overlap>=cap)return {ok:false,reason:'This stream already has an overlapping booking.'};
+    return {ok:true,overlap,capacity:cap};
+  }
+  function selectStreamForBooking(item,b,requestedStreamId){
+    const eligible=eligibleStreams(item);
+    let s=requestedStreamId?eligible.find(x=>String(x.id)===String(requestedStreamId)):null;
+    if(!s && eligible.length===1)s=eligible[0];
+    if(!s && !multiStreamEnabled(item.sellerPhone))s=eligible[0]||ensureDefaultStream(item.sellerPhone);
+    if(!s)return {error:'Choose the staff/service stream that will fulfil this booking.'};
+    const check=streamCanTake(s,b.proposedStartAt||b.neededAt,b.durationHours,b.turnaroundMinutes,b.id);
+    if(!check.ok)return {error:check.reason};
+    return {stream:s};
+  }
+
+  function scoreEvent(b,code,points,detail){
+    b.scoreEvents=Array.isArray(b.scoreEvents)?b.scoreEvents:[];
+    if(b.scoreEvents.some(e=>e.code===code))return;
+    b.scoreEvents.push({code,points,detail,at:nowIso()});
+  }
+  function scoreBooking(b,rating){
+    const s=streamById(b.streamId)||ensureDefaultStream(b.providerPhone);
+    let raw=0;
+    const scheduled=Date.parse(b.proposedStartAt||b.neededAt||'');
+    const ready=Date.parse(b.clientReadyAt||'');
+    const actual=Date.parse(b.actualStartedAt||'');
+    const baseline=Math.max(Number.isFinite(scheduled)?scheduled:0,Number.isFinite(ready)?ready:0);
+    const durationMs=bookingDurationMs(b);
+    if(b.providerDefaultedAt){ raw-=2; scoreEvent(b,'provider_default',-2,'Provider failed to start within the permitted grace period.'); }
+    else if(Number.isFinite(actual)&&baseline){
+      const delay=Math.max(0,actual-baseline), ratio=durationMs?delay/durationMs:0;
+      if(delay<=2*60000){raw+=.5;scoreEvent(b,'punctual_start',.5,'Provider started on time.');}
+      else if(ratio<=.10){raw-=.5;scoreEvent(b,'minor_start_delay',-.5,'Provider started slightly late.');}
+      else if(ratio<=.20){raw-=1;scoreEvent(b,'significant_start_delay',-1,'Provider had a significant start delay.');}
+      else {raw-=2;scoreEvent(b,'start_default_threshold',-2,'Provider exceeded the start-delay default threshold.');}
+    }
+    if(Number(b.providerPostponements||0)>0){raw-=Math.min(1.5,Number(b.providerPostponements||0));scoreEvent(b,'provider_postponement',-Math.min(1.5,Number(b.providerPostponements||0)),'Provider-initiated postponement.');}
+    const delivered=Date.parse(b.providerDeliveredAt||'');
+    if(Number.isFinite(actual)&&Number.isFinite(delivered)&&durationMs>0){
+      const ratio=(delivered-actual)/durationMs;
+      if(ratio<=1.10){raw+=.5;scoreEvent(b,'duration_on_target',.5,'Service delivered within the expected duration tolerance.');}
+      else if(ratio<=1.20){raw-=.5;scoreEvent(b,'duration_over_10',-.5,'Service exceeded estimated duration by 10–20%.');}
+      else if(ratio<=1.50){raw-=1;scoreEvent(b,'duration_over_20',-1,'Service exceeded estimated duration by 20–50%.');}
+      else {raw-=1.5;scoreEvent(b,'duration_over_50',-1.5,'Service exceeded estimated duration by more than 50%.');}
+    }
+    const quality=clamp(rating&&rating.quality,1,5), professionalism=clamp(rating&&rating.professionalism||quality,1,5);
+    const q=(quality*.75)+(professionalism*.25);
+    const qDelta=q>=4.5?1:q>=3.5?.5:q>=2.5?0:q>=1.5?-.5:-1.5;
+    raw+=qDelta;scoreEvent(b,'client_quality',qDelta,`Client service rating ${q.toFixed(2)}/5 (quality ${quality}/5; professionalism ${professionalism}/5).`);
+    const prior=Array.isArray(s.recentOutcomes)?s.recentOutcomes.slice(-4):[];
+    if(prior.length===4&&prior.every(x=>x.good)&&!b.providerDefaultedAt&&q>=4){raw+=.5;scoreEvent(b,'consistency_bonus',.5,'Five-booking consistency bonus.');}
+    const net=clamp(raw,-2,2);
+    const before=streamScore(s).points;
+    s.scorePoints=clamp(before+net,0,SERVICE_SCORE_MAX);
+    s.completedBookings=Number(s.completedBookings||0)+1;
+    s.recentOutcomes=Array.isArray(s.recentOutcomes)?s.recentOutcomes:[];
+    s.recentOutcomes.push({bookingId:b.id,at:nowIso(),delta:net,good:net>=0&&q>=4,providerDefault:!!b.providerDefaultedAt});
+    s.recentOutcomes=s.recentOutcomes.slice(-10);
+    if(b.providerDefaultedAt)s.defaultCount=Number(s.defaultCount||0)+1;
+    const defaultsLast5=s.recentOutcomes.slice(-5).filter(x=>x.providerDefault).length;
+    const defaultsLast10=s.recentOutcomes.filter(x=>x.providerDefault).length;
+    s.warning=defaultsLast5>=2?'Repeated provider defaults require review.':'';
+    if(s.scorePoints<=0||defaultsLast10>=3){s.suspended=true;s.suspendedAt=nowIso();s.suspensionReason=s.scorePoints<=0?'Reliability score reached zero.':'Three serious provider defaults in the last ten scored bookings.';}
+    s.updatedAt=nowIso();streamHistory(s).push({at:s.updatedAt,actor:'system',action:'reliability_scored',bookingId:b.id,delta:net,scoreBefore:before,scoreAfter:s.scorePoints});
+    persist('stream',s).catch(()=>{});
+    b.reliabilityAdjustment=net;b.reliabilityScoreBefore=before;b.reliabilityScoreAfter=s.scorePoints;b.reliabilityScoredAt=nowIso();
+    return {delta:net,stream:streamScore(s),events:b.scoreEvents||[],suspended:!!s.suspended,warning:s.warning||''};
+  }
+  function applyProviderDefaultPenalty(b){
+    if(b.defaultPenaltyAppliedAt)return;
+    const s=streamById(b.streamId)||ensureDefaultStream(b.providerPhone);
+    const before=streamScore(s).points;
+    s.scorePoints=clamp(before-2,0,SERVICE_SCORE_MAX);s.defaultCount=Number(s.defaultCount||0)+1;
+    s.recentOutcomes=Array.isArray(s.recentOutcomes)?s.recentOutcomes:[];s.recentOutcomes.push({bookingId:b.id,at:nowIso(),delta:-2,good:false,providerDefault:true});s.recentOutcomes=s.recentOutcomes.slice(-10);
+    const defaultsLast5=s.recentOutcomes.slice(-5).filter(x=>x.providerDefault).length,defaultsLast10=s.recentOutcomes.filter(x=>x.providerDefault).length;
+    if(defaultsLast5>=2)s.warning='Repeated provider defaults require review.';
+    if(s.scorePoints<=0||defaultsLast10>=3){s.suspended=true;s.suspendedAt=nowIso();s.suspensionReason=s.scorePoints<=0?'Reliability score reached zero.':'Three serious provider defaults in the last ten bookings.';}
+    s.updatedAt=nowIso();streamHistory(s).push({at:s.updatedAt,actor:'system',action:'provider_default_penalty',bookingId:b.id,delta:-2,scoreBefore:before,scoreAfter:s.scorePoints});persist('stream',s).catch(()=>{});
+    b.defaultPenaltyAppliedAt=nowIso();b.reliabilityAdjustment=-2;b.reliabilityScoreBefore=before;b.reliabilityScoreAfter=s.scorePoints;scoreEvent(b,'provider_default',-2,'Provider failed to start within the permitted grace period.');
+  }
+
+  function txFor(b){return (transactions||[]).find(tx=>String(tx.id)===String(b.transactionId||''));}
+  function syncTx(b){
+    const tx=txFor(b);if(!tx)return null;
+    tx.serviceBookingId=b.id;tx.serviceFulfilmentStatus=lower(b.status);tx.serviceStreamId=b.streamId||null;tx.serviceStreamName=b.streamName||null;
+    tx.serviceStartAt=b.proposedStartAt||b.neededAt||null;tx.serviceDurationHours=Math.max(.25,Number(b.durationHours||1));tx.serviceTurnaroundMinutes=Math.max(0,Number(b.turnaroundMinutes||0));
+    tx.serviceClientReadyAt=b.clientReadyAt||null;tx.serviceProviderStartDeadline=b.providerStartDeadline||null;tx.serviceStartedAt=b.actualStartedAt||null;
+    tx.serviceExpectedCompletionAt=b.expectedCompletionAt||null;tx.serviceCompletionEligibleAt=b.completionEligibleAt||null;tx.serviceProviderDeliveredAt=b.providerDeliveredAt||null;
+    tx.serviceBuyerReviewDueAt=b.buyerReviewDueAt||null;tx.serviceClientCompletedAt=b.clientCompletedAt||null;tx.serviceClientRatingSubmittedAt=b.clientRatingSubmittedAt||null;
+    tx.serviceProviderDefaultedAt=b.providerDefaultedAt||null;tx.updatedAt=b.updatedAt||nowIso();
+    if(dbEnabled())dbUpsertTransaction(tx).catch(()=>{});return tx;
+  }
+
+  function migrateBooking(b){
+    if(!b||!b.status)return;
+    if(b.status==='confirmed')b.status='agreement_ready';
+    if(b.status==='completed'){
+      const tx=txFor(b);
+      b.status=tx&&['completed','released'].includes(lower(tx.status))?'completed':'provider_delivered';
+      b.providerDeliveredAt=b.providerDeliveredAt||b.serviceCompletedAt||b.updatedAt||nowIso();
+    }
+    if(b.serviceStartedAt&&!b.actualStartedAt)b.actualStartedAt=b.serviceStartedAt;
+    if(!b.turnaroundMinutes)b.turnaroundMinutes=Number(itemByCode(b.itemCode)?.turnaroundMinutes||0);
+    if(!b.streamId){const d=ensureDefaultStream(b.providerPhone);b.streamId=d.id;b.streamName=d.name;}
+  }
+  function startGraceMs(b){return clamp(bookingDurationMs(b)*.20,10*60000,60*60000);}
+  function prune(){
+    const now=Date.now();
+    for(const b of bookings){
+      migrateBooking(b);const st=lower(b.status);const tx=txFor(b);
+      if(st==='agreement_ready'&&b.reservationExpiresAt&&Date.parse(b.reservationExpiresAt)<=now){b.reservationExpiresAt=null;b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'slot_reservation_expired'});persist('booking',b).catch(()=>{});}
+      if(tx&&lower(b.status)==='payment_pending'&&String(tx.paymentStatus||'').toLowerCase()!=='paid'&&b.paymentDueAt&&Date.parse(b.paymentDueAt)<=now){
+        b.status='agreement_ready';b.paymentExpiredAt=nowIso();b.updatedAt=b.paymentExpiredAt;b.transactionId=null;bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'protected_payment_window_expired',transactionId:tx.id});tx.serviceFulfilmentStatus='payment_window_expired';tx.servicePaymentWindowExpiredAt=b.paymentExpiredAt;tx.updatedAt=b.updatedAt;if(dbEnabled())dbUpsertTransaction(tx).catch(()=>{});persist('booking',b).catch(()=>{});
+      }
+      if(tx&&String(tx.paymentStatus||'').toLowerCase()==='paid'&&['payment_pending','agreement_ready'].includes(lower(b.status))){
+        b.status='booked';b.paymentDueAt=null;b.paidAt=tx.paidAt||nowIso();b.bookedAt=b.paidAt;b.reservationExpiresAt=null;b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'partner_payment_confirmed'});syncTx(b);persist('booking',b).catch(()=>{});
+      }
+      if(lower(b.status)==='booked'&&Date.parse(b.proposedStartAt||b.neededAt||'')<=now){b.status='awaiting_client_start';b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'scheduled_start_reached'});syncTx(b);persist('booking',b).catch(()=>{});}
+      if(lower(b.status)==='awaiting_provider_start'&&b.providerStartDeadline&&Date.parse(b.providerStartDeadline)<=now&&!b.actualStartedAt){
+        b.status='provider_defaulted';b.providerDefaultedAt=nowIso();b.updatedAt=b.providerDefaultedAt;bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'provider_start_defaulted'});applyProviderDefaultPenalty(b);syncTx(b);persist('booking',b).catch(()=>{});
+      }
+      if(tx&&['completed','released'].includes(lower(tx.status))&&lower(b.status)==='ready_for_release'){
+        b.status='completed';b.settledAt=tx.completedAt||nowIso();b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'partner_release_completed'});syncTx(b);persist('booking',b).catch(()=>{});
+      }
+    }
+    let promoted=true;
+    while(promoted){promoted=false;const providers=[...new Set(bookings.filter(b=>lower(b.status)===PENDING).map(b=>String(b.providerPhone||'')))];
+      for(const phone of providers){const q=pendingQueue(phone);for(const b of q.slice(0,3)){
+        if(!b.reviewWindowStartedAt){b.reviewWindowStartedAt=nowIso();b.responseDueAt=iso(Date.now()+ENQUIRY_RESPONSE_MS);b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'entered_provider_review_queue'});persist('booking',b).catch(()=>{});}
+        if(b.responseDueAt&&Date.parse(b.responseDueAt)<=Date.now()){b.status='timed_out';b.timedOutAt=nowIso();b.updatedAt=b.timedOutAt;bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'provider_response_timed_out'});updateLinkedRequest(b,'timeout');persist('booking',b).catch(()=>{});promoted=true;}
+      }}
+    }
+  }
+
+  function committedForStream(id){return bookings.filter(b=>String(b.streamId||'')===String(id||'')&&committedStatuses.has(lower(b.status)));}
+  function committedForItem(code){return bookings.filter(b=>String(b.itemCode)===String(code||'')&&committedStatuses.has(lower(b.status)));}
+  function snapshot(item){
+    if(!isService(item))return null;prune();const rec=availability.get(String(item.code||item.id))||{};const mode=availabilityMode(item);const eligible=eligibleStreams(item);const active=eligible.filter(s=>s.active!==false&&!s.suspended&&streamScore(s).points>0);
+    const now=nowIso();const freeNow=active.filter(s=>streamCanTake(s,now,serviceHours(item),Number(item.turnaroundMinutes||0),null).ok);
+    const liveValid=rec.liveUntil&&Date.parse(rec.liveUntil)>Date.now();let status=mode;
+    if(providerSuspended(item.sellerPhone))status='suspended';else if(rec.paused)status='paused';else if(mode==='instant'&&!liveValid)status='offline';else if(mode==='instant'&&freeNow.length)status='live_green';else if(mode==='instant'&&active.length)status='live_amber';
+    const rel=providerReliability(item.sellerPhone);const capacityUsed=eligible.reduce((sum,s)=>sum+committedForStream(s.id).length,0),capacityLimit=Math.max(1,eligible.length)*MAX_ACTIVE_PER_STREAM;
+    return {mode,status,capacityUsed,capacityLimit,remainingSlots:Math.max(0,capacityLimit-capacityUsed),itemBookings:committedForItem(item.code||item.id).length,liveUntil:liveValid?rec.liveUntil:null,paused:!!rec.paused,
+      pendingEnquiries:pendingQueue(item.sellerPhone).length,eligibleStreams:eligible.length,availableStreamsNow:freeNow.length,providerKind:providerKind(item.sellerPhone),
+      reliabilityPoints:rel.points,reliabilityStars:rel.stars,reliabilityProvisional:rel.provisional,completedServices:rel.completedBookings,updatedAt:rec.updatedAt||null};
+  }
+  globalThis.__tpServiceAvailabilityForItem=snapshot;
+  globalThis.__tpServiceMarkReleased=(tx,at)=>{const b=bookings.find(x=>String(x.id)===String(tx&&tx.serviceBookingId||''));if(!b)return; b.status='completed';b.settledAt=at||nowIso();b.updatedAt=b.settledAt;bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'buyer_release_confirmed'});tx.serviceFulfilmentStatus='completed';tx.serviceSettledAt=b.settledAt;persist('booking',b).catch(()=>{});};
+  globalThis.__tpServicePaymentGate=(tx)=>{if(!tx||!tx.serviceBookingId)return{ok:true};prune();if(String(tx.paymentStatus||'').toLowerCase()==='paid')return{ok:true};const b=bookings.find(x=>String(x.id)===String(tx.serviceBookingId));if(!b)return{ok:false,error:'The service agreement linked to this payment could not be found.'};if(lower(b.status)!=='payment_pending'||String(b.transactionId||'')!==String(tx.id))return{ok:false,error:'This protected-payment window is no longer active. Reopen the agreed service request and start payment again.'};if(b.paymentDueAt&&Date.parse(b.paymentDueAt)<=Date.now())return{ok:false,error:'The protected-payment window expired. Reopen the agreed service request and start payment again.'};return{ok:true,paymentDueAt:b.paymentDueAt||null};};
+
+  globalThis.__tpFilterServiceRequestsForUser=(user,rows)=>{prune();const annotated=(rows||[]).map(rq=>{if(!rq.serviceBookingId)return rq;const b=bookings.find(x=>String(x.id)===String(rq.serviceBookingId));if(!b)return rq;rq.serviceWorkflowStatus=lower(b.status);rq.serviceQueuePosition=lower(b.status)===PENDING?queuePosition(b):null;rq.serviceResponseDueAt=b.responseDueAt||null;rq.serviceTimedOutAt=b.timedOutAt||null;rq.initialBuyerNote=rq.initialBuyerNote||b.scope||'';rq.serviceRequest=Object.assign({},rq.serviceRequest||{},{neededAt:b.neededAt,location:b.location,scope:b.scope,streamId:b.streamId||null,streamName:b.streamName||null});return rq;});
+    if(!user||String(user.role)!=='seller')return annotated;const top=new Set(pendingQueue(user.phone).slice(0,3).map(b=>String(b.requestId||'')));return annotated.filter(rq=>{if(!rq.serviceBookingId)return true;const b=bookings.find(x=>String(x.id)===String(rq.serviceBookingId));return !b||lower(b.status)!==PENDING||top.has(String(rq.id));});};
+
+  globalThis.__tpAttachServiceAgreementToTransaction=tx=>{prune();const explicitId=clean(tx.requestedServiceBookingId,120);let b=explicitId?bookings.find(x=>String(x.id)===explicitId):bookings.filter(x=>lower(x.status)==='agreement_ready'&&String(x.buyerPhone)===String(tx.fromPhone)&&String(x.providerPhone)===String(tx.toPhone)&&String(x.itemCode)===String(tx.itemCode)).sort((a,b)=>Date.parse(b.updatedAt||b.createdAt)-Date.parse(a.updatedAt||a.createdAt))[0];
+    if(!b)return explicitId?{error:'The selected service agreement could not be found. Reopen Requests & Replies and select Proceed to escrow again.'}:null;if(lower(b.status)!=='agreement_ready')return{error:'This service enquiry is not an agreed, unpaid service agreement.'};
+    if(String(b.buyerPhone)!==String(tx.fromPhone)||String(b.providerPhone)!==String(tx.toPhone)||String(b.itemCode)!==String(tx.itemCode))return{error:'The payment details do not match the selected service agreement.'};
+    const item=itemByCode(b.itemCode);const chosen=selectStreamForBooking(item,b,b.streamId);if(chosen.error)return{error:chosen.error};b.streamId=chosen.stream.id;b.streamName=chosen.stream.name;
+    const check=streamCanTake(chosen.stream,b.proposedStartAt||b.neededAt,b.durationHours,b.turnaroundMinutes,b.id);if(!check.ok)return{error:check.reason};
+    b.status='payment_pending';b.transactionId=tx.id;b.paymentStartedAt=nowIso();b.paymentDueAt=iso(Date.now()+PAYMENT_WINDOW_MS);b.reservationExpiresAt=null;b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'buyer',action:'protected_payment_created',transactionId:tx.id,paymentDueAt:b.paymentDueAt});
+    tx.serviceBookingId=b.id;tx.serviceFulfilmentStatus='payment_pending';tx.servicePaymentDueAt=b.paymentDueAt;tx.serviceStartAt=b.proposedStartAt||b.neededAt||null;tx.serviceDurationHours=Math.max(.25,Number(b.durationHours||1));tx.serviceStreamId=b.streamId;tx.serviceStreamName=b.streamName;
+    tx.serviceAgreement={bookingId:b.id,requestedAt:b.createdAt||null,agreedAt:b.agreedAt||b.updatedAt||null,proposedStartAt:b.proposedStartAt||b.neededAt||null,durationHours:Math.max(.25,Number(b.durationHours||1)),turnaroundMinutes:Number(b.turnaroundMinutes||0),streamId:b.streamId,streamName:b.streamName,location:b.location||'',scope:b.scope||'',providerNote:b.providerNote||''};delete tx.requestedServiceBookingId;persist('booking',b).catch(()=>{});return{bookingId:b.id};};
+
+  function saveRequestForBooking(b,item){const rq={id:uuid(),fromPhone:b.buyerPhone,toPhone:b.providerPhone,itemCode:String(item.code),quantity:1,status:'open',createdAt:nowIso(),repliedAt:null,reply:null,serviceBookingId:b.id,
+      serviceRequest:{neededAt:b.neededAt,location:b.location,scope:b.scope,durationHours:b.durationHours},itemSnapshot:{code:item.code,title:item.title,details:item.details||'',price:item.price,imageUrl:item.imageUrl||'',imageUrls:Array.isArray(item.imageUrls)?item.imageUrls:(item.imageUrl?[item.imageUrl]:[]),listingType:'service',serviceCategory:item.serviceCategory||'',deliveryMode:item.deliveryMode||'',serviceArea:item.serviceArea||'',estimatedDurationHours:item.estimatedDurationHours||1,turnaroundMinutes:item.turnaroundMinutes||0,completionEvidence:item.completionEvidence||'',pricingRules:item.pricingRules||item.pricingTerms||null,pricingMode:item.pricingMode||(item.pricingRules&&item.pricingRules.mode)||'fixed'},itemPricingSnapshot:tpPricingSnapshotForItem(item,1),negotiationAllowed:tpPricingNegotiationAllowed({itemPricingSnapshot:tpPricingSnapshotForItem(item,1)}),initialBuyerNote:b.scope,notesThread:[{id:uuid(),actor:'buyer',phone:b.buyerPhone,text:b.scope,at:b.createdAt||nowIso(),kind:'initial_service_request'}]};requests.push(rq);b.requestId=rq.id;if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});return rq;}
+  function updateLinkedRequest(b,action){const rq=(requests||[]).find(x=>String(x.id)===String(b.requestId));if(!rq)return;if(action==='decline'){rq.status='declined';rq.repliedAt=nowIso();rq.reply={itemCode:rq.itemCode,availability:'service_enquiry_declined',preOrderNote:b.providerNote||'',message:b.providerNote?`Service provider declined the enquiry: ${b.providerNote}`:'The service provider declined this enquiry.'};}
+    else if(action==='timeout'){rq.status='timed_out';rq.repliedAt=nowIso();rq.reply=null;rq.serviceWorkflowStatus='timed_out';rq.serviceQueuePosition=null;}
+    else if(action==='proposal'){rq.status='open';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_terms_proposed',preOrderDate:b.proposedStartAt||b.neededAt,preOrderNote:b.providerNote||'',collectionPoint:b.location||'',message:'The service provider has proposed terms. Review and accept or decline them under My service enquiries.'};rq.notesThread=Array.isArray(rq.notesThread)?rq.notesThread:[];rq.notesThread.push({id:uuid(),actor:'service_provider',phone:b.providerPhone,text:b.providerNote||'Service terms proposed.',at:rq.repliedAt,kind:'service_terms_proposed'});}
+    else if(action==='accept'){rq.status='answered';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_agreement_awaiting_payment',preOrderDate:b.proposedStartAt||b.neededAt,preOrderNote:b.providerNote||'',collectionPoint:b.location||'',message:`Service terms agreed for ${b.proposedStartAt||b.neededAt}. Complete protected payment to confirm the booking.`};}if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});}
+
+  app.get('/api/services/:itemCode/availability',async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});res.json({ok:true,itemCode:String(item.code),availability:snapshot(item)});});
+  app.post('/api/services/:itemCode/availability',requireAuth,async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});if(!providerOwns(req,item)&&req.user.role!=='admin')return res.status(403).json({error:'Only this service provider can change availability.'});const action=lower(req.body&&req.body.action),mode=availabilityMode(item),rec=availability.get(String(item.code))||{id:`service-availability:${item.code}`,itemCode:String(item.code),providerPhone:item.sellerPhone};if(action==='pause'){rec.paused=true;rec.liveUntil=null;}else if(action==='go_live'){if(mode!=='instant')return res.status(400).json({error:'Go live is only available for services lasting 1–5 hours.'});const hours=[1,2,4,8].includes(Number(req.body.liveHours))?Number(req.body.liveHours):2;rec.paused=false;rec.liveUntil=iso(Date.now()+hours*3600000);}else if(action==='resume')rec.paused=false;else return res.status(400).json({error:'Choose go_live, pause or resume.'});rec.updatedAt=nowIso();rec.updatedBy=req.user.phone;availability.set(String(item.code),rec);await persist('availability',rec);logAudit(req,'service_availability_updated',{itemCode:item.code,action,status:snapshot(item).status});res.json({ok:true,availability:snapshot(item)});});
+
+  app.get('/api/services/streams',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const providerPhone=req.user.role==='admin'&&req.query.providerPhone?String(req.query.providerPhone):String(req.user.phone);if(req.user.role!=='admin'&&String(providerPhone)!==String(req.user.phone))return res.status(403).json({error:'Not allowed.'});let ss=providerStreams(providerPhone,{includeInactive:true});const item=req.query.itemCode?itemByCode(req.query.itemCode):null;if(item&&String(item.sellerPhone)!==String(providerPhone))return res.status(403).json({error:'Listing does not belong to this provider.'});const startAt=clean(req.query.startAt,80),duration=Number(req.query.durationHours||serviceHours(item)||1),turnaround=Number(req.query.turnaroundMinutes||item?.turnaroundMinutes||0);const eligibleIds=item?new Set(eligibleStreams(item,{includeInactive:true}).map(s=>String(s.id))):null;
+    const rows=ss.map(s=>{const score=streamScore(s),check=startAt?streamCanTake(s,startAt,duration,turnaround,null):{ok:s.active!==false&&!s.suspended};return{...s,scorePoints:score.points,stars:score.stars,provisional:score.provisional,eligibleForItem:eligibleIds?eligibleIds.has(String(s.id)):true,availableForSlot:!!check.ok,availabilityReason:check.ok?'Available':check.reason,activePaidBookings:committedForStream(s.id).length};});res.json({ok:true,providerPhone,providerKind:providerKind(providerPhone),multiStreamEnabled:multiStreamEnabled(providerPhone),reliability:providerReliability(providerPhone),streams:rows});});
+  app.post('/api/services/streams',requireAuth,async(req,res)=>{await load().catch(()=>{});if(req.user.role!=='seller'&&req.user.role!=='admin')return res.status(403).json({error:'Service provider access required.'});const phone=String(req.user.phone);if(req.user.role!=='admin'&&!multiStreamEnabled(phone))return res.status(409).json({error:'Additional streams are available only to company Service Provider accounts with Multiple streams enabled.'});const name=clean(req.body&&req.body.name,80),roleLabel=clean(req.body&&req.body.roleLabel,100);if(name.length<2)return res.status(400).json({error:'Enter the staff/service stream name.'});let avatarUrl=clean(req.body&&req.body.avatarUrl,500);const avatarDataUrl=String(req.body&&req.body.avatarDataUrl||'');if(!avatarUrl&&!avatarDataUrl.startsWith('data:image'))return res.status(400).json({error:'A clear staff profile photo/selfie is required for each independent service stream.'});if(avatarDataUrl.startsWith('data:image')){try{avatarUrl=await persistImageDataUrl(avatarDataUrl,{prefix:'service-stream',folder:`tutopay/service-streams/${phone}`});}catch(e){return res.status(400).json({error:'Could not save the stream profile image.'});}}
+    const s={id:uuid(),providerPhone:phone,name,roleLabel:roleLabel||'Service professional',avatarUrl,active:true,suspended:false,concurrentCapacity:Math.max(1,Math.min(20,Number(req.body&&req.body.concurrentCapacity||1))),scorePoints:DEFAULT_SCORE_POINTS,completedBookings:0,defaultCount:0,recentOutcomes:[],createdAt:nowIso(),updatedAt:nowIso(),isDefault:false,history:[{at:nowIso(),actor:phone,action:'stream_created'}]};streams.push(s);await persist('stream',s);logAudit(req,'service_stream_created',{streamId:s.id,name:s.name});res.status(201).json({ok:true,stream:{...s,...streamScore(s)}});});
+  app.post('/api/services/streams/:id',requireAuth,async(req,res)=>{await load().catch(()=>{});const s=streamById(req.params.id);if(!s)return res.status(404).json({error:'Service stream not found.'});if(req.user.role!=='admin'&&String(s.providerPhone)!==String(req.user.phone))return res.status(403).json({error:'Not allowed.'});const action=lower(req.body&&req.body.action);if(action==='pause')s.active=false;else if(action==='resume'){if(s.suspended)return res.status(409).json({error:'This stream is suspended and requires review before it can resume.'});s.active=true;}else if(action==='update'){if(req.body.name)s.name=clean(req.body.name,80);if(req.body.roleLabel)s.roleLabel=clean(req.body.roleLabel,100);if(req.body.concurrentCapacity!=null)s.concurrentCapacity=Math.max(1,Math.min(20,Number(req.body.concurrentCapacity||1)));}else return res.status(400).json({error:'Choose pause, resume or update.'});s.updatedAt=nowIso();streamHistory(s).push({at:s.updatedAt,actor:req.user.phone,action});await persist('stream',s);res.json({ok:true,stream:{...s,...streamScore(s)}});});
+
+  app.get('/api/services/bookings',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();let mine;if(req.user.role==='admin')mine=bookings;else if(req.user.role==='seller'){const visible=new Set(pendingQueue(req.user.phone).slice(0,3).map(b=>String(b.id)));mine=bookings.filter(b=>String(b.providerPhone)===String(req.user.phone)&&(lower(b.status)!==PENDING||visible.has(String(b.id))));}else mine=bookings.filter(b=>String(b.buyerPhone)===String(req.user.phone));const output=mine.map(b=>{const s=streamById(b.streamId);const score=s?streamScore(s):null;const now=Date.now(),eligibleAt=Date.parse(b.completionEligibleAt||'');return{...b,queuePosition:lower(b.status)===PENDING?queuePosition(b):null,deliveryEligible:lower(b.status)==='in_progress'&&Number.isFinite(eligibleAt)&&now>=eligibleAt,stream:s?{id:s.id,name:s.name,roleLabel:s.roleLabel,avatarUrl:s.avatarUrl,stars:score.stars,scorePoints:score.points,provisional:score.provisional}:null};});const ordered=output.sort((a,b)=>{if(req.user.role==='seller'){const ap=lower(a.status)===PENDING,bp=lower(b.status)===PENDING;if(ap!==bp)return ap?-1:1;if(ap&&bp)return queueStableCompare(a,b);}return Date.parse(b.updatedAt||b.createdAt)-Date.parse(a.updatedAt||a.createdAt);});res.json({ok:true,bookings:ordered.slice(0,250)});});
+
+  app.post('/api/services/:itemCode/bookings',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();if(req.user.role!=='buyer'&&req.user.role!=='admin')return res.status(403).json({error:'Only buyers can request a service booking.'});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});const state=snapshot(item);if(['paused','offline','suspended'].includes(state.status))return res.status(409).json({error:state.status==='paused'?'This service is paused.':state.status==='suspended'?'This provider is not accepting new service bookings while their account is under review.':'This instant service is not live.'});const neededAt=clean(req.body&&req.body.neededAt,80),location=clean(req.body&&req.body.location,180),scope=clean(req.body&&req.body.scope,600);if(!neededAt||!Number.isFinite(Date.parse(neededAt))||!location||scope.length<10)return res.status(400).json({error:'Required time, location and a clear service description are required.'});const b={id:uuid(),itemCode:String(item.code),itemTitle:item.title,buyerPhone:req.user.phone,providerPhone:item.sellerPhone,neededAt,location,scope,durationHours:serviceHours(item),turnaroundMinutes:Number(item.turnaroundMinutes||0),availabilityMode:availabilityMode(item),status:PENDING,queueSequence:nextProviderQueueSequence(item.sellerPhone),reservationExpiresAt:null,createdAt:nowIso(),updatedAt:nowIso(),reviewWindowStartedAt:null,responseDueAt:null,timedOutAt:null,proposedStartAt:null,agreedPrice:null,providerNote:'',streamId:null,streamName:null,history:[{at:nowIso(),actor:'buyer',action:'booking_requested'}]};saveRequestForBooking(b,item);bookings.push(b);await persist('booking',b);prune();logAudit(req,'service_booking_requested',{bookingId:b.id,itemCode:item.code,providerPhone:item.sellerPhone});b.queuePosition=queuePosition(b);res.status(201).json({ok:true,booking:b,availability:snapshot(item)});});
+
+  app.post('/api/services/bookings/:id/respond',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});const item=itemByCode(b.itemCode);if(String(req.user.phone)!==String(b.providerPhone)&&req.user.role!=='admin')return res.status(403).json({error:'Only the service provider can respond.'});if(lower(b.status)!==PENDING)return res.status(409).json({error:'This enquiry is no longer awaiting a provider response.'});if(queuePosition(b)>3)return res.status(409).json({error:'Only the first three enquiries in the provider queue can be reviewed.'});const action=lower(req.body&&req.body.action),note=clean(req.body&&req.body.note,300);if(action==='decline'){if(note.length<3)return res.status(400).json({error:'Enter a clear reason for declining.'});b.status='declined';b.providerNote=note;updateLinkedRequest(b,'decline');}else if(action==='accept'||action==='revise'){const startAt=clean(req.body&&req.body.proposedStartAt,80),price=Number(req.body&&req.body.agreedPrice);if(!startAt||!Number.isFinite(Date.parse(startAt))||Date.parse(startAt)<=Date.now())return res.status(400).json({error:'Choose a valid future service date and time.'});if(!Number.isFinite(price)||price<=0)return res.status(400).json({error:'Enter a valid service price greater than zero.'});if(note.length<3)return res.status(400).json({error:'Enter a short message for the potential client.'});b.proposedStartAt=startAt;b.agreedPrice=price;b.providerNote=note;const proposedDuration=Number(req.body&&req.body.durationHours||b.durationHours||serviceHours(item));if(!Number.isFinite(proposedDuration)||proposedDuration<.25||proposedDuration>720)return res.status(400).json({error:'Enter a valid estimated service duration.'});b.durationHours=proposedDuration;const chosen=selectStreamForBooking(item,b,clean(req.body&&req.body.streamId,120));if(chosen.error)return res.status(409).json({error:chosen.error});b.streamId=chosen.stream.id;b.streamName=chosen.stream.name;b.status='awaiting_buyer';b.reservationExpiresAt=null;updateLinkedRequest(b,'proposal');}else return res.status(400).json({error:'Choose accept, revise or decline.'});b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'provider',action,note:b.providerNote,streamId:b.streamId||null});await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(item)});});
+
+  app.post('/api/services/bookings/:id/buyer-response',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});if(String(req.user.phone)!==String(b.buyerPhone)&&req.user.role!=='admin')return res.status(403).json({error:'Only the requesting buyer can respond.'});const action=lower(req.body&&req.body.action);if(lower(b.status)==='awaiting_buyer'){
+      if(action==='accept'){const item=itemByCode(b.itemCode),s=streamById(b.streamId);const check=streamCanTake(s,b.proposedStartAt,b.durationHours,b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:`Those terms can no longer be reserved: ${check.reason}`});b.status='agreement_ready';b.agreedAt=nowIso();b.reservationExpiresAt=iso(Date.now()+AGREEMENT_SLOT_RESERVATION_MS);updateLinkedRequest(b,'accept');}else if(action==='decline'){b.status='cancelled';b.reservationExpiresAt=null;updateLinkedRequest(b,'decline');}else return res.status(400).json({error:'Choose accept or decline.'});
+    } else if(lower(b.status)==='reschedule_pending_client'){
+      if(action==='accept_reschedule'){const s=streamById(b.streamId);const check=streamCanTake(s,b.proposedRescheduleAt,b.durationHours,b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});b.previousStartAt=b.proposedStartAt;b.proposedStartAt=b.proposedRescheduleAt;b.proposedRescheduleAt=null;b.providerPostponements=Number(b.providerPostponements||0)+1;b.status='booked';b.clientReadyAt=null;b.providerStartDeadline=null;bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'provider_reschedule_accepted'});}else if(action==='decline_reschedule'){b.proposedRescheduleAt=null;b.status=Date.parse(b.proposedStartAt)<=Date.now()?'awaiting_client_start':'booked';bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'provider_reschedule_declined'});}else return res.status(400).json({error:'Choose accept_reschedule or decline_reschedule.'});
+    } else return res.status(409).json({error:'No buyer response is required for this booking.'});b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'buyer',action});syncTx(b);await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});});
+
+  app.post('/api/services/bookings/:id/status',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});const action=lower(req.body&&req.body.action||req.body&&req.body.status),isBuyer=String(req.user.phone)===String(b.buyerPhone)&&req.user.role==='buyer',isProvider=String(req.user.phone)===String(b.providerPhone)&&req.user.role==='seller',isAdmin=req.user.role==='admin';const st=lower(b.status),tx=txFor(b);if(b.disputeActive||tx&&tx.disputeActive)return res.status(409).json({error:'Service actions are paused while the issue is under review.'});
+    if(action==='client_ready'){
+      if(!isBuyer&&!isAdmin)return res.status(403).json({error:'Only the client can confirm readiness.'});if(!['booked','awaiting_client_start'].includes(st))return res.status(409).json({error:'This booking is not awaiting client readiness.'});const scheduled=Date.parse(b.proposedStartAt||b.neededAt||'');if(!Number.isFinite(scheduled)||Date.now()<scheduled)return res.status(409).json({error:'The agreed service start time has not arrived yet.'});b.clientReadyAt=nowIso();const baseline=Math.max(scheduled,Date.parse(b.clientReadyAt));b.providerStartDeadline=iso(baseline+startGraceMs(b));b.status='awaiting_provider_start';bookingHistory(b).push({at:b.clientReadyAt,actor:'buyer',action:'client_ready'});
+    } else if(action==='provider_start'){
+      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the assigned service provider can start service delivery.'});if(st!=='awaiting_provider_start')return res.status(409).json({error:'The client must first confirm that the service can start.'});if(b.providerStartDeadline&&Date.now()>Date.parse(b.providerStartDeadline))return res.status(409).json({error:'The provider start window has already defaulted. This booking requires review.'});b.actualStartedAt=nowIso();b.expectedCompletionAt=iso(Date.parse(b.actualStartedAt)+bookingDurationMs(b));b.completionEligibleAt=iso(Date.parse(b.actualStartedAt)+bookingDurationMs(b)*.70);b.status='in_progress';bookingHistory(b).push({at:b.actualStartedAt,actor:'provider',action:'service_started'});
+    } else if(action==='provider_delivered'){
+      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the assigned service provider can mark the service delivered.'});if(st!=='in_progress')return res.status(409).json({error:'Service delivery has not been started.'});if(!b.completionEligibleAt||Date.now()<Date.parse(b.completionEligibleAt))return res.status(409).json({error:'Service delivered can be confirmed only after at least 70% of the estimated service duration has elapsed.'});b.providerDeliveredAt=nowIso();b.buyerReviewDueAt=iso(Date.now()+DELIVERY_REVIEW_MS);b.status='provider_delivered';bookingHistory(b).push({at:b.providerDeliveredAt,actor:'provider',action:'service_delivered'});
+    } else if(action==='client_completed'){
+      if(!isBuyer&&!isAdmin)return res.status(403).json({error:'Only the client can confirm service completion.'});if(st!=='provider_delivered')return res.status(409).json({error:'The provider has not yet marked the service delivered.'});b.clientCompletedAt=nowIso();b.status='awaiting_rating';bookingHistory(b).push({at:b.clientCompletedAt,actor:'buyer',action:'service_completion_confirmed'});if(tx){tx.status='delivered';tx.deliveredAt=b.clientCompletedAt;}
+    } else if(action==='request_reschedule'){
+      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the provider can request a reschedule.'});if(!['booked','awaiting_client_start'].includes(st))return res.status(409).json({error:'This booking can no longer be rescheduled from the provider console.'});const newStart=clean(req.body&&req.body.newStartAt,80);if(!newStart||!Number.isFinite(Date.parse(newStart))||Date.parse(newStart)<=Date.now())return res.status(400).json({error:'Choose a valid future replacement time.'});const s=streamById(b.streamId),check=streamCanTake(s,newStart,b.durationHours,b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});b.proposedRescheduleAt=newStart;b.rescheduleRequestedAt=nowIso();b.status='reschedule_pending_client';bookingHistory(b).push({at:b.rescheduleRequestedAt,actor:'provider',action:'reschedule_requested',newStartAt:newStart});
+    } else return res.status(400).json({error:'That service action is not available.'});b.updatedAt=nowIso();syncTx(b);if(tx&&dbEnabled())dbUpsertTransaction(tx).catch(()=>{});await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});});
+
+  app.post('/api/services/bookings/:id/rating',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});if(String(req.user.phone)!==String(b.buyerPhone)&&req.user.role!=='admin')return res.status(403).json({error:'Only the client can rate this service.'});if(lower(b.status)!=='awaiting_rating')return res.status(409).json({error:'This booking is not awaiting a service rating.'});if(b.clientRatingSubmittedAt)return res.status(409).json({error:'This service has already been rated.'});const quality=Number(req.body&&req.body.quality),professionalism=Number(req.body&&req.body.professionalism||quality);if(![1,2,3,4,5].includes(quality)||![1,2,3,4,5].includes(professionalism))return res.status(400).json({error:'Choose a quality and professionalism rating from 1 to 5.'});b.clientRating={quality,professionalism,wouldUseAgain:req.body&&req.body.wouldUseAgain!==false,comment:clean(req.body&&req.body.comment,500),submittedAt:nowIso()};b.clientRatingSubmittedAt=b.clientRating.submittedAt;const scored=scoreBooking(b,b.clientRating);b.status='ready_for_release';b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'buyer',action:'service_rated',quality,professionalism,scoreDelta:scored.delta});const tx=syncTx(b);if(tx){tx.serviceClientRatingSubmittedAt=b.clientRatingSubmittedAt;tx.serviceReliabilityAdjustment=scored.delta;tx.serviceReliabilityScoreAfter=scored.stream.points;if(dbEnabled())dbUpsertTransaction(tx).catch(()=>{});}await persist('booking',b);logAudit(req,'service_rating_submitted',{bookingId:b.id,streamId:b.streamId,quality,delta:scored.delta,scoreAfter:scored.stream.points});res.json({ok:true,booking:b,reliability:scored,providerReliability:providerReliability(b.providerPhone)});});
+
+  load().catch(e=>console.error('[service-engine-v2] initial load failed:',e&&e.message?e.message:e));
+  console.log('[TutoPay] Service Engine v2 loaded');
 })();
 
 /* ===== Seller share-link conversion tracking =====
