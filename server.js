@@ -7318,6 +7318,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   const availability = new Map();
   const bookings = [];
   const streams = [];
+  const reviews = [];
   let loaded = false;
   let dbReady = false;
 
@@ -7439,7 +7440,11 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
       if (row.kind === 'availability' && obj.itemCode) availability.set(String(obj.itemCode),obj);
       if (row.kind === 'booking' && obj.id) bookings.push(obj);
       if (row.kind === 'stream' && obj.id) streams.push(obj);
+      if (row.kind === 'review' && obj.id) reviews.push(obj);
     }
+    // Backfill a review record for any genuine reliability suspension that
+    // existed before the review-governance module was introduced.
+    for(const stream of streams){if(stream&&stream.suspended)ensureServiceProviderReview(stream,null,'migration_existing_suspension');}
     loaded = true;
   }
 
@@ -7490,13 +7495,47 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const points=weight?total/weight:DEFAULT_SCORE_POINTS;
     return {points:Number(points.toFixed(2)),stars:Number((points/10).toFixed(1)),provisional:completed<5,completedBookings:completed,streamCount:ss.filter(s=>s.active!==false&&!s.suspended).length};
   }
-  function providerSuspended(phone){
-    const active=providerStreams(phone,{includeInactive:true}).filter(s=>s.active!==false&&!s.suspended&&streamScore(s).points>0);
-    return active.length===0;
+  function providerGateState(phone){
+    const all=providerStreams(phone,{includeInactive:true});
+    const activeHealthy=all.filter(s=>s.active!==false&&!s.suspended&&streamScore(s).points>0&&streamIdentityComplete(s));
+    if(activeHealthy.length)return {status:'ok',reason:'',healthyStreams:activeHealthy.length,totalStreams:all.length};
+    const activeIdentityMissing=all.filter(s=>s.active!==false&&!s.suspended&&streamScore(s).points>0&&!streamIdentityComplete(s));
+    if(activeIdentityMissing.length){
+      return {status:'setup_required',reason:'Complete the private staff identity for at least one active service stream before accepting bookings.',healthyStreams:0,totalStreams:all.length};
+    }
+    const resumableHealthy=all.filter(s=>s.active===false&&!s.suspended&&streamScore(s).points>0&&streamIdentityComplete(s));
+    if(resumableHealthy.length){
+      return {status:'no_active_streams',reason:'No service staff stream is active right now. Resume an available stream before accepting bookings.',healthyStreams:0,totalStreams:all.length};
+    }
+    const formallySuspended=all.filter(s=>s.suspended||streamScore(s).points<=0);
+    if(formallySuspended.length){
+      const reason=formallySuspended.map(s=>s.suspensionReason).filter(Boolean)[0]||'Service-provider privileges are suspended pending review.';
+      return {status:'suspended',reason,healthyStreams:0,totalStreams:all.length,suspendedStreamIds:formallySuspended.map(s=>s.id)};
+    }
+    return {status:'no_active_streams',reason:'No active service staff stream is currently available. Add or resume a staff stream.',healthyStreams:0,totalStreams:all.length};
   }
-  globalThis.__tpServiceProviderCanList = phone => providerSuspended(phone)
-    ? {ok:false,error:'Service-provider privileges are suspended because no active service stream has a reliability score above zero. Request an account review before taking new bookings.'}
-    : {ok:true};
+  function providerSuspended(phone){ return providerGateState(phone).status==='suspended'; }
+  function reviewOpenStatus(r){return ['system_suspension','appeal_submitted','under_review'].includes(lower(r&&r.status));}
+  function openReviewForStream(streamId){return reviews.find(r=>String(r.streamId||'')===String(streamId||'')&&reviewOpenStatus(r));}
+  function ensureServiceProviderReview(stream,booking,trigger){
+    if(!stream)return null;
+    let r=openReviewForStream(stream.id);
+    const score=streamScore(stream);
+    if(!r){
+      r={id:uuid(),providerPhone:stream.providerPhone,streamId:stream.id,streamName:stream.name||'Service stream',status:'system_suspension',trigger:trigger||'automatic_reliability_suspension',reason:stream.suspensionReason||'Reliability suspension threshold reached.',scorePoints:score.points,stars:score.stars,defaultCount:Number(stream.defaultCount||0),bookingId:booking&&booking.id||null,createdAt:nowIso(),updatedAt:nowIso(),history:[]};
+      reviews.push(r);
+    } else {
+      r.reason=stream.suspensionReason||r.reason;r.scorePoints=score.points;r.stars=score.stars;r.defaultCount=Number(stream.defaultCount||0);r.bookingId=booking&&booking.id||r.bookingId;r.updatedAt=nowIso();
+    }
+    r.history=Array.isArray(r.history)?r.history:[];
+    r.history.push({at:r.updatedAt,actor:'system',action:'suspension_recorded',reason:r.reason,bookingId:r.bookingId||null,scorePoints:r.scorePoints});
+    persist('review',r).catch(()=>{});
+    return r;
+  }
+  globalThis.__tpServiceProviderCanList = phone => {
+    const gate=providerGateState(phone);
+    return gate.status==='suspended' ? {ok:false,error:`Service-provider privileges are suspended: ${gate.reason} Request an account review before taking new bookings.`} : {ok:true};
+  };
   globalThis.__tpServiceReliabilityForProvider = providerReliability;
 
   const queueTime = b => Number.isFinite(Date.parse(b&&b.createdAt)) ? Date.parse(b.createdAt) : Number.MAX_SAFE_INTEGER;
@@ -7609,7 +7648,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const defaultsLast5=s.recentOutcomes.slice(-5).filter(x=>x.providerDefault).length;
     const defaultsLast10=s.recentOutcomes.filter(x=>x.providerDefault).length;
     s.warning=defaultsLast5>=2?'Repeated provider defaults require review.':'';
-    if(s.scorePoints<=0||defaultsLast10>=3){s.suspended=true;s.suspendedAt=nowIso();s.suspensionReason=s.scorePoints<=0?'Reliability score reached zero.':'Three serious provider defaults in the last ten scored bookings.';}
+    if(s.scorePoints<=0||defaultsLast10>=3){s.suspended=true;s.suspendedAt=s.suspendedAt||nowIso();s.suspensionReason=s.scorePoints<=0?'Reliability score reached zero.':'Three serious provider defaults in the last ten scored bookings.';ensureServiceProviderReview(s,b,'automatic_reliability_suspension');}
     s.updatedAt=nowIso();streamHistory(s).push({at:s.updatedAt,actor:'system',action:'reliability_scored',bookingId:b.id,delta:net,scoreBefore:before,scoreAfter:s.scorePoints});
     persist('stream',s).catch(()=>{});
     b.reliabilityAdjustment=net;b.reliabilityScoreBefore=before;b.reliabilityScoreAfter=s.scorePoints;b.reliabilityScoredAt=nowIso();
@@ -7623,7 +7662,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     s.recentOutcomes=Array.isArray(s.recentOutcomes)?s.recentOutcomes:[];s.recentOutcomes.push({bookingId:b.id,at:nowIso(),delta:-2,good:false,providerDefault:true});s.recentOutcomes=s.recentOutcomes.slice(-10);
     const defaultsLast5=s.recentOutcomes.slice(-5).filter(x=>x.providerDefault).length,defaultsLast10=s.recentOutcomes.filter(x=>x.providerDefault).length;
     if(defaultsLast5>=2)s.warning='Repeated provider defaults require review.';
-    if(s.scorePoints<=0||defaultsLast10>=3){s.suspended=true;s.suspendedAt=nowIso();s.suspensionReason=s.scorePoints<=0?'Reliability score reached zero.':'Three serious provider defaults in the last ten bookings.';}
+    if(s.scorePoints<=0||defaultsLast10>=3){s.suspended=true;s.suspendedAt=s.suspendedAt||nowIso();s.suspensionReason=s.scorePoints<=0?'Reliability score reached zero.':'Three serious provider defaults in the last ten bookings.';ensureServiceProviderReview(s,b,'automatic_reliability_suspension');}
     s.updatedAt=nowIso();streamHistory(s).push({at:s.updatedAt,actor:'system',action:'provider_default_penalty',bookingId:b.id,delta:-2,scoreBefore:before,scoreAfter:s.scorePoints});persist('stream',s).catch(()=>{});
     b.defaultPenaltyAppliedAt=nowIso();b.reliabilityAdjustment=-2;b.reliabilityScoreBefore=before;b.reliabilityScoreAfter=s.scorePoints;scoreEvent(b,'provider_default',-2,'Provider failed to start within the permitted grace period.');
   }
@@ -7694,10 +7733,10 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   function snapshot(item){
     if(!isService(item))return null;prune();const rec=availability.get(String(item.code||item.id))||{};const mode=availabilityMode(item);const eligible=eligibleStreams(item);const active=eligible.filter(s=>s.active!==false&&!s.suspended&&streamScore(s).points>0);
     const now=nowIso();const freeNow=active.filter(s=>streamCanTake(s,now,serviceHours(item),Number(item.turnaroundMinutes||0),null).ok);
-    const liveValid=rec.liveUntil&&Date.parse(rec.liveUntil)>Date.now();let status=mode;
-    if(providerSuspended(item.sellerPhone))status='suspended';else if(rec.paused)status='paused';else if(mode==='instant'&&!liveValid)status='offline';else if(mode==='instant'&&freeNow.length)status='live_green';else if(mode==='instant'&&active.length)status='live_amber';
+    const liveValid=rec.liveUntil&&Date.parse(rec.liveUntil)>Date.now();let status=mode;const gate=providerGateState(item.sellerPhone);
+    if(gate.status==='suspended')status='suspended';else if(gate.status==='setup_required')status='setup_required';else if(gate.status==='no_active_streams')status='no_active_streams';else if(rec.paused)status='paused';else if(mode==='instant'&&!liveValid)status='offline';else if(mode==='instant'&&freeNow.length)status='live_green';else if(mode==='instant'&&active.length)status='live_amber';
     const rel=providerReliability(item.sellerPhone);const capacityUsed=eligible.reduce((sum,s)=>sum+committedForStream(s.id).length,0),capacityLimit=Math.max(1,eligible.length)*MAX_ACTIVE_PER_STREAM;
-    return {mode,status,capacityUsed,capacityLimit,remainingSlots:Math.max(0,capacityLimit-capacityUsed),itemBookings:committedForItem(item.code||item.id).length,liveUntil:liveValid?rec.liveUntil:null,paused:!!rec.paused,
+    return {mode,status,statusReason:gate.reason||'',capacityUsed,capacityLimit,remainingSlots:Math.max(0,capacityLimit-capacityUsed),itemBookings:committedForItem(item.code||item.id).length,liveUntil:liveValid?rec.liveUntil:null,paused:!!rec.paused,
       pendingEnquiries:pendingQueue(item.sellerPhone).length,eligibleStreams:eligible.length,availableStreamsNow:freeNow.length,providerKind:providerKind(item.sellerPhone),
       reliabilityPoints:rel.points,reliabilityStars:rel.stars,reliabilityProvisional:rel.provisional,completedServices:rel.completedBookings,updatedAt:rec.updatedAt||null};
   }
@@ -7734,9 +7773,45 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const s={id:uuid(),providerPhone:phone,name,roleLabel:roleLabel||'Service professional',avatarUrl,staffPhone,staffIdentityKey:staffIdentityKey(staffPhone),active:true,suspended:false,concurrentCapacity:Math.max(1,Math.min(20,Number(req.body&&req.body.concurrentCapacity||1))),scorePoints:DEFAULT_SCORE_POINTS,completedBookings:0,defaultCount:0,recentOutcomes:[],createdAt:nowIso(),updatedAt:nowIso(),isDefault:false,history:[{at:nowIso(),actor:phone,action:'stream_created'}]};streams.push(s);await persist('stream',s);logAudit(req,'service_stream_created',{streamId:s.id,name:s.name,identity:'private_mobile_verified'});const score=streamScore(s);res.status(201).json({ok:true,stream:{...s,staffPhone:undefined,staffIdentityKey:undefined,staffPhoneMasked:maskStaffPhone(s.staffPhone),identityComplete:true,...score}});});
   app.post('/api/services/streams/:id',requireAuth,async(req,res)=>{await load().catch(()=>{});const s=streamById(req.params.id);if(!s)return res.status(404).json({error:'Service stream not found.'});if(req.user.role!=='admin'&&String(s.providerPhone)!==String(req.user.phone))return res.status(403).json({error:'Not allowed.'});const action=lower(req.body&&req.body.action);if(action==='pause')s.active=false;else if(action==='resume'){if(s.suspended)return res.status(409).json({error:'This stream is suspended and requires review before it can resume.'});s.active=true;}else if(action==='update'){if(req.body.name)s.name=clean(req.body.name,80);if(req.body.roleLabel)s.roleLabel=clean(req.body.roleLabel,100);if(req.body.concurrentCapacity!=null)s.concurrentCapacity=Math.max(1,Math.min(20,Number(req.body.concurrentCapacity||1)));if(req.body.staffPhone!=null){const nextPhone=normalizeStaffPhone(req.body.staffPhone);if(!nextPhone)return res.status(400).json({error:'Enter a valid 10-digit staff mobile number.'});const current=normalizeStaffPhone(s.staffPhone);if(current&&current!==nextPhone&&req.user.role!=='admin')return res.status(409).json({error:'A staff identity number is locked once set. Pause this stream and contact Admin if the staff identity must be corrected.'});const duplicate=duplicateStaffStream(s.providerPhone,nextPhone,s.id);if(duplicate)return res.status(409).json({error:`That staff mobile number is already attached to ${duplicate.name}. One staff member cannot own multiple independent streams.`,existingStreamId:duplicate.id});s.staffPhone=nextPhone;s.staffIdentityKey=staffIdentityKey(nextPhone);}}else return res.status(400).json({error:'Choose pause, resume or update.'});s.updatedAt=nowIso();streamHistory(s).push({at:s.updatedAt,actor:req.user.phone,action});await persist('stream',s);const score=streamScore(s);res.json({ok:true,stream:{...s,staffPhone:undefined,staffIdentityKey:undefined,staffPhoneMasked:maskStaffPhone(s.staffPhone),identityComplete:streamIdentityComplete(s),...score}});});
 
+
+  app.get('/api/admin/service-provider-reviews',requireAuth,async(req,res)=>{
+    await load().catch(()=>{});prune();
+    if(req.user.role!=='admin'&&!['compliance_agent','compliance_officer'].includes(String(req.user.role)))return res.status(403).json({error:'Admin or Compliance access required.'});
+    const rows=reviews.slice().sort((a,b)=>Date.parse(b.updatedAt||b.createdAt)-Date.parse(a.updatedAt||a.createdAt)).map(r=>{
+      const stream=streamById(r.streamId),profile=profileFor(r.providerPhone),score=stream?streamScore(stream):{points:r.scorePoints||0,stars:r.stars||0,provisional:true};
+      return {...r,providerName:profile.businessName||profile.displayName||r.providerPhone,scorePoints:score.points,stars:score.stars,streamSuspended:!!(stream&&stream.suspended),streamActive:!!(stream&&stream.active!==false)};
+    });
+    res.json({ok:true,reviews:rows,openCount:rows.filter(reviewOpenStatus).length});
+  });
+
+  app.post('/api/services/provider-review/appeal',requireAuth,async(req,res)=>{
+    await load().catch(()=>{});prune();
+    if(req.user.role!=='seller'&&req.user.role!=='admin')return res.status(403).json({error:'Service-provider access required.'});
+    const phone=String(req.user.phone),gate=providerGateState(phone);
+    if(gate.status!=='suspended')return res.status(409).json({error:'This service-provider account is not currently under a formal reliability suspension.'});
+    const note=clean(req.body&&req.body.note,800);if(note.length<10)return res.status(400).json({error:'Briefly explain why you are requesting a review (at least 10 characters).'});
+    const affected=providerStreams(phone,{includeInactive:true}).filter(s=>s.suspended||streamScore(s).points<=0);const out=[];
+    for(const stream of affected){const r=ensureServiceProviderReview(stream,null,'provider_appeal');r.status='appeal_submitted';r.appealNote=note;r.appealedAt=nowIso();r.updatedAt=r.appealedAt;r.history.push({at:r.updatedAt,actor:phone,action:'appeal_submitted',note});await persist('review',r);out.push(r);}
+    logAudit(req,'service_provider_review_requested',{providerPhone:phone,reviewIds:out.map(r=>r.id)});res.json({ok:true,reviews:out});
+  });
+
+  app.post('/api/admin/service-provider-reviews/:id/action',requireAuth,async(req,res)=>{
+    await load().catch(()=>{});if(req.user.role!=='admin')return res.status(403).json({error:'Admin access required.'});
+    const r=reviews.find(x=>String(x.id)===String(req.params.id));if(!r)return res.status(404).json({error:'Service-provider review not found.'});
+    const stream=streamById(r.streamId);if(!stream)return res.status(404).json({error:'The service stream linked to this review no longer exists.'});
+    const action=lower(req.body&&req.body.action),note=clean(req.body&&req.body.note,800);r.history=Array.isArray(r.history)?r.history:[];
+    if(action==='start_review'){r.status='under_review';r.reviewStartedAt=nowIso();}
+    else if(action==='reinstate'){
+      stream.suspended=false;stream.active=true;stream.suspensionReason='';stream.suspendedAt=null;if(streamScore(stream).points<=0)stream.scorePoints=10;stream.warning='Reinstated by Admin on probation.';stream.updatedAt=nowIso();streamHistory(stream).push({at:stream.updatedAt,actor:req.user.phone,action:'admin_reinstated',reviewId:r.id,note});await persist('stream',stream);r.status='resolved_reinstated';r.resolvedAt=nowIso();
+    } else if(action==='uphold'){
+      stream.suspended=true;stream.active=false;stream.suspensionReason=stream.suspensionReason||r.reason||'Reliability suspension upheld by Admin.';stream.updatedAt=nowIso();streamHistory(stream).push({at:stream.updatedAt,actor:req.user.phone,action:'admin_suspension_upheld',reviewId:r.id,note});await persist('stream',stream);r.status='resolved_upheld';r.resolvedAt=nowIso();
+    } else return res.status(400).json({error:'Choose start_review, reinstate or uphold.'});
+    r.adminNote=note||r.adminNote||'';r.updatedAt=nowIso();r.history.push({at:r.updatedAt,actor:req.user.phone,action,note});await persist('review',r);logAudit(req,'service_provider_review_action',{reviewId:r.id,providerPhone:r.providerPhone,streamId:r.streamId,action});res.json({ok:true,review:r,stream:{id:stream.id,name:stream.name,...streamScore(stream),suspended:!!stream.suspended,active:stream.active!==false}});
+  });
+
   app.get('/api/services/bookings',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();let mine;if(req.user.role==='admin')mine=bookings;else if(req.user.role==='seller'){const visible=new Set(pendingQueue(req.user.phone).slice(0,3).map(b=>String(b.id)));mine=bookings.filter(b=>String(b.providerPhone)===String(req.user.phone)&&(lower(b.status)!==PENDING||visible.has(String(b.id))));}else mine=bookings.filter(b=>String(b.buyerPhone)===String(req.user.phone));const output=mine.map(b=>{const s=streamById(b.streamId);const score=s?streamScore(s):null;const now=Date.now(),eligibleAt=Date.parse(b.completionEligibleAt||'');return{...b,queuePosition:lower(b.status)===PENDING?queuePosition(b):null,deliveryEligible:lower(b.status)==='in_progress'&&Number.isFinite(eligibleAt)&&now>=eligibleAt,stream:s?{id:s.id,name:s.name,roleLabel:s.roleLabel,avatarUrl:s.avatarUrl,stars:score.stars,scorePoints:score.points,provisional:score.provisional}:null};});const ordered=output.sort((a,b)=>{if(req.user.role==='seller'){const ap=lower(a.status)===PENDING,bp=lower(b.status)===PENDING;if(ap!==bp)return ap?-1:1;if(ap&&bp)return queueStableCompare(a,b);}return Date.parse(b.updatedAt||b.createdAt)-Date.parse(a.updatedAt||a.createdAt);});res.json({ok:true,bookings:ordered.slice(0,250)});});
 
-  app.post('/api/services/:itemCode/bookings',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();if(req.user.role!=='buyer'&&req.user.role!=='admin')return res.status(403).json({error:'Only buyers can request a service booking.'});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});const state=snapshot(item);if(['paused','offline','suspended'].includes(state.status))return res.status(409).json({error:state.status==='paused'?'This service is paused.':state.status==='suspended'?'This provider is not accepting new service bookings while their account is under review.':'This instant service is not live.'});const neededAt=normalizeServiceDate(req.body&&req.body.neededAt),location=clean(req.body&&req.body.location,180),scope=clean(req.body&&req.body.scope,600);if(!neededAt||!Number.isFinite(serviceDateMs(neededAt))||!location||scope.length<10)return res.status(400).json({error:'Required time, location and a clear service description are required.'});const b={id:uuid(),itemCode:String(item.code),itemTitle:item.title,buyerPhone:req.user.phone,providerPhone:item.sellerPhone,neededAt,location,scope,durationHours:serviceHours(item),turnaroundMinutes:Number(item.turnaroundMinutes||0),availabilityMode:availabilityMode(item),status:PENDING,queueSequence:nextProviderQueueSequence(item.sellerPhone),reservationExpiresAt:null,createdAt:nowIso(),updatedAt:nowIso(),reviewWindowStartedAt:null,responseDueAt:null,timedOutAt:null,proposedStartAt:null,agreedPrice:null,providerNote:'',streamId:null,streamName:null,history:[{at:nowIso(),actor:'buyer',action:'booking_requested'}]};saveRequestForBooking(b,item);bookings.push(b);await persist('booking',b);prune();logAudit(req,'service_booking_requested',{bookingId:b.id,itemCode:item.code,providerPhone:item.sellerPhone});b.queuePosition=queuePosition(b);res.status(201).json({ok:true,booking:b,availability:snapshot(item)});});
+  app.post('/api/services/:itemCode/bookings',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();if(req.user.role!=='buyer'&&req.user.role!=='admin')return res.status(403).json({error:'Only buyers can request a service booking.'});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});const state=snapshot(item);if(['paused','offline','suspended','setup_required','no_active_streams'].includes(state.status))return res.status(409).json({error:state.status==='paused'?'This service is paused.':state.status==='suspended'?'This provider is temporarily unavailable because service privileges are suspended.':state.status==='setup_required'?'This provider must complete staff/service-stream setup before taking bookings.':state.status==='no_active_streams'?'This provider currently has no active service staff available.':'This instant service is not live.'});const neededAt=normalizeServiceDate(req.body&&req.body.neededAt),location=clean(req.body&&req.body.location,180),scope=clean(req.body&&req.body.scope,600);if(!neededAt||!Number.isFinite(serviceDateMs(neededAt))||!location||scope.length<10)return res.status(400).json({error:'Required time, location and a clear service description are required.'});const b={id:uuid(),itemCode:String(item.code),itemTitle:item.title,buyerPhone:req.user.phone,providerPhone:item.sellerPhone,neededAt,location,scope,durationHours:serviceHours(item),turnaroundMinutes:Number(item.turnaroundMinutes||0),availabilityMode:availabilityMode(item),status:PENDING,queueSequence:nextProviderQueueSequence(item.sellerPhone),reservationExpiresAt:null,createdAt:nowIso(),updatedAt:nowIso(),reviewWindowStartedAt:null,responseDueAt:null,timedOutAt:null,proposedStartAt:null,agreedPrice:null,providerNote:'',streamId:null,streamName:null,history:[{at:nowIso(),actor:'buyer',action:'booking_requested'}]};saveRequestForBooking(b,item);bookings.push(b);await persist('booking',b);prune();logAudit(req,'service_booking_requested',{bookingId:b.id,itemCode:item.code,providerPhone:item.sellerPhone});b.queuePosition=queuePosition(b);res.status(201).json({ok:true,booking:b,availability:snapshot(item)});});
 
   app.post('/api/services/bookings/:id/respond',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});const item=itemByCode(b.itemCode);if(String(req.user.phone)!==String(b.providerPhone)&&req.user.role!=='admin')return res.status(403).json({error:'Only the service provider can respond.'});if(lower(b.status)!==PENDING)return res.status(409).json({error:'This enquiry is no longer awaiting a provider response.'});if(queuePosition(b)>3)return res.status(409).json({error:'Only the first three enquiries in the provider queue can be reviewed.'});const action=lower(req.body&&req.body.action),note=clean(req.body&&req.body.note,300);if(action==='decline'){if(note.length<3)return res.status(400).json({error:'Enter a clear reason for declining.'});b.status='declined';b.providerNote=note;updateLinkedRequest(b,'decline');}else if(action==='accept'||action==='revise'){const startAt=normalizeServiceDate(req.body&&req.body.proposedStartAt),price=Number(req.body&&req.body.agreedPrice);if(!startAt||!Number.isFinite(serviceDateMs(startAt))||serviceDateMs(startAt)<=Date.now())return res.status(400).json({error:'Choose a valid future service date and time.'});if(!Number.isFinite(price)||price<=0)return res.status(400).json({error:'Enter a valid service price greater than zero.'});if(note.length<3)return res.status(400).json({error:'Enter a short message for the potential client.'});b.proposedStartAt=startAt;b.agreedPrice=price;b.providerNote=note;const proposedDuration=Number(req.body&&req.body.durationHours||b.durationHours||serviceHours(item));if(!Number.isFinite(proposedDuration)||proposedDuration<.25||proposedDuration>720)return res.status(400).json({error:'Enter a valid estimated service duration.'});b.durationHours=proposedDuration;const chosen=selectStreamForBooking(item,b,clean(req.body&&req.body.streamId,120));if(chosen.error)return res.status(409).json({error:chosen.error});b.streamId=chosen.stream.id;b.streamName=chosen.stream.name;b.status='awaiting_buyer';b.reservationExpiresAt=null;updateLinkedRequest(b,'proposal');}else return res.status(400).json({error:'Choose accept, revise or decline.'});b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'provider',action,note:b.providerNote,streamId:b.streamId||null});await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(item)});});
 
