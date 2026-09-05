@@ -4604,32 +4604,61 @@ app.post("/api/transactions/:id/dispute/upload", requireAuth, (req, res) => {
   });
 });
 
-// Seller updates live GPS location for a transaction
+// Live GPS for product delivery and provider-to-client service travel.
+// Precise GPS is intentionally NOT used for remote/online services, and it is
+// not needed when the client travels to a fixed provider location.
 app.post("/api/transactions/:id/location", requireAuth, (req, res) => {
   const id = req.params.id;
   const tx = transactions.find((t) => t.id === id);
   if (!tx) return res.status(404).json({ error: "Transaction not found" });
 
-  const isSeller =
-    req.user.phone === tx.toPhone && req.user.role === "seller";
   const isAdmin = req.user.role === "admin";
+  const isServiceTx = !!(tx.serviceBookingId || tx.deliveryMethod === "service_fulfilment" || (tx.itemSnapshot && String(tx.itemSnapshot.listingType || "").toLowerCase() === "service"));
+  const isProvider = req.user.phone === tx.toPhone && (isProviderRole(req.user.role) || String(req.user.accountRole || "").toLowerCase() === "service_provider");
+  const isSeller = req.user.phone === tx.toPhone && req.user.role === "seller";
+  const body = req.body || {};
 
-  if (!isSeller && !isAdmin) {
-    return res.status(403).json({
-      error: "Only the seller can send live location for this transaction.",
-    });
+  if (isServiceTx) {
+    if (!isProvider && !isAdmin) return res.status(403).json({ error: "Only the assigned service provider can share travel location for this service." });
+    const method = String(tx.serviceFulfilmentMethod || (tx.serviceAgreement && tx.serviceAgreement.fulfilmentMethod) || "").toLowerCase();
+    if (method !== "provider_to_client") return res.status(409).json({ error: method === "remote" ? "GPS is not used for remote/online services." : "Live GPS is only used when the service provider is travelling to the client." });
+
+    if (body.stop === true) {
+      tx.liveLocation = null;
+      tx.liveLocationStoppedAt = nowIso();
+      if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
+      return res.json({ ok: true, liveLocation: null });
+    }
+
+    if (String(tx.paymentStatus || "").toLowerCase() !== "paid") return res.status(409).json({ error: "Trip GPS becomes available after protected payment is confirmed." });
+    const serviceState = String(tx.serviceFulfilmentStatus || "").toLowerCase();
+    if (!["booked", "awaiting_client_start", "awaiting_provider_start"].includes(serviceState)) return res.status(409).json({ error: "Trip GPS is available only before the service itself starts." });
+    if (tx.disputeActive) return res.status(409).json({ error: "Location sharing is paused while this service issue is under review." });
+  } else {
+    if (!isSeller && !isAdmin) return res.status(403).json({ error: "Only the seller can send live location for this transaction." });
+    if (body.stop === true) {
+      tx.liveLocation = null;
+      tx.liveLocationStoppedAt = nowIso();
+      if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
+      return res.json({ ok: true, liveLocation: null });
+    }
   }
 
-  const { lat, lng } = req.body || {};
-  if (lat == null || lng == null) {
-    return res.status(400).json({ error: "Missing lat or lng" });
-  }
+  const lat = Number(body.lat);
+  const lng = Number(body.lng);
+  const accuracy = body.accuracy == null ? null : Number(body.accuracy);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) return res.status(400).json({ error: "Invalid GPS coordinates" });
 
   tx.liveLocation = {
     lat,
     lng,
+    accuracy: Number.isFinite(accuracy) ? Math.max(0, Math.round(accuracy)) : null,
     updatedAt: nowIso(),
+    sharedBy: isServiceTx ? "service_provider" : "seller",
+    purpose: isServiceTx ? "service_travel" : "product_delivery",
   };
+  tx.liveLocationStartedAt = tx.liveLocationStartedAt || tx.liveLocation.updatedAt;
+  if (dbEnabled()) dbUpsertTransaction(tx).catch(() => {});
 
   res.json({ ok: true, liveLocation: tx.liveLocation });
 });
@@ -7866,7 +7895,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   function updateLinkedRequest(b,action){const rq=(requests||[]).find(x=>String(x.id)===String(b.requestId));if(!rq)return;if(action==='decline'){rq.status='declined';rq.repliedAt=nowIso();rq.reply={itemCode:rq.itemCode,availability:'service_enquiry_declined',preOrderNote:b.providerNote||'',message:b.providerNote?`Service provider declined the enquiry: ${b.providerNote}`:'The service provider declined this enquiry.'};}
     else if(action==='timeout'){rq.status='timed_out';rq.repliedAt=nowIso();rq.reply=null;rq.serviceWorkflowStatus='timed_out';rq.serviceQueuePosition=null;}
     else if(action==='proposal'){const p=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);rq.status='open';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_terms_proposed',requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||b.neededAt,preOrderDate:b.proposedStartAt||b.neededAt,startAdjustmentMinutes:p.adjustmentMinutes,startAdjustmentLimitMinutes:p.maxAdjustmentMinutes,requestedDurationMinutes:p.baselineDurationMinutes,preOrderNote:b.providerNote||'',collectionPoint:b.location||'',message:p.adjustmentMinutes===0?'The service provider accepted your requested start time and proposed the remaining service terms. Review and accept or decline them.':`The service provider proposed a start-time adjustment of ${Math.abs(p.adjustmentMinutes)} minute(s) ${p.adjustmentMinutes<0?'earlier':'later'}, within the ${p.maxAdjustmentMinutes}-minute policy limit. Review the updated start time before accepting.`};rq.notesThread=Array.isArray(rq.notesThread)?rq.notesThread:[];rq.notesThread.push({id:uuid(),actor:'service_provider',phone:b.providerPhone,text:b.providerNote||'Service terms proposed.',at:rq.repliedAt,kind:'service_terms_proposed'});}
-    else if(action==='accept'){const p=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);rq.status='answered';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_agreement_awaiting_payment',requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||b.neededAt,agreedStartAt:b.proposedStartAt||b.neededAt,preOrderDate:b.proposedStartAt||b.neededAt,startAdjustmentMinutes:p.adjustmentMinutes,startAdjustmentLimitMinutes:p.maxAdjustmentMinutes,requestedDurationMinutes:p.baselineDurationMinutes,preOrderNote:b.providerNote||'',collectionPoint:b.fulfilmentLocation||b.location||'',serviceFulfilmentMethod:b.fulfilmentMethod||null,serviceFulfilmentLocation:b.fulfilmentLocation||null,message:`Service terms agreed. The agreed start time is the provider proposal shown above. Fulfilment: ${b.fulfilmentMethod||'not selected'}. Complete protected payment to confirm the booking.`};}if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});}
+    else if(action==='accept'){const p=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);rq.status='answered';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_agreement_awaiting_payment',requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||b.neededAt,agreedStartAt:b.proposedStartAt||b.neededAt,preOrderDate:b.proposedStartAt||b.neededAt,startAdjustmentMinutes:p.adjustmentMinutes,startAdjustmentLimitMinutes:p.maxAdjustmentMinutes,requestedDurationMinutes:p.baselineDurationMinutes,preOrderNote:b.providerNote||'',collectionPoint:b.fulfilmentLocation||b.location||'',serviceFulfilmentMethod:b.fulfilmentMethod||null,serviceFulfilmentLocation:b.fulfilmentLocation||null,message:`Service terms agreed. The agreed start time is the provider proposal shown above. The agreed service delivery type is recorded with this booking. Complete protected payment to confirm the booking.`};}if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});}
 
   app.get('/api/services/:itemCode/availability',async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});res.json({ok:true,itemCode:String(item.code),availability:snapshot(item)});});
   app.post('/api/services/:itemCode/availability',requireAuth,async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});if(!providerOwns(req,item)&&req.user.role!=='admin')return res.status(403).json({error:'Only this service provider can change availability.'});const action=lower(req.body&&req.body.action),mode=availabilityMode(item),rec=availability.get(String(item.code))||{id:`service-availability:${item.code}`,itemCode:String(item.code),providerPhone:item.sellerPhone};if(action==='pause'){rec.paused=true;rec.liveUntil=null;}else if(action==='go_live'){if(mode!=='instant')return res.status(400).json({error:'Go live is only available for services lasting 15 minutes–5 hours.'});const hours=[1,2,4,8].includes(Number(req.body.liveHours))?Number(req.body.liveHours):2;rec.paused=false;rec.liveUntil=iso(Date.now()+hours*3600000);}else if(action==='resume')rec.paused=false;else return res.status(400).json({error:'Choose go_live, pause or resume.'});rec.updatedAt=nowIso();rec.updatedBy=req.user.phone;availability.set(String(item.code),rec);await persist('availability',rec);logAudit(req,'service_availability_updated',{itemCode:item.code,action,status:snapshot(item).status});res.json({ok:true,availability:snapshot(item)});});
@@ -7931,7 +7960,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if(action==='client_ready'){
       if(!isBuyer&&!isAdmin)return res.status(403).json({error:'Only the client can confirm readiness.'});if(st!=='awaiting_client_start')return res.status(409).json({error:st==='booked'?'The agreed service start time has not arrived yet.':'This booking is not awaiting client readiness.'});const scheduled=serviceDateMs(b.proposedStartAt||b.neededAt||'');if(!Number.isFinite(scheduled)||Date.now()+5000<scheduled)return res.status(409).json({error:'The agreed service start time has not arrived yet.'});b.clientReadyAt=nowIso();const baseline=Math.max(scheduled,Date.parse(b.clientReadyAt));b.providerStartDeadline=iso(baseline+startGraceMs(b));b.status='awaiting_provider_start';bookingHistory(b).push({at:b.clientReadyAt,actor:'buyer',action:'client_ready'});
     } else if(action==='provider_start'){
-      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the assigned service provider can start service delivery.'});if(st!=='awaiting_provider_start')return res.status(409).json({error:'The client must first confirm that the service can start.'});if(b.providerStartDeadline&&Date.now()>Date.parse(b.providerStartDeadline))return res.status(409).json({error:'The provider start window has already defaulted. This booking requires review.'});b.actualStartedAt=nowIso();b.expectedCompletionAt=iso(Date.parse(b.actualStartedAt)+bookingDurationMs(b));b.completionEligibleAt=iso(Date.parse(b.actualStartedAt)+bookingDurationMs(b)*.70);b.status='in_progress';bookingHistory(b).push({at:b.actualStartedAt,actor:'provider',action:'service_started'});
+      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the assigned service provider can start service delivery.'});if(st!=='awaiting_provider_start')return res.status(409).json({error:'The client must first confirm that the service can start.'});if(b.providerStartDeadline&&Date.now()>Date.parse(b.providerStartDeadline))return res.status(409).json({error:'The provider start window has already defaulted. This booking requires review.'});b.actualStartedAt=nowIso();b.expectedCompletionAt=iso(Date.parse(b.actualStartedAt)+bookingDurationMs(b));b.completionEligibleAt=iso(Date.parse(b.actualStartedAt)+bookingDurationMs(b)*.70);b.status='in_progress';if(tx){tx.liveLocation=null;tx.liveLocationStoppedAt=b.actualStartedAt;}bookingHistory(b).push({at:b.actualStartedAt,actor:'provider',action:'service_started'});
     } else if(action==='provider_delivered'){
       if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the assigned service provider can mark the service delivered.'});if(st!=='in_progress')return res.status(409).json({error:'Service delivery has not been started.'});if(!b.completionEligibleAt||Date.now()<Date.parse(b.completionEligibleAt))return res.status(409).json({error:'Service delivered can be confirmed only after at least 70% of the estimated service duration has elapsed.'});b.providerDeliveredAt=nowIso();b.buyerReviewDueAt=iso(Date.now()+DELIVERY_REVIEW_MS);b.status='provider_delivered';bookingHistory(b).push({at:b.providerDeliveredAt,actor:'provider',action:'service_delivered'});
     } else if(action==='client_completed'){
