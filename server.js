@@ -3470,17 +3470,28 @@ const cache = new Map();
   const serviceCategories = new Set(["home_maintenance","professional_business","technology_digital","education_tutoring","events_creative","transport_delivery","personal_care_wellness","other_review_required"]);
   const serviceCategory = String(req.body.serviceCategory || "").trim().toLowerCase();
   const serviceText = `${title || ""} ${details || ""} ${serviceCategory}`.toLowerCase();
+  const serviceDeliveryMode = String(req.body.deliveryMode || "").trim().toLowerCase();
+  const serviceOperatingMode = String(req.body.operatingMode || "").trim().toLowerCase();
   const prohibited = ["gambling","betting","casino","alcohol","tobacco","nicotine","weapon","firearm","adult service","sexual service","illegal drug","fake document","document forgery","hack account"];
   if (listingType === "service") {
     if (!serviceCategories.has(serviceCategory)) return res.status(400).json({ error: "Select an approved service category." });
     if (prohibited.some((term) => serviceText.includes(term))) return res.status(400).json({ error: "This service is not permitted on TutoPay." });
-    if (!String(req.body.deliveryMode || "").trim()) return res.status(400).json({ error: "Select how the service will be delivered." });
-    if (!["stationary","mobile","stationary_mobile"].includes(String(req.body.operatingMode || "").trim())) return res.status(400).json({ error: "Select whether the provider is stationary or mobile." });
+    if (!["on_site","remote","provider_location","hybrid"].includes(serviceDeliveryMode)) return res.status(400).json({ error: "Select a valid service delivery method." });
+    if (!["stationary","mobile","stationary_mobile"].includes(serviceOperatingMode)) return res.status(400).json({ error: "Select whether the provider is stationary or mobile." });
+    if (serviceDeliveryMode === "on_site" && !["mobile","stationary_mobile"].includes(serviceOperatingMode)) return res.status(400).json({ error: "A service delivered at the client location requires a Mobile or Stationary & Mobile provider." });
+    if (serviceDeliveryMode === "provider_location" && !["stationary","stationary_mobile"].includes(serviceOperatingMode)) return res.status(400).json({ error: "A service delivered at the provider location requires a Stationary or Stationary & Mobile provider." });
     if (!["per_hour","per_day","per_completion"].includes(String(req.body.chargeBasis || "").trim())) return res.status(400).json({ error: "Select the service charge basis." });
     if (!["solid","discount","negotiable"].includes(String(req.body.rateFlexibility || "").trim())) return res.status(400).json({ error: "Select the service rate terms." });
     if (!String(req.body.serviceArea || "").trim()) return res.status(400).json({ error: "Enter the service location or coverage area." });
     if (!String(req.body.completionEvidence || "").trim()) return res.status(400).json({ error: "State how service completion will be evidenced." });
   }
+
+  const serviceEstimatedDurationMinutes = listingType === "service"
+    ? Math.max(15, Math.min(43200, Math.round(Number(req.body.estimatedDurationMinutes || (Number(req.body.estimatedDurationHours || 1) * 60)))))
+    : null;
+  const serviceAvailabilityMode = listingType === "service"
+    ? (serviceEstimatedDurationMinutes <= 300 ? "instant" : (serviceEstimatedDurationMinutes <= 1440 ? "time_bound" : "scheduled"))
+    : "";
 
   const item = {
     id: uuid(),
@@ -3499,19 +3510,19 @@ const cache = new Map();
     category: req.body && req.body.category ? String(req.body.category) : "",
     listingType,
     serviceCategory: listingType === "service" ? serviceCategory : "",
-    deliveryMode: listingType === "service" ? String(req.body.deliveryMode || "").trim() : "",
-    operatingMode: listingType === "service" ? String(req.body.operatingMode || "").trim() : "",
+    deliveryMode: listingType === "service" ? serviceDeliveryMode : "",
+    operatingMode: listingType === "service" ? serviceOperatingMode : "",
     chargeBasis: listingType === "service" ? String(req.body.chargeBasis || "").trim() : "",
     rateFlexibility: listingType === "service" ? String(req.body.rateFlexibility || "").trim() : "",
     serviceArea: listingType === "service" ? String(req.body.serviceArea || "").trim().slice(0, 160) : "",
     estimatedDuration: listingType === "service" ? String(req.body.estimatedDuration || "").trim().slice(0, 120) : "",
-    estimatedDurationMinutes: listingType === "service" ? Math.max(15, Math.min(43200, Math.round(Number(req.body.estimatedDurationMinutes || (Number(req.body.estimatedDurationHours || 1) * 60))))) : null,
-    estimatedDurationHours: listingType === "service" ? Math.max(.25, Math.min(720, Number(req.body.estimatedDurationMinutes ? Number(req.body.estimatedDurationMinutes) / 60 : (req.body.estimatedDurationHours || 1)))) : null,
-    availabilityMode: listingType === "service" ? String(req.body.availabilityMode || "").trim().toLowerCase() : "",
+    estimatedDurationMinutes: serviceEstimatedDurationMinutes,
+    estimatedDurationHours: listingType === "service" ? serviceEstimatedDurationMinutes / 60 : null,
+    availabilityMode: serviceAvailabilityMode,
     completionEvidence: listingType === "service" ? String(req.body.completionEvidence || "").trim().slice(0, 240) : "",
     turnaroundMinutes: listingType === "service" ? Math.max(0, Math.min(240, Number(req.body.turnaroundMinutes || 0))) : 0,
     serviceStreamIds: listingType === "service" ? [...new Set((Array.isArray(req.body.serviceStreamIds) ? req.body.serviceStreamIds : []).map(v => String(v || "").trim()).filter(Boolean))].slice(0, 30) : [],
-    servicePolicyVersion: listingType === "service" ? "2.3-duration-minutes" : null,
+    servicePolicyVersion: listingType === "service" ? "2.4-service-fulfilment" : null,
   };
 
   // v14.3.1: seller-controlled discount / negotiation rules; default is fixed price.
@@ -3623,6 +3634,7 @@ app.post("/api/transactions", requireAuth, idempotencyMiddleware, (req, res) => 
     deliveryMethod,
     deliveryPoint,
     serviceBookingId,
+    serviceFulfilmentMethod,
   } = req.body || {};
 
   if (req.user.role !== "buyer" && req.user.role !== "admin") {
@@ -3637,14 +3649,19 @@ app.post("/api/transactions", requireAuth, idempotencyMiddleware, (req, res) => 
     });
   }
 
-  if (!fromPhone || !toPhone || !itemCode || !amount || !deliveryMethod) {
+  if (!fromPhone || !toPhone || !itemCode || !amount) {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
   const itemCodeStr = String(itemCode || "").trim();
-const item = findItem(itemCodeStr);
+  const item = findItem(itemCodeStr);
   if (item) migrateItemImagesInPlace(item);
-const priceNum = Number(amount);
+  const isServiceItem = !!(item && String(item.listingType || "").toLowerCase() === "service");
+  if (!isServiceItem && !deliveryMethod) return res.status(400).json({ error: "Choose the product collection/delivery method." });
+  if (isServiceItem && !String(serviceBookingId || "").trim()) {
+    return res.status(409).json({ error: "A service payment must come from an agreed service booking. Reopen Requests & Replies and choose Proceed to escrow." });
+  }
+  const priceNum = Number(amount);
   if (Number.isNaN(priceNum) || priceNum <= 0) {
     return res.status(400).json({ error: "Invalid amount" });
   }
@@ -3682,8 +3699,9 @@ const priceNum = Number(amount);
   // 🔹🔹 END KYC ENFORCEMENT 🔹🔹
 
   const now = new Date();
-const holdDurationHours =
-  item && item.holdHours != null ? Number(item.holdHours) : 24;
+const holdDurationHours = isServiceItem
+  ? null
+  : (item && item.holdHours != null ? Number(item.holdHours) : 24);
 
 // Hold countdown starts when seller confirms "Hold item"
 const holdExpiresAt = null;
@@ -3694,8 +3712,8 @@ const tx = {
     toPhone,
   itemCode: itemCodeStr,
     amount: priceNum,
-    deliveryMethod, // 'self_collect' or 'seller_delivery'
-    deliveryPoint: deliveryPoint || "",
+    deliveryMethod: isServiceItem ? "service_fulfilment" : deliveryMethod,
+    deliveryPoint: isServiceItem ? "" : (deliveryPoint || ""),
     liveLocation: null, // { lat, lng, updatedAt }
     status: "pending_payment",
     createdAt: nowIso(),
@@ -3713,19 +3731,27 @@ const tx = {
     dispute: null,
     disputeDocs: [],
     requestedServiceBookingId: String(serviceBookingId || "").trim() || null,
+    requestedServiceFulfilmentMethod: String(serviceFulfilmentMethod || "").trim().toLowerCase() || null,
     itemSnapshot: item
       ? {
           code: item.code,
           title: item.title,
           details: item.details || "",
           price: item.price,
-          holdHours: item.holdHours,
+          holdHours: isServiceItem ? null : item.holdHours,
           imageUrl: item.imageUrl || "",
           imageUrls: Array.isArray(item.imageUrls)
             ? item.imageUrls
             : item.imageUrl
             ? [item.imageUrl]
             : [],
+          listingType: item.listingType || "product",
+          serviceCategory: item.serviceCategory || "",
+          deliveryMode: item.deliveryMode || "",
+          operatingMode: item.operatingMode || "",
+          serviceArea: item.serviceArea || "",
+          estimatedDurationMinutes: item.estimatedDurationMinutes || null,
+          availabilityMode: item.availabilityMode || "",
         }
       : null,
   };
@@ -7413,7 +7439,23 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   };
   const serviceHours = item => serviceMinutes(item) / 60;
   const modeForMinutes = minutes => minutes <= 300 ? 'instant' : (minutes <= 1440 ? 'time_bound' : 'scheduled');
-  const availabilityMode = item => lower(item && item.availabilityMode) || modeForMinutes(serviceMinutes(item));
+  const availabilityMode = item => modeForMinutes(serviceMinutes(item));
+  function serviceFulfilmentCapabilities(item){
+    if(!isService(item)) return [];
+    const delivery=lower(item.deliveryMode), operating=lower(item.operatingMode), out=[];
+    const mobile=['mobile','stationary_mobile'].includes(operating);
+    const stationary=['stationary','stationary_mobile'].includes(operating);
+    if(delivery==='remote') out.push('remote');
+    if(delivery==='on_site' && mobile) out.push('provider_to_client');
+    if(delivery==='provider_location' && stationary) out.push('client_to_provider');
+    if(delivery==='hybrid'){
+      if(mobile) out.push('provider_to_client');
+      if(stationary) out.push('client_to_provider');
+    }
+    return [...new Set(out)];
+  }
+  const fulfilmentLocationFor=(item,b,method)=> method==='provider_to_client' ? String(b&&b.location||'') : method==='client_to_provider' ? String(item&&item.serviceArea||'') : method==='remote' ? 'Remote / online' : '';
+  globalThis.__tpServiceFulfilmentCapabilitiesForItem = item => serviceFulfilmentCapabilities(item);
   const providerOwns = (req,item) => item && String(item.sellerPhone) === String(req.user.phone) && (req.user.role === 'seller' || req.user.accountRole === 'service_provider');
   const bookingHistory = b => Array.isArray(b.history) ? b.history : (b.history=[]);
   const streamHistory = s => Array.isArray(s.history) ? s.history : (s.history=[]);
@@ -7568,6 +7610,33 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   }
   function bookingDurationMinutes(b){const direct=Number(b&&b.durationMinutes);if(Number.isFinite(direct)&&direct>=15)return Math.max(15,Math.min(43200,Math.round(direct)));const hours=Number(b&&b.durationHours);return Number.isFinite(hours)&&hours>0?Math.max(15,Math.min(43200,Math.round(hours*60))):60;}
   function bookingDurationMs(b){return bookingDurationMinutes(b)*60000;}
+  function requestedBookingDurationMinutes(b){
+    const direct=Number(b&&b.requestedDurationMinutes);
+    if(Number.isFinite(direct)&&direct>=15)return Math.max(15,Math.min(43200,Math.round(direct)));
+    const rq=(requests||[]).find(x=>String(x.id||'')===String(b&&b.requestId||''));
+    const fromRequest=Number(rq&&rq.serviceRequest&&rq.serviceRequest.requestedDurationMinutes||rq&&rq.itemSnapshot&&rq.itemSnapshot.estimatedDurationMinutes||rq&&rq.serviceRequest&&rq.serviceRequest.durationMinutes);
+    if(Number.isFinite(fromRequest)&&fromRequest>=15)return Math.max(15,Math.min(43200,Math.round(fromRequest)));
+    const item=itemByCode(b&&b.itemCode);
+    return Math.max(15,Math.min(43200,Math.round(serviceMinutes(item)||bookingDurationMinutes(b)||60)));
+  }
+  function initialStartAdjustmentPolicy(b,startAt){
+    const requestedMs=serviceDateMs(b&&b.neededAt||'');
+    const proposedMs=serviceDateMs(startAt||b&&b.proposedStartAt||b&&b.neededAt||'');
+    const baselineDurationMinutes=requestedBookingDurationMinutes(b);
+    const maxAdjustmentMinutes=Math.max(1,Math.min(60,Math.floor(baselineDurationMinutes*.20)));
+    const limitMs=maxAdjustmentMinutes*60000;
+    const adjustmentMinutes=Number.isFinite(requestedMs)&&Number.isFinite(proposedMs)?Math.round((proposedMs-requestedMs)/60000):null;
+    return {
+      requestedStartAt:b&&b.neededAt||null,
+      proposedStartAt:startAt||b&&b.proposedStartAt||null,
+      baselineDurationMinutes,
+      maxAdjustmentMinutes,
+      adjustmentMinutes,
+      minStartAt:Number.isFinite(requestedMs)?iso(requestedMs-limitMs):null,
+      maxStartAt:Number.isFinite(requestedMs)?iso(requestedMs+limitMs):null,
+      withinLimit:Number.isFinite(requestedMs)&&Number.isFinite(proposedMs)?Math.abs(proposedMs-requestedMs)<=limitMs+1000:false
+    };
+  }
   function bookingEndMs(b){
     const start=bookingStartMs(b); if(!Number.isFinite(start)) return NaN;
     const st=lower(b.status), turnaround=Math.max(0,Number(b.turnaroundMinutes||0))*60000;
@@ -7685,6 +7754,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     const tx=txFor(b);if(!tx)return null;
     tx.serviceBookingId=b.id;tx.serviceFulfilmentStatus=lower(b.status);tx.serviceStreamId=b.streamId||null;tx.serviceStreamName=b.streamName||null;
     tx.serviceStartAt=b.proposedStartAt||b.neededAt||null;tx.serviceDurationMinutes=bookingDurationMinutes(b);tx.serviceDurationHours=bookingDurationMinutes(b)/60;tx.serviceTurnaroundMinutes=Math.max(0,Number(b.turnaroundMinutes||0));
+    tx.serviceAvailabilityMode=b.availabilityMode||modeForMinutes(bookingDurationMinutes(b));tx.serviceFulfilmentMethod=b.fulfilmentMethod||null;tx.serviceFulfilmentLocation=b.fulfilmentLocation||null;tx.serviceFulfilmentSelectedBy=b.fulfilmentSelectedBy||null;tx.serviceFulfilmentAgreedAt=b.fulfilmentAgreedAt||null;
     tx.serviceClientReadyAt=b.clientReadyAt||null;tx.serviceProviderStartDeadline=b.providerStartDeadline||null;tx.serviceStartedAt=b.actualStartedAt||null;
     tx.serviceExpectedCompletionAt=b.expectedCompletionAt||null;tx.serviceCompletionEligibleAt=b.completionEligibleAt||null;tx.serviceProviderDeliveredAt=b.providerDeliveredAt||null;
     tx.serviceBuyerReviewDueAt=b.buyerReviewDueAt||null;tx.serviceClientCompletedAt=b.clientCompletedAt||null;tx.serviceClientRatingSubmittedAt=b.clientRatingSubmittedAt||null;
@@ -7710,7 +7780,19 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     if(b.serviceStartedAt&&!b.actualStartedAt){b.actualStartedAt=b.serviceStartedAt;changed=true;}
     if(!b.durationMinutes){b.durationMinutes=Math.max(15,Math.round(Number(b.durationHours||serviceHours(itemByCode(b.itemCode))||1)*60));changed=true;}
     if(!b.durationHours){b.durationHours=b.durationMinutes/60;changed=true;}
+    if(!b.requestedDurationMinutes){b.requestedDurationMinutes=requestedBookingDurationMinutes(b);changed=true;}
+    if(b.proposedStartAt){
+      const p=initialStartAdjustmentPolicy(b,b.proposedStartAt);
+      if(b.startAdjustmentMinutes!==p.adjustmentMinutes){b.startAdjustmentMinutes=p.adjustmentMinutes;changed=true;}
+      if(b.startAdjustmentLimitMinutes!==p.maxAdjustmentMinutes){b.startAdjustmentLimitMinutes=p.maxAdjustmentMinutes;changed=true;}
+    }
     if(!b.turnaroundMinutes)b.turnaroundMinutes=Number(itemByCode(b.itemCode)?.turnaroundMinutes||0);
+    const fulfilmentItem=itemByCode(b.itemCode);const allowed=serviceFulfilmentCapabilities(fulfilmentItem);
+    if(!Array.isArray(b.allowedFulfilmentMethods)||JSON.stringify(b.allowedFulfilmentMethods)!==JSON.stringify(allowed)){b.allowedFulfilmentMethods=allowed;changed=true;}
+    if(!b.availabilityMode){b.availabilityMode=availabilityMode(fulfilmentItem);changed=true;}
+    if(b.fulfilmentMethod&&!allowed.includes(lower(b.fulfilmentMethod))){b.fulfilmentMethod=null;b.fulfilmentLocation=null;b.fulfilmentSelectedBy=null;b.fulfilmentAgreedAt=null;changed=true;}
+    if(!b.fulfilmentMethod&&allowed.length===1){b.fulfilmentMethod=allowed[0];b.fulfilmentSelectedBy='system';b.fulfilmentAgreedAt=b.fulfilmentAgreedAt||b.agreedAt||nowIso();b.fulfilmentLocation=fulfilmentLocationFor(fulfilmentItem,b,b.fulfilmentMethod);changed=true;}
+    if(b.fulfilmentMethod&&!b.fulfilmentLocation){b.fulfilmentLocation=fulfilmentLocationFor(fulfilmentItem,b,b.fulfilmentMethod);changed=true;}
     if(!b.streamId){const d=ensureDefaultStream(b.providerPhone);b.streamId=d.id;b.streamName=d.name;changed=true;}
     if(changed){syncTx(b);persist('booking',b).catch(()=>{});}
   }
@@ -7760,24 +7842,31 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   globalThis.__tpServiceMarkReleased=(tx,at)=>{const b=bookings.find(x=>String(x.id)===String(tx&&tx.serviceBookingId||''));if(!b)return; b.status='completed';b.settledAt=at||nowIso();b.updatedAt=b.settledAt;bookingHistory(b).push({at:b.updatedAt,actor:'system',action:'buyer_release_confirmed'});tx.serviceFulfilmentStatus='completed';tx.serviceSettledAt=b.settledAt;persist('booking',b).catch(()=>{});};
   globalThis.__tpServicePaymentGate=(tx)=>{if(!tx||!tx.serviceBookingId)return{ok:true};prune();if(String(tx.paymentStatus||'').toLowerCase()==='paid')return{ok:true};const b=bookings.find(x=>String(x.id)===String(tx.serviceBookingId));if(!b)return{ok:false,error:'The service agreement linked to this payment could not be found.'};if(lower(b.status)!=='payment_pending'||String(b.transactionId||'')!==String(tx.id))return{ok:false,error:'This protected-payment window is no longer active. Reopen the agreed service request and start payment again.'};if(b.paymentDueAt&&Date.parse(b.paymentDueAt)<=Date.now())return{ok:false,error:'The protected-payment window expired. Reopen the agreed service request and start payment again.'};return{ok:true,paymentDueAt:b.paymentDueAt||null};};
 
-  globalThis.__tpFilterServiceRequestsForUser=(user,rows)=>{prune();const annotated=(rows||[]).map(rq=>{if(!rq.serviceBookingId)return rq;const b=bookings.find(x=>String(x.id)===String(rq.serviceBookingId));if(!b)return rq;rq.serviceWorkflowStatus=lower(b.status);rq.serviceQueuePosition=lower(b.status)===PENDING?queuePosition(b):null;rq.serviceResponseDueAt=b.responseDueAt||null;rq.serviceTimedOutAt=b.timedOutAt||null;rq.initialBuyerNote=rq.initialBuyerNote||b.scope||'';rq.serviceRequest=Object.assign({},rq.serviceRequest||{},{neededAt:b.neededAt,location:b.location,scope:b.scope,streamId:b.streamId||null,streamName:b.streamName||null});return rq;});
+  globalThis.__tpFilterServiceRequestsForUser=(user,rows)=>{prune();const annotated=(rows||[]).map(rq=>{if(!rq.serviceBookingId)return rq;const b=bookings.find(x=>String(x.id)===String(rq.serviceBookingId));if(!b)return rq;rq.serviceWorkflowStatus=lower(b.status);rq.serviceQueuePosition=lower(b.status)===PENDING?queuePosition(b):null;rq.serviceResponseDueAt=b.responseDueAt||null;rq.serviceTimedOutAt=b.timedOutAt||null;rq.initialBuyerNote=rq.initialBuyerNote||b.scope||'';const startPolicy=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);rq.serviceRequest=Object.assign({},rq.serviceRequest||{},{neededAt:b.neededAt,requestedStartAt:b.neededAt,proposedStartAt:b.proposedStartAt||null,agreedStartAt:b.agreedAt?(b.proposedStartAt||b.neededAt):null,startAdjustmentMinutes:b.proposedStartAt?startPolicy.adjustmentMinutes:null,startAdjustmentLimitMinutes:startPolicy.maxAdjustmentMinutes,requestedDurationMinutes:requestedBookingDurationMinutes(b),location:b.location,scope:b.scope,streamId:b.streamId||null,streamName:b.streamName||null,durationMinutes:bookingDurationMinutes(b),availabilityMode:b.availabilityMode||modeForMinutes(bookingDurationMinutes(b)),allowedFulfilmentMethods:Array.isArray(b.allowedFulfilmentMethods)?b.allowedFulfilmentMethods:serviceFulfilmentCapabilities(itemByCode(b.itemCode)),fulfilmentMethod:b.fulfilmentMethod||null,fulfilmentLocation:b.fulfilmentLocation||null,fulfilmentSelectedBy:b.fulfilmentSelectedBy||null,fulfilmentAgreedAt:b.fulfilmentAgreedAt||null});return rq;});
     if(!user||String(user.role)!=='seller')return annotated;const top=new Set(pendingQueue(user.phone).slice(0,3).map(b=>String(b.requestId||'')));return annotated.filter(rq=>{if(!rq.serviceBookingId)return true;const b=bookings.find(x=>String(x.id)===String(rq.serviceBookingId));return !b||lower(b.status)!==PENDING||top.has(String(rq.id));});};
 
   globalThis.__tpAttachServiceAgreementToTransaction=tx=>{prune();const explicitId=clean(tx.requestedServiceBookingId,120);let b=explicitId?bookings.find(x=>String(x.id)===explicitId):bookings.filter(x=>lower(x.status)==='agreement_ready'&&String(x.buyerPhone)===String(tx.fromPhone)&&String(x.providerPhone)===String(tx.toPhone)&&String(x.itemCode)===String(tx.itemCode)).sort((a,b)=>Date.parse(b.updatedAt||b.createdAt)-Date.parse(a.updatedAt||a.createdAt))[0];
     if(!b)return explicitId?{error:'The selected service agreement could not be found. Reopen Requests & Replies and select Proceed to escrow again.'}:null;if(lower(b.status)!=='agreement_ready')return{error:'This service enquiry is not an agreed, unpaid service agreement.'};
     if(String(b.buyerPhone)!==String(tx.fromPhone)||String(b.providerPhone)!==String(tx.toPhone)||String(b.itemCode)!==String(tx.itemCode))return{error:'The payment details do not match the selected service agreement.'};
     const item=itemByCode(b.itemCode);const chosen=selectStreamForBooking(item,b,b.streamId);if(chosen.error)return{error:chosen.error};b.streamId=chosen.stream.id;b.streamName=chosen.stream.name;
+    const allowed=serviceFulfilmentCapabilities(item);b.allowedFulfilmentMethods=allowed;const requestedMethod=lower(tx.requestedServiceFulfilmentMethod||'');
+    if(!b.fulfilmentMethod&&allowed.length===1){b.fulfilmentMethod=allowed[0];b.fulfilmentSelectedBy='system';b.fulfilmentAgreedAt=b.fulfilmentAgreedAt||b.agreedAt||nowIso();b.fulfilmentLocation=fulfilmentLocationFor(item,b,b.fulfilmentMethod);}
+    if(!b.fulfilmentMethod)return{error:'Choose and accept the service fulfilment method before starting protected payment.'};
+    if(!allowed.includes(lower(b.fulfilmentMethod)))return{error:'The agreed service fulfilment method is no longer permitted by this listing.'};
+    if(requestedMethod&&requestedMethod!==lower(b.fulfilmentMethod))return{error:'The payment fulfilment method does not match the agreed service terms. Reopen the service agreement.'};
+    b.fulfilmentLocation=b.fulfilmentLocation||fulfilmentLocationFor(item,b,b.fulfilmentMethod);
     const check=streamCanTake(chosen.stream,b.proposedStartAt||b.neededAt,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return{error:check.reason};
-    b.status='payment_pending';b.transactionId=tx.id;b.paymentStartedAt=nowIso();b.paymentDueAt=iso(Date.now()+PAYMENT_WINDOW_MS);b.reservationExpiresAt=null;b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'buyer',action:'protected_payment_created',transactionId:tx.id,paymentDueAt:b.paymentDueAt});
-    tx.serviceBookingId=b.id;tx.serviceFulfilmentStatus='payment_pending';tx.servicePaymentDueAt=b.paymentDueAt;tx.serviceStartAt=b.proposedStartAt||b.neededAt||null;tx.serviceDurationMinutes=bookingDurationMinutes(b);tx.serviceDurationHours=bookingDurationMinutes(b)/60;tx.serviceStreamId=b.streamId;tx.serviceStreamName=b.streamName;
-    tx.serviceAgreement={bookingId:b.id,requestedAt:b.createdAt||null,agreedAt:b.agreedAt||b.updatedAt||null,proposedStartAt:b.proposedStartAt||b.neededAt||null,durationMinutes:bookingDurationMinutes(b),durationHours:bookingDurationMinutes(b)/60,turnaroundMinutes:Number(b.turnaroundMinutes||0),streamId:b.streamId,streamName:b.streamName,location:b.location||'',scope:b.scope||'',providerNote:b.providerNote||''};delete tx.requestedServiceBookingId;persist('booking',b).catch(()=>{});return{bookingId:b.id};};
+    b.status='payment_pending';b.transactionId=tx.id;b.paymentStartedAt=nowIso();b.paymentDueAt=iso(Date.now()+PAYMENT_WINDOW_MS);b.reservationExpiresAt=null;b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'buyer',action:'protected_payment_created',transactionId:tx.id,paymentDueAt:b.paymentDueAt,fulfilmentMethod:b.fulfilmentMethod});
+    tx.serviceBookingId=b.id;tx.serviceFulfilmentStatus='payment_pending';tx.servicePaymentDueAt=b.paymentDueAt;tx.serviceStartAt=b.proposedStartAt||b.neededAt||null;tx.serviceDurationMinutes=bookingDurationMinutes(b);tx.serviceDurationHours=bookingDurationMinutes(b)/60;tx.serviceAvailabilityMode=b.availabilityMode||availabilityMode(item);tx.serviceStreamId=b.streamId;tx.serviceStreamName=b.streamName;
+    tx.serviceFulfilmentMethod=b.fulfilmentMethod;tx.serviceFulfilmentLocation=b.fulfilmentLocation||'';tx.serviceFulfilmentSelectedBy=b.fulfilmentSelectedBy||'buyer';tx.serviceFulfilmentAgreedAt=b.fulfilmentAgreedAt||b.agreedAt||nowIso();tx.deliveryMethod='service_fulfilment';tx.deliveryPoint='';tx.holdDurationHours=null;tx.holdExpiresAt=null;
+    const startPolicy=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);tx.serviceAgreement={bookingId:b.id,requestedAt:b.createdAt||null,agreedAt:b.agreedAt||b.updatedAt||null,requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||b.neededAt||null,startAdjustmentMinutes:startPolicy.adjustmentMinutes,startAdjustmentLimitMinutes:startPolicy.maxAdjustmentMinutes,requestedDurationMinutes:requestedBookingDurationMinutes(b),durationMinutes:bookingDurationMinutes(b),durationHours:bookingDurationMinutes(b)/60,availabilityMode:b.availabilityMode||availabilityMode(item),turnaroundMinutes:Number(b.turnaroundMinutes||0),streamId:b.streamId,streamName:b.streamName,location:b.location||'',scope:b.scope||'',providerNote:b.providerNote||'',fulfilmentMethod:b.fulfilmentMethod,fulfilmentLocation:b.fulfilmentLocation||'',allowedFulfilmentMethods:allowed,listingDeliveryMode:item&&item.deliveryMode||'',listingOperatingMode:item&&item.operatingMode||''};delete tx.requestedServiceBookingId;delete tx.requestedServiceFulfilmentMethod;persist('booking',b).catch(()=>{});return{bookingId:b.id};};
 
   function saveRequestForBooking(b,item){const rq={id:uuid(),fromPhone:b.buyerPhone,toPhone:b.providerPhone,itemCode:String(item.code),quantity:1,status:'open',createdAt:nowIso(),repliedAt:null,reply:null,serviceBookingId:b.id,
-      serviceRequest:{neededAt:b.neededAt,location:b.location,scope:b.scope,durationMinutes:bookingDurationMinutes(b),durationHours:bookingDurationMinutes(b)/60},itemSnapshot:{code:item.code,title:item.title,details:item.details||'',price:item.price,imageUrl:item.imageUrl||'',imageUrls:Array.isArray(item.imageUrls)?item.imageUrls:(item.imageUrl?[item.imageUrl]:[]),listingType:'service',serviceCategory:item.serviceCategory||'',deliveryMode:item.deliveryMode||'',serviceArea:item.serviceArea||'',estimatedDurationMinutes:serviceMinutes(item),estimatedDurationHours:serviceMinutes(item)/60,turnaroundMinutes:item.turnaroundMinutes||0,completionEvidence:item.completionEvidence||'',pricingRules:item.pricingRules||item.pricingTerms||null,pricingMode:item.pricingMode||(item.pricingRules&&item.pricingRules.mode)||'fixed'},itemPricingSnapshot:tpPricingSnapshotForItem(item,1),negotiationAllowed:tpPricingNegotiationAllowed({itemPricingSnapshot:tpPricingSnapshotForItem(item,1)}),initialBuyerNote:b.scope,notesThread:[{id:uuid(),actor:'buyer',phone:b.buyerPhone,text:b.scope,at:b.createdAt||nowIso(),kind:'initial_service_request'}]};requests.push(rq);b.requestId=rq.id;if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});return rq;}
+      serviceRequest:{neededAt:b.neededAt,requestedStartAt:b.neededAt,requestedDurationMinutes:requestedBookingDurationMinutes(b),location:b.location,scope:b.scope,durationMinutes:bookingDurationMinutes(b),durationHours:bookingDurationMinutes(b)/60,availabilityMode:b.availabilityMode||availabilityMode(item),allowedFulfilmentMethods:Array.isArray(b.allowedFulfilmentMethods)?b.allowedFulfilmentMethods:serviceFulfilmentCapabilities(item),fulfilmentMethod:b.fulfilmentMethod||null,fulfilmentLocation:b.fulfilmentLocation||null},itemSnapshot:{code:item.code,title:item.title,details:item.details||'',price:item.price,imageUrl:item.imageUrl||'',imageUrls:Array.isArray(item.imageUrls)?item.imageUrls:(item.imageUrl?[item.imageUrl]:[]),listingType:'service',serviceCategory:item.serviceCategory||'',deliveryMode:item.deliveryMode||'',operatingMode:item.operatingMode||'',serviceArea:item.serviceArea||'',availabilityMode:item.availabilityMode||availabilityMode(item),estimatedDurationMinutes:serviceMinutes(item),estimatedDurationHours:serviceMinutes(item)/60,turnaroundMinutes:item.turnaroundMinutes||0,completionEvidence:item.completionEvidence||'',pricingRules:item.pricingRules||item.pricingTerms||null,pricingMode:item.pricingMode||(item.pricingRules&&item.pricingRules.mode)||'fixed'},itemPricingSnapshot:tpPricingSnapshotForItem(item,1),negotiationAllowed:tpPricingNegotiationAllowed({itemPricingSnapshot:tpPricingSnapshotForItem(item,1)}),initialBuyerNote:b.scope,notesThread:[{id:uuid(),actor:'buyer',phone:b.buyerPhone,text:b.scope,at:b.createdAt||nowIso(),kind:'initial_service_request'}]};requests.push(rq);b.requestId=rq.id;if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});return rq;}
   function updateLinkedRequest(b,action){const rq=(requests||[]).find(x=>String(x.id)===String(b.requestId));if(!rq)return;if(action==='decline'){rq.status='declined';rq.repliedAt=nowIso();rq.reply={itemCode:rq.itemCode,availability:'service_enquiry_declined',preOrderNote:b.providerNote||'',message:b.providerNote?`Service provider declined the enquiry: ${b.providerNote}`:'The service provider declined this enquiry.'};}
     else if(action==='timeout'){rq.status='timed_out';rq.repliedAt=nowIso();rq.reply=null;rq.serviceWorkflowStatus='timed_out';rq.serviceQueuePosition=null;}
-    else if(action==='proposal'){rq.status='open';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_terms_proposed',preOrderDate:b.proposedStartAt||b.neededAt,preOrderNote:b.providerNote||'',collectionPoint:b.location||'',message:'The service provider has proposed terms. Review and accept or decline them under My service enquiries.'};rq.notesThread=Array.isArray(rq.notesThread)?rq.notesThread:[];rq.notesThread.push({id:uuid(),actor:'service_provider',phone:b.providerPhone,text:b.providerNote||'Service terms proposed.',at:rq.repliedAt,kind:'service_terms_proposed'});}
-    else if(action==='accept'){rq.status='answered';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_agreement_awaiting_payment',preOrderDate:b.proposedStartAt||b.neededAt,preOrderNote:b.providerNote||'',collectionPoint:b.location||'',message:`Service terms agreed for ${b.proposedStartAt||b.neededAt}. Complete protected payment to confirm the booking.`};}if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});}
+    else if(action==='proposal'){const p=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);rq.status='open';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_terms_proposed',requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||b.neededAt,preOrderDate:b.proposedStartAt||b.neededAt,startAdjustmentMinutes:p.adjustmentMinutes,startAdjustmentLimitMinutes:p.maxAdjustmentMinutes,requestedDurationMinutes:p.baselineDurationMinutes,preOrderNote:b.providerNote||'',collectionPoint:b.location||'',message:p.adjustmentMinutes===0?'The service provider accepted your requested start time and proposed the remaining service terms. Review and accept or decline them.':`The service provider proposed a start-time adjustment of ${Math.abs(p.adjustmentMinutes)} minute(s) ${p.adjustmentMinutes<0?'earlier':'later'}, within the ${p.maxAdjustmentMinutes}-minute policy limit. Review the updated start time before accepting.`};rq.notesThread=Array.isArray(rq.notesThread)?rq.notesThread:[];rq.notesThread.push({id:uuid(),actor:'service_provider',phone:b.providerPhone,text:b.providerNote||'Service terms proposed.',at:rq.repliedAt,kind:'service_terms_proposed'});}
+    else if(action==='accept'){const p=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);rq.status='answered';rq.repliedAt=nowIso();rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_agreement_awaiting_payment',requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||b.neededAt,agreedStartAt:b.proposedStartAt||b.neededAt,preOrderDate:b.proposedStartAt||b.neededAt,startAdjustmentMinutes:p.adjustmentMinutes,startAdjustmentLimitMinutes:p.maxAdjustmentMinutes,requestedDurationMinutes:p.baselineDurationMinutes,preOrderNote:b.providerNote||'',collectionPoint:b.fulfilmentLocation||b.location||'',serviceFulfilmentMethod:b.fulfilmentMethod||null,serviceFulfilmentLocation:b.fulfilmentLocation||null,message:`Service terms agreed. The agreed start time is the provider proposal shown above. Fulfilment: ${b.fulfilmentMethod||'not selected'}. Complete protected payment to confirm the booking.`};}if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});}
 
   app.get('/api/services/:itemCode/availability',async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});res.json({ok:true,itemCode:String(item.code),availability:snapshot(item)});});
   app.post('/api/services/:itemCode/availability',requireAuth,async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});if(!providerOwns(req,item)&&req.user.role!=='admin')return res.status(403).json({error:'Only this service provider can change availability.'});const action=lower(req.body&&req.body.action),mode=availabilityMode(item),rec=availability.get(String(item.code))||{id:`service-availability:${item.code}`,itemCode:String(item.code),providerPhone:item.sellerPhone};if(action==='pause'){rec.paused=true;rec.liveUntil=null;}else if(action==='go_live'){if(mode!=='instant')return res.status(400).json({error:'Go live is only available for services lasting 15 minutes–5 hours.'});const hours=[1,2,4,8].includes(Number(req.body.liveHours))?Number(req.body.liveHours):2;rec.paused=false;rec.liveUntil=iso(Date.now()+hours*3600000);}else if(action==='resume')rec.paused=false;else return res.status(400).json({error:'Choose go_live, pause or resume.'});rec.updatedAt=nowIso();rec.updatedBy=req.user.phone;availability.set(String(item.code),rec);await persist('availability',rec);logAudit(req,'service_availability_updated',{itemCode:item.code,action,status:snapshot(item).status});res.json({ok:true,availability:snapshot(item)});});
@@ -7826,12 +7915,14 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
 
   app.get('/api/services/bookings',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();let mine;if(req.user.role==='admin')mine=bookings;else if(req.user.role==='seller'){const visible=new Set(pendingQueue(req.user.phone).slice(0,3).map(b=>String(b.id)));mine=bookings.filter(b=>String(b.providerPhone)===String(req.user.phone)&&(lower(b.status)!==PENDING||visible.has(String(b.id))));}else mine=bookings.filter(b=>String(b.buyerPhone)===String(req.user.phone));const output=mine.map(b=>{const s=streamById(b.streamId);const score=s?streamScore(s):null;const now=Date.now(),eligibleAt=Date.parse(b.completionEligibleAt||'');return{...b,queuePosition:lower(b.status)===PENDING?queuePosition(b):null,deliveryEligible:lower(b.status)==='in_progress'&&Number.isFinite(eligibleAt)&&now>=eligibleAt,stream:s?{id:s.id,name:s.name,roleLabel:s.roleLabel,avatarUrl:s.avatarUrl,stars:score.stars,scorePoints:score.points,provisional:score.provisional}:null};});const ordered=output.sort((a,b)=>{if(req.user.role==='seller'){const ap=lower(a.status)===PENDING,bp=lower(b.status)===PENDING;if(ap!==bp)return ap?-1:1;if(ap&&bp)return queueStableCompare(a,b);}return Date.parse(b.updatedAt||b.createdAt)-Date.parse(a.updatedAt||a.createdAt);});res.json({ok:true,bookings:ordered.slice(0,250)});});
 
-  app.post('/api/services/:itemCode/bookings',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();if(req.user.role!=='buyer'&&req.user.role!=='admin')return res.status(403).json({error:'Only buyers can request a service booking.'});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});const state=snapshot(item);if(['paused','offline','suspended','setup_required','no_active_streams'].includes(state.status))return res.status(409).json({error:state.status==='paused'?'This service is paused.':state.status==='suspended'?'This provider is temporarily unavailable because service privileges are suspended.':state.status==='setup_required'?'This provider must complete staff/service-stream setup before taking bookings.':state.status==='no_active_streams'?'This provider currently has no active service staff available.':'This instant service is not live.'});const neededAt=normalizeServiceDate(req.body&&req.body.neededAt),location=clean(req.body&&req.body.location,180),scope=clean(req.body&&req.body.scope,600);if(!neededAt||!Number.isFinite(serviceDateMs(neededAt))||!location||scope.length<10)return res.status(400).json({error:'Required time, location and a clear service description are required.'});const b={id:uuid(),itemCode:String(item.code),itemTitle:item.title,buyerPhone:req.user.phone,providerPhone:item.sellerPhone,neededAt,location,scope,durationMinutes:serviceMinutes(item),durationHours:serviceMinutes(item)/60,turnaroundMinutes:Number(item.turnaroundMinutes||0),availabilityMode:availabilityMode(item),status:PENDING,queueSequence:nextProviderQueueSequence(item.sellerPhone),reservationExpiresAt:null,createdAt:nowIso(),updatedAt:nowIso(),reviewWindowStartedAt:null,responseDueAt:null,timedOutAt:null,proposedStartAt:null,agreedPrice:null,providerNote:'',streamId:null,streamName:null,history:[{at:nowIso(),actor:'buyer',action:'booking_requested'}]};saveRequestForBooking(b,item);bookings.push(b);await persist('booking',b);prune();logAudit(req,'service_booking_requested',{bookingId:b.id,itemCode:item.code,providerPhone:item.sellerPhone});b.queuePosition=queuePosition(b);res.status(201).json({ok:true,booking:b,availability:snapshot(item)});});
+  app.post('/api/services/:itemCode/bookings',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();if(req.user.role!=='buyer'&&req.user.role!=='admin')return res.status(403).json({error:'Only buyers can request a service booking.'});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});const state=snapshot(item);if(['paused','offline','suspended','setup_required','no_active_streams'].includes(state.status))return res.status(409).json({error:state.status==='paused'?'This service is paused.':state.status==='suspended'?'This provider is temporarily unavailable because service privileges are suspended.':state.status==='setup_required'?'This provider must complete staff/service-stream setup before taking bookings.':state.status==='no_active_streams'?'This provider currently has no active service staff available.':'This instant service is not live.'});const neededAt=normalizeServiceDate(req.body&&req.body.neededAt),location=clean(req.body&&req.body.location,180),scope=clean(req.body&&req.body.scope,600);if(!neededAt||!Number.isFinite(serviceDateMs(neededAt))||!location||scope.length<10)return res.status(400).json({error:'Required time, location and a clear service description are required.'});const allowedFulfilmentMethods=serviceFulfilmentCapabilities(item);if(!allowedFulfilmentMethods.length)return res.status(409).json({error:'This service listing has incompatible delivery and operating settings. The provider must correct the listing before taking bookings.'});const b={id:uuid(),itemCode:String(item.code),itemTitle:item.title,buyerPhone:req.user.phone,providerPhone:item.sellerPhone,neededAt,location,scope,durationMinutes:serviceMinutes(item),durationHours:serviceMinutes(item)/60,requestedDurationMinutes:serviceMinutes(item),turnaroundMinutes:Number(item.turnaroundMinutes||0),availabilityMode:availabilityMode(item),allowedFulfilmentMethods,fulfilmentMethod:allowedFulfilmentMethods.length===1?allowedFulfilmentMethods[0]:null,fulfilmentLocation:allowedFulfilmentMethods.length===1?fulfilmentLocationFor(item,{location},allowedFulfilmentMethods[0]):null,fulfilmentSelectedBy:allowedFulfilmentMethods.length===1?'system':null,fulfilmentAgreedAt:null,status:PENDING,queueSequence:nextProviderQueueSequence(item.sellerPhone),reservationExpiresAt:null,createdAt:nowIso(),updatedAt:nowIso(),reviewWindowStartedAt:null,responseDueAt:null,timedOutAt:null,proposedStartAt:null,agreedPrice:null,providerNote:'',streamId:null,streamName:null,history:[{at:nowIso(),actor:'buyer',action:'booking_requested'}]};saveRequestForBooking(b,item);bookings.push(b);await persist('booking',b);prune();logAudit(req,'service_booking_requested',{bookingId:b.id,itemCode:item.code,providerPhone:item.sellerPhone});b.queuePosition=queuePosition(b);res.status(201).json({ok:true,booking:b,availability:snapshot(item)});});
 
-  app.post('/api/services/bookings/:id/respond',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});const item=itemByCode(b.itemCode);if(String(req.user.phone)!==String(b.providerPhone)&&req.user.role!=='admin')return res.status(403).json({error:'Only the service provider can respond.'});if(lower(b.status)!==PENDING)return res.status(409).json({error:'This enquiry is no longer awaiting a provider response.'});if(queuePosition(b)>3)return res.status(409).json({error:'Only the first three enquiries in the provider queue can be reviewed.'});const action=lower(req.body&&req.body.action),note=clean(req.body&&req.body.note,300);if(action==='decline'){if(note.length<3)return res.status(400).json({error:'Enter a clear reason for declining.'});b.status='declined';b.providerNote=note;updateLinkedRequest(b,'decline');}else if(action==='accept'||action==='revise'){const startAt=normalizeServiceDate(req.body&&req.body.proposedStartAt),price=Number(req.body&&req.body.agreedPrice);if(!startAt||!Number.isFinite(serviceDateMs(startAt))||serviceDateMs(startAt)<=Date.now())return res.status(400).json({error:'Choose a valid future service date and time.'});if(!Number.isFinite(price)||price<=0)return res.status(400).json({error:'Enter a valid service price greater than zero.'});if(note.length<3)return res.status(400).json({error:'Enter a short message for the potential client.'});b.proposedStartAt=startAt;b.agreedPrice=price;b.providerNote=note;const proposedDurationMinutes=Number(req.body&&req.body.durationMinutes||((req.body&&req.body.durationHours||b.durationHours||serviceHours(item))*60));if(!Number.isFinite(proposedDurationMinutes)||proposedDurationMinutes<15||proposedDurationMinutes>43200)return res.status(400).json({error:'Estimated service duration must be between 15 minutes and 30 days.'});b.durationMinutes=Math.round(proposedDurationMinutes);b.durationHours=b.durationMinutes/60;const chosen=selectStreamForBooking(item,b,clean(req.body&&req.body.streamId,120));if(chosen.error)return res.status(409).json({error:chosen.error});b.streamId=chosen.stream.id;b.streamName=chosen.stream.name;b.status='awaiting_buyer';b.reservationExpiresAt=null;updateLinkedRequest(b,'proposal');}else return res.status(400).json({error:'Choose accept, revise or decline.'});b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'provider',action,note:b.providerNote,streamId:b.streamId||null});await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(item)});});
+  app.post('/api/services/bookings/:id/respond',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});const item=itemByCode(b.itemCode);if(String(req.user.phone)!==String(b.providerPhone)&&req.user.role!=='admin')return res.status(403).json({error:'Only the service provider can respond.'});if(lower(b.status)!==PENDING)return res.status(409).json({error:'This enquiry is no longer awaiting a provider response.'});if(queuePosition(b)>3)return res.status(409).json({error:'Only the first three enquiries in the provider queue can be reviewed.'});const action=lower(req.body&&req.body.action),note=clean(req.body&&req.body.note,300);if(action==='decline'){if(note.length<3)return res.status(400).json({error:'Enter a clear reason for declining.'});b.status='declined';b.providerNote=note;updateLinkedRequest(b,'decline');}else if(action==='accept'||action==='revise'){const startAt=normalizeServiceDate(req.body&&req.body.proposedStartAt),price=Number(req.body&&req.body.agreedPrice);if(!startAt||!Number.isFinite(serviceDateMs(startAt))||serviceDateMs(startAt)<=Date.now())return res.status(400).json({error:'Choose a valid future service date and time.'});const startPolicy=initialStartAdjustmentPolicy(b,startAt);if(!startPolicy.withinLimit)return res.status(400).json({error:`The provider may adjust the client's requested start time by no more than ${startPolicy.maxAdjustmentMinutes} minute(s), which is 20% of the ${startPolicy.baselineDurationMinutes}-minute service duration originally requested, capped at 60 minutes. Choose a time between ${startPolicy.minStartAt} and ${startPolicy.maxStartAt}, or decline and ask the client to submit a new time request.`});if(!Number.isFinite(price)||price<=0)return res.status(400).json({error:'Enter a valid service price greater than zero.'});if(note.length<3)return res.status(400).json({error:'Enter a short message for the potential client.'});b.proposedStartAt=startAt;b.startAdjustmentMinutes=startPolicy.adjustmentMinutes;b.startAdjustmentLimitMinutes=startPolicy.maxAdjustmentMinutes;b.agreedPrice=price;b.providerNote=note;const proposedDurationMinutes=Number(req.body&&req.body.durationMinutes||((req.body&&req.body.durationHours||b.durationHours||serviceHours(item))*60));if(!Number.isFinite(proposedDurationMinutes)||proposedDurationMinutes<15||proposedDurationMinutes>43200)return res.status(400).json({error:'Estimated service duration must be between 15 minutes and 30 days.'});b.durationMinutes=Math.round(proposedDurationMinutes);b.durationHours=b.durationMinutes/60;b.availabilityMode=modeForMinutes(b.durationMinutes);b.allowedFulfilmentMethods=serviceFulfilmentCapabilities(item);if(!b.allowedFulfilmentMethods.length)return res.status(409).json({error:'This listing has no valid service fulfilment method. Correct the service delivery/operating settings first.'});if(b.fulfilmentMethod&&!b.allowedFulfilmentMethods.includes(lower(b.fulfilmentMethod))){b.fulfilmentMethod=null;b.fulfilmentLocation=null;b.fulfilmentSelectedBy=null;b.fulfilmentAgreedAt=null;}if(!b.fulfilmentMethod&&b.allowedFulfilmentMethods.length===1){b.fulfilmentMethod=b.allowedFulfilmentMethods[0];b.fulfilmentSelectedBy='system';b.fulfilmentLocation=fulfilmentLocationFor(item,b,b.fulfilmentMethod);}const chosen=selectStreamForBooking(item,b,clean(req.body&&req.body.streamId,120));if(chosen.error)return res.status(409).json({error:chosen.error});b.streamId=chosen.stream.id;b.streamName=chosen.stream.name;b.status='awaiting_buyer';b.reservationExpiresAt=null;updateLinkedRequest(b,'proposal');}else return res.status(400).json({error:'Choose accept, revise or decline.'});b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'provider',action,note:b.providerNote,streamId:b.streamId||null,requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||null,startAdjustmentMinutes:b.startAdjustmentMinutes||0,startAdjustmentLimitMinutes:b.startAdjustmentLimitMinutes||initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt).maxAdjustmentMinutes});await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(item)});});
 
   app.post('/api/services/bookings/:id/buyer-response',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});if(String(req.user.phone)!==String(b.buyerPhone)&&req.user.role!=='admin')return res.status(403).json({error:'Only the requesting buyer can respond.'});const action=lower(req.body&&req.body.action);if(lower(b.status)==='awaiting_buyer'){
-      if(action==='accept'){const item=itemByCode(b.itemCode),s=streamById(b.streamId);const check=streamCanTake(s,b.proposedStartAt,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:`Those terms can no longer be reserved: ${check.reason}`});b.status='agreement_ready';b.agreedAt=nowIso();b.reservationExpiresAt=iso(Date.now()+AGREEMENT_SLOT_RESERVATION_MS);updateLinkedRequest(b,'accept');}else if(action==='decline'){b.status='cancelled';b.reservationExpiresAt=null;updateLinkedRequest(b,'decline');}else return res.status(400).json({error:'Choose accept or decline.'});
+      if(action==='accept'){const item=itemByCode(b.itemCode),s=streamById(b.streamId),allowed=serviceFulfilmentCapabilities(item);let method=lower(req.body&&req.body.fulfilmentMethod||b.fulfilmentMethod||'');if(!method&&allowed.length===1){method=allowed[0];b.fulfilmentSelectedBy='system';}else if(!method&&allowed.length>1)return res.status(400).json({error:'Choose how the service will be fulfilled before accepting the terms.'});if(!allowed.includes(method))return res.status(400).json({error:'That service fulfilment method is not available for this provider.'});const check=streamCanTake(s,b.proposedStartAt,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:`Those terms can no longer be reserved: ${check.reason}`});b.allowedFulfilmentMethods=allowed;b.fulfilmentMethod=method;b.fulfilmentLocation=fulfilmentLocationFor(item,b,method);b.fulfilmentSelectedBy=b.fulfilmentSelectedBy||'buyer';b.fulfilmentAgreedAt=nowIso();b.status='agreement_ready';b.agreedAt=b.fulfilmentAgreedAt;b.reservationExpiresAt=iso(Date.now()+AGREEMENT_SLOT_RESERVATION_MS);updateLinkedRequest(b,'accept');}else if(action==='decline'){b.status='cancelled';b.reservationExpiresAt=null;updateLinkedRequest(b,'decline');}else return res.status(400).json({error:'Choose accept or decline.'});
+    } else if(lower(b.status)==='agreement_ready' && action==='set_fulfilment'){
+      const item=itemByCode(b.itemCode),allowed=serviceFulfilmentCapabilities(item),method=lower(req.body&&req.body.fulfilmentMethod||'');if(!allowed.includes(method))return res.status(400).json({error:'Choose an available service fulfilment method.'});b.allowedFulfilmentMethods=allowed;b.fulfilmentMethod=method;b.fulfilmentLocation=fulfilmentLocationFor(item,b,method);b.fulfilmentSelectedBy='buyer';b.fulfilmentAgreedAt=nowIso();updateLinkedRequest(b,'accept');
     } else if(lower(b.status)==='reschedule_pending_client'){
       if(action==='accept_reschedule'){const s=streamById(b.streamId);const check=streamCanTake(s,b.proposedRescheduleAt,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});b.previousStartAt=b.proposedStartAt;b.proposedStartAt=b.proposedRescheduleAt;b.proposedRescheduleAt=null;b.providerPostponements=Number(b.providerPostponements||0)+1;b.status='booked';b.clientReadyAt=null;b.providerStartDeadline=null;bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'provider_reschedule_accepted'});}else if(action==='decline_reschedule'){b.proposedRescheduleAt=null;b.status=serviceDateMs(b.proposedStartAt)<=Date.now()?'awaiting_client_start':'booked';bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'provider_reschedule_declined'});}else return res.status(400).json({error:'Choose accept_reschedule or decline_reschedule.'});
     } else return res.status(409).json({error:'No buyer response is required for this booking.'});b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'buyer',action});syncTx(b);await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});});
