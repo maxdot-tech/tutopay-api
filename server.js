@@ -7926,14 +7926,40 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   function committedForStream(id){return bookings.filter(b=>String(b.streamId||'')===String(id||'')&&committedStatuses.has(lower(b.status)));}
   function committedForItem(code){return bookings.filter(b=>String(b.itemCode)===String(code||'')&&committedStatuses.has(lower(b.status)));}
   function snapshot(item){
-    if(!isService(item))return null;prune();const rec=availability.get(String(item.code||item.id))||{};const mode=availabilityMode(item);const eligible=eligibleStreams(item);const active=eligible.filter(s=>s.active!==false&&!s.suspended&&streamScore(s).points>0);
-    const now=nowIso();const freeNow=active.filter(s=>streamCanTake(s,now,serviceHours(item),Number(item.turnaroundMinutes||0),null).ok);
-    const liveValid=rec.liveUntil&&Date.parse(rec.liveUntil)>Date.now();let status=mode;const gate=providerGateState(item.sellerPhone);
-    if(gate.status==='suspended')status='suspended';else if(gate.status==='setup_required')status='setup_required';else if(gate.status==='no_active_streams')status='no_active_streams';else if(rec.paused)status='paused';else if(mode==='instant'&&!liveValid)status='offline';else if(mode==='instant'&&freeNow.length)status='live_green';else if(mode==='instant'&&active.length)status='live_amber';
-    const rel=providerReliability(item.sellerPhone);const capacityUsed=eligible.reduce((sum,s)=>sum+committedForStream(s.id).length,0),capacityLimit=Math.max(1,eligible.length)*MAX_ACTIVE_PER_STREAM;
-    return {mode,status,statusReason:gate.reason||'',capacityUsed,capacityLimit,remainingSlots:Math.max(0,capacityLimit-capacityUsed),itemBookings:committedForItem(item.code||item.id).length,liveUntil:liveValid?rec.liveUntil:null,paused:!!rec.paused,
+    if(!isService(item))return null;
+    prune();
+    const rec=availability.get(String(item.code||item.id))||{};
+    const mode=availabilityMode(item);
+    const eligible=eligibleStreams(item);
+    const active=eligible.filter(s=>s.active!==false&&!s.suspended&&streamScore(s).points>0);
+    const now=nowIso();
+    const freeNow=active.filter(s=>streamCanTake(s,now,serviceMinutes(item),Number(item.turnaroundMinutes||0),null).ok);
+
+    // Instant-service live state is mirrored onto the listing as a durable fallback.
+    // This prevents a refresh/restart or an availability-record load race from making
+    // buyers see "Offline" immediately after the provider has gone live.
+    const recLiveUntil=clean(rec.liveUntil,80);
+    const itemLiveUntil=clean(item.serviceLiveUntil,80);
+    const liveUntil=recLiveUntil||itemLiveUntil||null;
+    const paused=(rec.paused!==undefined&&rec.paused!==null)?!!rec.paused:!!item.servicePaused;
+    const liveValid=!!(liveUntil&&Number.isFinite(Date.parse(liveUntil))&&Date.parse(liveUntil)>Date.now());
+
+    let status=mode;
+    const gate=providerGateState(item.sellerPhone);
+    if(gate.status==='suspended')status='suspended';
+    else if(gate.status==='setup_required')status='setup_required';
+    else if(gate.status==='no_active_streams')status='no_active_streams';
+    else if(paused)status='paused';
+    else if(mode==='instant'&&!liveValid)status='offline';
+    else if(mode==='instant'&&freeNow.length)status='live_green';
+    else if(mode==='instant'&&active.length)status='live_amber';
+
+    const rel=providerReliability(item.sellerPhone);
+    const capacityUsed=eligible.reduce((sum,s)=>sum+committedForStream(s.id).length,0);
+    const capacityLimit=Math.max(1,eligible.length)*MAX_ACTIVE_PER_STREAM;
+    return {mode,status,statusReason:gate.reason||'',capacityUsed,capacityLimit,remainingSlots:Math.max(0,capacityLimit-capacityUsed),itemBookings:committedForItem(item.code||item.id).length,liveUntil:liveValid?liveUntil:null,paused,
       pendingEnquiries:pendingQueue(item.sellerPhone).length,eligibleStreams:eligible.length,availableStreamsNow:freeNow.length,providerKind:providerKind(item.sellerPhone),
-      reliabilityPoints:rel.points,reliabilityStars:rel.stars,reliabilityProvisional:rel.provisional,completedServices:rel.completedBookings,updatedAt:rec.updatedAt||null};
+      reliabilityPoints:rel.points,reliabilityStars:rel.stars,reliabilityProvisional:rel.provisional,completedServices:rel.completedBookings,updatedAt:rec.updatedAt||item.serviceAvailabilityUpdatedAt||null};
   }
   globalThis.__tpServiceAvailabilityForItem=snapshot;
   globalThis.__tpServiceRefreshStates=()=>{prune();};
@@ -7972,7 +7998,39 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
   app.get('/api/services/:itemCode/availability',async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});res.json({ok:true,itemCode:String(item.code),availability:snapshot(item)});});
   app.get('/api/services/:itemCode/location-pin',requireAuth,async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});if(!providerOwns(req,item)&&req.user.role!=='admin')return res.status(403).json({error:'Only this service provider can view the exact service-location pin.'});const pin=providerLocationPin(item);res.json({ok:true,itemCode:String(item.code),hasPin:!!pin,pin});});
   app.post('/api/services/:itemCode/location-pin',requireAuth,async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});if(!providerOwns(req,item)&&req.user.role!=='admin')return res.status(403).json({error:'Only this service provider can set the service-location pin.'});const pin=normalizeLocationPin(req.body&&req.body.pin,'provider_gps');if(!pin)return res.status(400).json({error:'A valid GPS pin is required.'});item.serviceLocationPin=pin;item.updatedAt=nowIso();try{await dbUpsertItem(item);}catch(_){}logAudit(req,'service_location_pin_updated',{itemCode:item.code,providerPhone:item.sellerPhone,accuracy:pin.accuracy});res.json({ok:true,itemCode:String(item.code),hasPin:true,pin});});
-  app.post('/api/services/:itemCode/availability',requireAuth,async(req,res)=>{await load().catch(()=>{});const item=itemByCode(req.params.itemCode);if(!isService(item))return res.status(404).json({error:'Service listing not found.'});if(!providerOwns(req,item)&&req.user.role!=='admin')return res.status(403).json({error:'Only this service provider can change availability.'});const action=lower(req.body&&req.body.action),mode=availabilityMode(item),rec=availability.get(String(item.code))||{id:`service-availability:${item.code}`,itemCode:String(item.code),providerPhone:item.sellerPhone};if(action==='pause'){rec.paused=true;rec.liveUntil=null;}else if(action==='go_live'){if(mode!=='instant')return res.status(400).json({error:'Go live is only available for services lasting 15 minutes–5 hours.'});const hours=[1,2,4,8].includes(Number(req.body.liveHours))?Number(req.body.liveHours):2;rec.paused=false;rec.liveUntil=iso(Date.now()+hours*3600000);}else if(action==='resume')rec.paused=false;else return res.status(400).json({error:'Choose go_live, pause or resume.'});rec.updatedAt=nowIso();rec.updatedBy=req.user.phone;availability.set(String(item.code),rec);await persist('availability',rec);logAudit(req,'service_availability_updated',{itemCode:item.code,action,status:snapshot(item).status});res.json({ok:true,availability:snapshot(item)});});
+  app.post('/api/services/:itemCode/availability',requireAuth,async(req,res)=>{
+    await load().catch(()=>{});
+    const item=itemByCode(req.params.itemCode);
+    if(!isService(item))return res.status(404).json({error:'Service listing not found.'});
+    if(!providerOwns(req,item)&&req.user.role!=='admin')return res.status(403).json({error:'Only this service provider can change availability.'});
+
+    const action=lower(req.body&&req.body.action),mode=availabilityMode(item);
+    const rec=availability.get(String(item.code))||{id:`service-availability:${item.code}`,itemCode:String(item.code),providerPhone:item.sellerPhone};
+
+    if(action==='pause'){
+      rec.paused=true;rec.liveUntil=null;
+      item.servicePaused=true;item.serviceLiveUntil=null;
+    }else if(action==='go_live'){
+      if(mode!=='instant')return res.status(400).json({error:'Go live is only available for services lasting 15 minutes–5 hours.'});
+      const hours=[1,2,4,8].includes(Number(req.body.liveHours))?Number(req.body.liveHours):2;
+      rec.paused=false;
+      rec.liveUntil=iso(Date.now()+hours*3600000);
+      item.servicePaused=false;
+      item.serviceLiveUntil=rec.liveUntil;
+    }else if(action==='resume'){
+      rec.paused=false;
+      item.servicePaused=false;
+    }else return res.status(400).json({error:'Choose go_live, pause or resume.'});
+
+    rec.updatedAt=nowIso();rec.updatedBy=req.user.phone;
+    item.serviceAvailabilityUpdatedAt=rec.updatedAt;
+    availability.set(String(item.code),rec);
+    await persist('availability',rec);
+    try{await dbUpsertItem(item);}catch(e){console.error('[service availability] item mirror save failed:',e&&e.message?e.message:e);}
+    const out=snapshot(item);
+    logAudit(req,'service_availability_updated',{itemCode:item.code,action,status:out.status,liveUntil:out.liveUntil||null});
+    res.json({ok:true,availability:out});
+  });
 
   app.get('/api/services/streams',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const providerPhone=req.user.role==='admin'&&req.query.providerPhone?String(req.query.providerPhone):String(req.user.phone);if(req.user.role!=='admin'&&String(providerPhone)!==String(req.user.phone))return res.status(403).json({error:'Not allowed.'});let ss=providerStreams(providerPhone,{includeInactive:true});const item=req.query.itemCode?itemByCode(req.query.itemCode):null;if(item&&String(item.sellerPhone)!==String(providerPhone))return res.status(403).json({error:'Listing does not belong to this provider.'});const startAt=clean(req.query.startAt,80),duration=Number(req.query.durationMinutes||((req.query.durationHours||serviceHours(item)||1)*60)),turnaround=Number(req.query.turnaroundMinutes||item?.turnaroundMinutes||0);const eligibleIds=item?new Set(eligibleStreams(item,{includeInactive:true}).map(s=>String(s.id))):null;
     const rows=ss.map(s=>{const score=streamScore(s),check=startAt?streamCanTake(s,startAt,duration,turnaround,null):{ok:s.active!==false&&!s.suspended&&streamIdentityComplete(s),reason:streamIdentityComplete(s)?'':'Staff identity number required'};return{...s,staffPhone:undefined,staffIdentityKey:undefined,staffPhoneMasked:maskStaffPhone(s.staffPhone),identityComplete:streamIdentityComplete(s),scorePoints:score.points,stars:score.stars,provisional:score.provisional,eligibleForItem:eligibleIds?eligibleIds.has(String(s.id)):true,availableForSlot:!!check.ok,availabilityReason:check.ok?'Available':check.reason,activePaidBookings:committedForStream(s.id).length};});res.json({ok:true,providerPhone,providerKind:providerKind(providerPhone),multiStreamEnabled:multiStreamEnabled(providerPhone),reliability:providerReliability(providerPhone),streams:rows});});
