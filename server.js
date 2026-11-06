@@ -3357,16 +3357,89 @@ function tpPricingNegotiationAllowed(rq) {
   return false;
 }
 
+// -------- User archive / panel housekeeping --------
+// Archive is deliberately non-destructive. Canonical transaction/request records
+// remain available for audit, dispute and reconciliation work; public users simply
+// hide terminal records from their own active panels. Catalogue archive is global
+// for the listing owner because an archived listing must no longer be discoverable.
+function tpArchivePhones(record) {
+  return Array.isArray(record && record.archivedBy) ? record.archivedBy.map(String) : [];
+}
+function tpArchivedForUser(record, phone) {
+  const key = String(phone || '');
+  return !!key && tpArchivePhones(record).includes(key);
+}
+function tpSetArchivedForUser(record, phone, archived) {
+  const key = String(phone || '');
+  if (!record || !key) return;
+  const set = new Set(tpArchivePhones(record));
+  if (archived) set.add(key); else set.delete(key);
+  record.archivedBy = Array.from(set);
+  record.updatedAt = nowIso();
+}
+function tpTerminalTransaction(tx) {
+  if (!tx || tx.disputeActive) return false;
+  const st = String(tx.status || '').toLowerCase();
+  const service = String(tx.serviceFulfilmentStatus || '').toLowerCase();
+  const terminalTx = new Set(['completed','released','refunded','cancelled','canceled','rejected','failed','expired','voided','settled']);
+  const terminalService = new Set(['completed','cancelled','canceled','case_resolved']);
+  if (service && !terminalService.has(service) && !terminalTx.has(st)) return false;
+  return terminalTx.has(st) || terminalService.has(service);
+}
+function tpRequestLinkedTransactions(rq) {
+  if (!rq) return [];
+  const requestId = String(rq.id || '');
+  const bookingId = String(rq.serviceBookingId || '');
+  const directId = String(rq.transactionId || '');
+  return transactions.filter((tx) => {
+    if (directId && String(tx.id || '') === directId) return true;
+    if (bookingId && String(tx.serviceBookingId || '') === bookingId) return true;
+    return requestId && String(tx.requestId || tx.quoteRequestId || '') === requestId;
+  });
+}
+function tpRequestArchiveCheck(rq) {
+  if (!rq) return { ok:false, reason:'Request not found.' };
+  const activeTx = tpRequestLinkedTransactions(rq).find((tx) => !tpTerminalTransaction(tx));
+  if (activeTx) return { ok:false, reason:'This request is still linked to an active transaction.' };
+  const st = String(rq.status || '').toLowerCase();
+  const wf = String(rq.serviceWorkflowStatus || '').toLowerCase();
+  const activeService = new Set(['pending_provider','awaiting_buyer','agreement_ready','payment_pending','booked','awaiting_client_start','awaiting_provider_start','start_window_expired','reschedule_pending_client','reschedule_pending_provider','in_progress','completion_overdue','provider_delivered','awaiting_rating','ready_for_release','provider_defaulted']);
+  if (activeService.has(wf)) return { ok:false, reason:'This service request is still active. Resolve, cancel or complete it before archiving.' };
+  if (st === 'open' || st === 'pending') return { ok:false, reason:'This request is still awaiting action.' };
+  return { ok:true };
+}
+function tpItemArchiveBlockers(item) {
+  if (!item) return ['Listing not found.'];
+  const code = String(item.code || item.id || '');
+  const blockers = [];
+  const activeTx = transactions.filter((tx) => {
+    const txCode = String(tx.itemCode || (tx.itemSnapshot && tx.itemSnapshot.code) || '');
+    return txCode === code && !tpTerminalTransaction(tx);
+  });
+  if (activeTx.length) blockers.push(`${activeTx.length} active transaction${activeTx.length === 1 ? '' : 's'}`);
+  const terminalRequestStatuses = new Set(['declined','cancelled','canceled','timed_out','expired','closed','completed','rejected']);
+  const terminalServiceWorkflows = new Set(['completed','case_resolved','cancelled','canceled','timed_out']);
+  const unresolvedReq = requests.filter((rq) => {
+    if (String(rq.itemCode || (rq.itemSnapshot && rq.itemSnapshot.code) || '') !== code) return false;
+    const st = String(rq.status || '').toLowerCase(), wf = String(rq.serviceWorkflowStatus || '').toLowerCase();
+    if (terminalRequestStatuses.has(st) || terminalServiceWorkflows.has(wf)) return false;
+    return true;
+  });
+  if (unresolvedReq.length) blockers.push(`${unresolvedReq.length} unresolved request${unresolvedReq.length === 1 ? '' : 's'}`);
+  return blockers;
+}
+
 // -------- Items --------
 app.get("/api/items", (req, res) => {
   // Ensure images are served as /uploads files (not giant base64 blobs)
   items.forEach(migrateItemImagesInPlace);
+  const activeItems = items.filter((it) => !it.archivedAt);
   // Default: return a lightweight list (no huge base64 images).
   // Use ?full=1 to return full objects, including imageUrls/base64.
   const full = String(req.query.full || '').toLowerCase();
   const wantFull = full === '1' || full === 'true' || full === 'yes';
 
-  if (wantFull) return res.json(items.map((it) => {
+  if (wantFull) return res.json(activeItems.map((it) => {
     const out = { ...it };
     if (String(it.listingType || "").toLowerCase() === "service") {
       out.hasServiceLocationPin = !!(it.serviceLocationPin && Number.isFinite(Number(it.serviceLocationPin.lat)) && Number.isFinite(Number(it.serviceLocationPin.lng)));
@@ -3376,7 +3449,7 @@ app.get("/api/items", (req, res) => {
     return out;
   }));
 
-  const lite = items.map((it) => {
+  const lite = activeItems.map((it) => {
     const out = { ...it };
     const urls = Array.isArray(it.imageUrls) ? it.imageUrls : (it.imageUrl ? [it.imageUrl] : []);
     const thumb = urls.length ? urls[0] : null;
@@ -3406,7 +3479,7 @@ app.get("/api/items/:id", (req, res) => {
   items.forEach(migrateItemImagesInPlace);
   const idOrCode = String(req.params.id || "");
   const it = items.find((x) => x.id === idOrCode) || findItem(idOrCode);
-if (!it) return res.status(404).json({ error: "Item not found" });
+if (!it || it.archivedAt) return res.status(404).json({ error: "Item not found" });
   const out = { ...it };
   if (typeof globalThis.__tpServiceAvailabilityForItem === "function" && String(it.listingType || "").toLowerCase() === "service") out.serviceAvailability = globalThis.__tpServiceAvailabilityForItem(it);
   res.json(out);
@@ -3696,6 +3769,7 @@ app.post("/api/transactions", requireAuth, idempotencyMiddleware, (req, res) => 
 
   const itemCodeStr = String(itemCode || "").trim();
   const item = findItem(itemCodeStr);
+  if (item && item.archivedAt) return res.status(409).json({ error: "This listing has been archived by the seller and can no longer start a new transaction." });
   if (item) migrateItemImagesInPlace(item);
   const isServiceItem = !!(item && String(item.listingType || "").toLowerCase() === "service");
   if (!isServiceItem && !deliveryMethod) return res.status(400).json({ error: "Choose the product collection/delivery method." });
@@ -4219,7 +4293,7 @@ app.get("/api/transactions", requireAuth, (req, res) => {
   // Public buyers/sellers still only see their own transactions.
   if (req.user.role !== "admin" && !isInternalStaffRole(req.user.role)) {
     view = transactions.filter(
-      (t) => t.fromPhone === req.user.phone || t.toPhone === req.user.phone
+      (t) => (t.fromPhone === req.user.phone || t.toPhone === req.user.phone) && !tpArchivedForUser(t, req.user.phone)
     );
   }
 
@@ -4718,8 +4792,69 @@ app.get("/api/requests", requireAuth, (req, res) => {
   if (typeof globalThis.__tpFilterServiceRequestsForUser === "function") {
     myReqs = globalThis.__tpFilterServiceRequestsForUser(req.user, myReqs);
   }
+  myReqs = myReqs.filter((rq) => !tpArchivedForUser(rq, req.user.phone));
 
   res.json(myReqs);
+});
+
+// Personal Archive: canonical records are retained; only panel visibility changes.
+app.get("/api/archive", requireAuth, (req, res) => {
+  const phone = String(req.user.phone || '');
+  const archivedTransactions = transactions.filter((tx) => (String(tx.fromPhone) === phone || String(tx.toPhone) === phone) && tpArchivedForUser(tx, phone));
+  const archivedRequests = requests.filter((rq) => (String(rq.fromPhone) === phone || String(rq.toPhone) === phone) && tpArchivedForUser(rq, phone));
+  const archivedItems = items.filter((it) => String(it.sellerPhone || '') === phone && !!it.archivedAt);
+  res.json({ ok:true, transactions: archivedTransactions, requests: archivedRequests, items: archivedItems });
+});
+
+app.post("/api/archive/:kind/:id", requireAuth, async (req, res) => {
+  const kind = String(req.params.kind || '').toLowerCase();
+  const id = String(req.params.id || '');
+  const action = String((req.body && req.body.action) || 'archive').toLowerCase();
+  const restore = action === 'restore';
+  const phone = String(req.user.phone || '');
+  const isAdmin = req.user.role === 'admin';
+  if (!['archive','restore'].includes(action)) return res.status(400).json({ error:'Choose archive or restore.' });
+
+  if (kind === 'transaction' || kind === 'tx') {
+    const tx = transactions.find((row) => String(row.id || '') === id);
+    if (!tx) return res.status(404).json({ error:'Transaction not found.' });
+    if (!isAdmin && String(tx.fromPhone) !== phone && String(tx.toPhone) !== phone) return res.status(403).json({ error:'This transaction does not belong to you.' });
+    if (!restore && !tpTerminalTransaction(tx)) return res.status(409).json({ error:'Active transactions cannot be archived. Complete, cancel or resolve the transaction first.' });
+    tpSetArchivedForUser(tx, phone, !restore);
+    if (dbEnabled()) await dbUpsertTransaction(tx);
+    logAudit(req, restore ? 'transaction_restored_from_archive' : 'transaction_archived_from_panel', { txId:tx.id });
+    return res.json({ ok:true, kind:'transaction', action, id:tx.id });
+  }
+
+  if (kind === 'request' || kind === 'reply') {
+    const rq = requests.find((row) => String(row.id || '') === id);
+    if (!rq) return res.status(404).json({ error:'Request not found.' });
+    if (!isAdmin && String(rq.fromPhone) !== phone && String(rq.toPhone) !== phone) return res.status(403).json({ error:'This request does not belong to you.' });
+    const check = tpRequestArchiveCheck(rq);
+    if (!restore && !check.ok) return res.status(409).json({ error:check.reason });
+    tpSetArchivedForUser(rq, phone, !restore);
+    if (dbEnabled()) await dbUpsertRequest(rq);
+    logAudit(req, restore ? 'request_restored_from_archive' : 'request_archived_from_panel', { requestId:rq.id });
+    return res.json({ ok:true, kind:'request', action, id:rq.id });
+  }
+
+  if (kind === 'item' || kind === 'listing' || kind === 'catalogue') {
+    const item = items.find((row) => String(row.id || '') === id || String(row.code || '') === id);
+    if (!item) return res.status(404).json({ error:'Listing not found.' });
+    if (!isAdmin && String(item.sellerPhone || '') !== phone) return res.status(403).json({ error:'Only the listing owner can archive it.' });
+    if (!restore) {
+      const blockers = tpItemArchiveBlockers(item);
+      if (blockers.length) return res.status(409).json({ error:`This listing cannot be archived yet: ${blockers.join(' and ')}.` });
+      item.archivedAt = nowIso(); item.archivedByPhone = phone; item.updatedAt = item.archivedAt;
+    } else {
+      item.archivedAt = null; item.archivedByPhone = null; item.updatedAt = nowIso();
+    }
+    if (dbEnabled()) await dbUpsertItem(item);
+    logAudit(req, restore ? 'listing_restored_from_archive' : 'listing_archived', { itemId:item.id, itemCode:item.code });
+    return res.json({ ok:true, kind:'item', action, id:item.id, code:item.code });
+  }
+
+  return res.status(400).json({ error:'Unsupported archive record type.' });
 });
 
 app.post("/api/requests", requireAuth, (req, res) => {
@@ -4743,6 +4878,7 @@ app.post("/api/requests", requireAuth, (req, res) => {
 
   // Try live catalogue first, fall back to snapshot sent from frontend
   const item = findItem(itemCode);
+  if (item && item.archivedAt) return res.status(409).json({ error: "This listing has been archived and is no longer accepting new requests." });
   const requestedQty = Math.max(1, Number(quantity != null ? quantity : qty) || 1);
   const snapSource = item || itemSnapshot || null;
   const itemPricingSnapshot = snapSource ? tpPricingSnapshotForItem(snapSource, requestedQty) : null;
@@ -7848,7 +7984,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     tx.serviceBookingId=b.id;tx.serviceFulfilmentStatus=lower(b.status);tx.serviceStreamId=b.streamId||null;tx.serviceStreamName=b.streamName||null;
     tx.serviceStartAt=b.proposedStartAt||b.neededAt||null;tx.serviceDurationMinutes=bookingDurationMinutes(b);tx.serviceDurationHours=bookingDurationMinutes(b)/60;tx.serviceTurnaroundMinutes=Math.max(0,Number(b.turnaroundMinutes||0));
     tx.serviceAvailabilityMode=b.availabilityMode||modeForMinutes(bookingDurationMinutes(b));tx.serviceFulfilmentMethod=b.fulfilmentMethod||null;tx.serviceFulfilmentLocation=b.fulfilmentLocation||null;tx.serviceFulfilmentSelectedBy=b.fulfilmentSelectedBy||null;tx.serviceFulfilmentAgreedAt=b.fulfilmentAgreedAt||null;
-    tx.serviceClientReadyAt=b.clientReadyAt||null;tx.serviceStartGraceEndsAt=b.startGraceEndsAt||null;tx.serviceStartWindowExpiredAt=b.startWindowExpiredAt||null;tx.serviceStartExpiryReason=b.startExpiryReason||null;tx.serviceBuyerRescheduleRequestedAt=b.buyerRescheduleRequestedAt||null;tx.serviceProviderStartDeadline=b.providerStartDeadline||null;tx.serviceStartedAt=b.actualStartedAt||null;
+    tx.serviceClientReadyAt=b.clientReadyAt||null;tx.serviceStartGraceEndsAt=b.startGraceEndsAt||null;tx.serviceStartWindowExpiredAt=b.startWindowExpiredAt||null;tx.serviceStartExpiryReason=b.startExpiryReason||null;tx.serviceBuyerRescheduleRequestedAt=b.buyerRescheduleRequestedAt||null;tx.serviceProposedRescheduleAt=b.proposedRescheduleAt||null;tx.serviceRescheduleProposedBy=b.rescheduleProposedBy||null;tx.serviceProviderStartDeadline=b.providerStartDeadline||null;tx.serviceStartedAt=b.actualStartedAt||null;
     tx.serviceExpectedCompletionAt=b.expectedCompletionAt||null;tx.serviceCompletionEligibleAt=b.completionEligibleAt||null;tx.serviceCompletionGraceEndsAt=b.completionGraceEndsAt||null;tx.serviceCompletionOverdueAt=b.completionOverdueAt||null;tx.serviceProviderDeliveredAt=b.providerDeliveredAt||null;tx.serviceFulfilmentPin=normalizeLocationPin(b.fulfilmentPin,'agreement_pin');
     tx.serviceBuyerReviewDueAt=b.buyerReviewDueAt||null;tx.serviceClientCompletedAt=b.clientCompletedAt||null;tx.serviceClientRatingSubmittedAt=b.clientRatingSubmittedAt||null;
     tx.serviceProviderDefaultedAt=b.providerDefaultedAt||null;tx.updatedAt=b.updatedAt||nowIso();
@@ -8017,8 +8153,10 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     else if(action==='proposal'){const p=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);rq.status='open';rq.repliedAt=nowIso();rq.serviceWorkflowStatus='awaiting_buyer';rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_terms_proposed',requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||b.neededAt,preOrderDate:b.proposedStartAt||b.neededAt,startAdjustmentMinutes:p.adjustmentMinutes,startAdjustmentLimitMinutes:p.maxAdjustmentMinutes,requestedDurationMinutes:p.baselineDurationMinutes,preOrderNote:b.providerNote||'',collectionPoint:b.location||'',message:p.adjustmentMinutes===0?'The service provider accepted your requested start time and proposed the remaining service terms. Review and accept or decline them.':`The service provider proposed a start-time adjustment of ${Math.abs(p.adjustmentMinutes)} minute(s) ${p.adjustmentMinutes<0?'earlier':'later'}, within the ${p.maxAdjustmentMinutes}-minute policy limit. Review the updated start time before accepting.`};rq.notesThread=Array.isArray(rq.notesThread)?rq.notesThread:[];rq.notesThread.push({id:uuid(),actor:'service_provider',phone:b.providerPhone,text:b.providerNote||'Service terms proposed.',at:rq.repliedAt,kind:'service_terms_proposed'});}
     else if(action==='accept'){const p=initialStartAdjustmentPolicy(b,b.proposedStartAt||b.neededAt);rq.status='answered';rq.repliedAt=nowIso();rq.serviceWorkflowStatus='agreement_ready';rq.reply={price:Number(b.agreedPrice||0)||null,itemCode:rq.itemCode,availability:'service_agreement_awaiting_payment',requestedStartAt:b.neededAt||null,proposedStartAt:b.proposedStartAt||b.neededAt,agreedStartAt:b.proposedStartAt||b.neededAt,preOrderDate:b.proposedStartAt||b.neededAt,startAdjustmentMinutes:p.adjustmentMinutes,startAdjustmentLimitMinutes:p.maxAdjustmentMinutes,requestedDurationMinutes:p.baselineDurationMinutes,preOrderNote:b.providerNote||'',collectionPoint:b.fulfilmentLocation||b.location||'',serviceFulfilmentMethod:b.fulfilmentMethod||null,serviceFulfilmentLocation:b.fulfilmentLocation||null,serviceFulfilmentPin:normalizeLocationPin(b.fulfilmentPin,'agreement_pin'),message:`Service terms agreed. The agreed start time is the provider proposal shown above. The agreed service delivery type is recorded with this booking. Complete protected payment to confirm the booking.`};}
     else if(action==='payment_reschedule_required'){rq.status='answered';rq.serviceWorkflowStatus='reschedule_required_payment';rq.repliedAt=nowIso();rq.reply={...(rq.reply||{}),availability:'service_payment_reschedule_required',message:'The agreed start time passed before protected payment was confirmed. A new service time is required.'};}
-    else if(action==='start_window_expired'){rq.status='answered';rq.serviceWorkflowStatus='start_window_expired';rq.repliedAt=nowIso();rq.reply={...(rq.reply||{}),availability:'service_start_window_expired',message:'The agreed service start window expired. The old time can no longer be used; reschedule or cancel/request resolution.'};}
-    else if(action==='paid_reschedule_confirmed'){rq.status='answered';rq.serviceWorkflowStatus='booked';rq.repliedAt=nowIso();rq.reply={...(rq.reply||{}),availability:'service_paid_reschedule_confirmed',proposedStartAt:b.proposedStartAt||null,agreedStartAt:b.proposedStartAt||null,preOrderDate:b.proposedStartAt||null,message:'A new service time was agreed. The existing protected payment remains active for the rescheduled booking.'};}
+    else if(action==='start_window_expired'){rq.status='answered';rq.serviceWorkflowStatus='start_window_expired';rq.repliedAt=nowIso();rq.reply={...(rq.reply||{}),availability:'service_start_window_expired',proposedRescheduleAt:null,rescheduleProposedBy:null,message:'The agreed service start window expired. The old time can no longer be used; reschedule or cancel/request resolution.'};}
+    else if(action==='buyer_reschedule_proposed'){rq.status='answered';rq.serviceWorkflowStatus='reschedule_pending_provider';rq.repliedAt=nowIso();rq.reply={...(rq.reply||{}),availability:'service_reschedule_pending_provider',proposedRescheduleAt:b.proposedRescheduleAt||null,rescheduleProposedBy:'buyer',message:'The customer proposed a replacement service time. The provider must accept it or suggest another time.'};}
+    else if(action==='provider_reschedule_proposed'){rq.status='answered';rq.serviceWorkflowStatus='reschedule_pending_client';rq.repliedAt=nowIso();rq.reply={...(rq.reply||{}),availability:'service_reschedule_pending_client',proposedRescheduleAt:b.proposedRescheduleAt||null,rescheduleProposedBy:'provider',message:'The provider proposed a replacement service time. The customer must accept it or suggest another time.'};}
+    else if(action==='paid_reschedule_confirmed'){rq.status='answered';rq.serviceWorkflowStatus='booked';rq.repliedAt=nowIso();rq.reply={...(rq.reply||{}),availability:'service_paid_reschedule_confirmed',proposedStartAt:b.proposedStartAt||null,agreedStartAt:b.proposedStartAt||null,preOrderDate:b.proposedStartAt||null,proposedRescheduleAt:null,rescheduleProposedBy:null,message:'A new service time was mutually agreed. The existing protected payment remains active for the rescheduled booking.'};}
     else if(action==='case_resolved'){rq.status='answered';rq.serviceWorkflowStatus='case_resolved';rq.repliedAt=nowIso();rq.reply={...(rq.reply||{}),availability:'service_case_resolved',message:'This service agreement ended when the case was resolved.'};}
     if(dbEnabled())dbUpsertRequest(rq).catch(()=>{});}
 
@@ -8080,7 +8218,7 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
     } else if(lower(b.status)==='agreement_ready' && action==='set_fulfilment'){
       const item=itemByCode(b.itemCode),allowed=serviceFulfilmentCapabilities(item),method=lower(req.body&&req.body.fulfilmentMethod||'');const submittedPin=normalizeLocationPin(req.body&&(req.body.serviceLocationPin||req.body.clientLocationPin),'client_gps');if(submittedPin)b.clientLocationPin=submittedPin;if(!allowed.includes(method))return res.status(400).json({error:'Choose an available service fulfilment method.'});b.allowedFulfilmentMethods=allowed;b.fulfilmentMethod=method;b.fulfilmentLocation=fulfilmentLocationFor(item,b,method);b.fulfilmentPin=fulfilmentPinFor(item,b,method);b.fulfilmentSelectedBy='buyer';b.fulfilmentAgreedAt=nowIso();updateLinkedRequest(b,'accept');
     } else if(lower(b.status)==='reschedule_pending_client'){
-      if(action==='accept_reschedule'){const s=streamById(b.streamId);const check=streamCanTake(s,b.proposedRescheduleAt,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});const rescheduleReason=b.rescheduleReason;b.previousStartAt=b.proposedStartAt;b.proposedStartAt=b.proposedRescheduleAt;b.proposedRescheduleAt=null;b.clientReadyAt=null;b.providerStartDeadline=null;b.startGraceEndsAt=null;b.startWindowExpiredAt=null;b.startExpiryReason=null;b.buyerRescheduleRequestedAt=null;if(rescheduleReason==='payment_missed'){b.status='agreement_ready';b.reservationExpiresAt=iso(Date.now()+AGREEMENT_SLOT_RESERVATION_MS);b.paymentDueAt=null;b.transactionId=null;b.rescheduleReason=null;updateLinkedRequest(b,'accept');bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'payment_missed_reschedule_accepted'});}else if(rescheduleReason==='missed_start'){b.status='booked';b.rescheduleReason=null;b.startGraceEndsAt=iso(startWindowDeadlineMs(b));if(b.providerDefaultedAt){b.lastProviderDefaultedAt=b.providerDefaultedAt;b.providerDefaultedAt=null;}updateLinkedRequest(b,'paid_reschedule_confirmed');bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'missed_start_reschedule_accepted',newStartAt:b.proposedStartAt});}else{b.providerPostponements=Number(b.providerPostponements||0)+1;b.status='booked';b.startGraceEndsAt=iso(startWindowDeadlineMs(b));bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'provider_reschedule_accepted'});}}else if(action==='decline_reschedule'){const rescheduleReason=b.rescheduleReason;b.proposedRescheduleAt=null;if(rescheduleReason==='payment_missed'){b.status='reschedule_required_payment';bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'payment_missed_reschedule_declined'});}else if(rescheduleReason==='missed_start'){b.status='start_window_expired';b.rescheduleReason=null;bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'missed_start_reschedule_declined'});}else{b.status=serviceDateMs(b.proposedStartAt)<=Date.now()?'awaiting_client_start':'booked';bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'provider_reschedule_declined'});}}else return res.status(400).json({error:'Choose accept_reschedule or decline_reschedule.'});
+      if(action==='accept_reschedule'){const s=streamById(b.streamId);const check=streamCanTake(s,b.proposedRescheduleAt,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});const rescheduleReason=b.rescheduleReason;b.previousStartAt=b.proposedStartAt;b.proposedStartAt=b.proposedRescheduleAt;b.proposedRescheduleAt=null;b.rescheduleProposedBy=null;b.clientReadyAt=null;b.providerStartDeadline=null;b.startGraceEndsAt=null;b.startWindowExpiredAt=null;b.startExpiryReason=null;b.buyerRescheduleRequestedAt=null;if(rescheduleReason==='payment_missed'){b.status='agreement_ready';b.reservationExpiresAt=iso(Date.now()+AGREEMENT_SLOT_RESERVATION_MS);b.paymentDueAt=null;b.transactionId=null;b.rescheduleReason=null;updateLinkedRequest(b,'accept');bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'payment_missed_reschedule_accepted'});}else if(rescheduleReason==='missed_start'){b.status='booked';b.rescheduleReason=null;b.startGraceEndsAt=iso(startWindowDeadlineMs(b));if(b.providerDefaultedAt){b.lastProviderDefaultedAt=b.providerDefaultedAt;b.providerDefaultedAt=null;}updateLinkedRequest(b,'paid_reschedule_confirmed');bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'missed_start_reschedule_accepted',newStartAt:b.proposedStartAt});}else{b.providerPostponements=Number(b.providerPostponements||0)+1;b.status='booked';b.startGraceEndsAt=iso(startWindowDeadlineMs(b));bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'provider_reschedule_accepted'});}}else if(action==='decline_reschedule'){const rescheduleReason=b.rescheduleReason;b.proposedRescheduleAt=null;b.rescheduleProposedBy=null;if(rescheduleReason==='payment_missed'){b.status='reschedule_required_payment';bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'payment_missed_reschedule_declined'});}else if(rescheduleReason==='missed_start'){b.status='start_window_expired';b.rescheduleReason=null;bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'missed_start_reschedule_declined'});}else{b.status=serviceDateMs(b.proposedStartAt)<=Date.now()?'awaiting_client_start':'booked';bookingHistory(b).push({at:nowIso(),actor:'buyer',action:'provider_reschedule_declined'});}}else return res.status(400).json({error:'Choose accept_reschedule or decline_reschedule.'});
     } else return res.status(409).json({error:'No buyer response is required for this booking.'});b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'buyer',action});syncTx(b);await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});});
 
   app.post('/api/services/bookings/:id/status',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});const action=lower(req.body&&req.body.action||req.body&&req.body.status),isBuyer=String(req.user.phone)===String(b.buyerPhone)&&req.user.role==='buyer',isProvider=String(req.user.phone)===String(b.providerPhone)&&req.user.role==='seller',isAdmin=req.user.role==='admin';const st=lower(b.status),tx=txFor(b);if(b.disputeActive||tx&&tx.disputeActive)return res.status(409).json({error:'Service actions are paused while the issue is under review.'});
@@ -8092,10 +8230,14 @@ app.post('/api/issues/cases/:caseId/actions', requireAuth, requireIssuesDesk, as
       if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the assigned service provider can mark the service delivered.'});if(!['in_progress','completion_overdue'].includes(st))return res.status(409).json({error:'Service delivery has not been started.'});if(!b.completionEligibleAt||Date.now()<Date.parse(b.completionEligibleAt))return res.status(409).json({error:'Service delivered can be confirmed only after at least 70% of the estimated service duration has elapsed.'});b.providerDeliveredAt=nowIso();b.buyerReviewDueAt=iso(Date.now()+DELIVERY_REVIEW_MS);b.status='provider_delivered';bookingHistory(b).push({at:b.providerDeliveredAt,actor:'provider',action:'service_delivered'});
     } else if(action==='client_completed'){
       if(!isBuyer&&!isAdmin)return res.status(403).json({error:'Only the client can confirm service completion.'});if(st!=='provider_delivered')return res.status(409).json({error:'The provider has not yet marked the service delivered.'});b.clientCompletedAt=nowIso();b.status='awaiting_rating';bookingHistory(b).push({at:b.clientCompletedAt,actor:'buyer',action:'service_completion_confirmed'});if(tx){tx.status='delivered';tx.deliveredAt=b.clientCompletedAt;}
-    } else if(action==='buyer_request_reschedule'){
-      if(!isBuyer&&!isAdmin)return res.status(403).json({error:'Only the client can request a new service time.'});if(st!=='start_window_expired')return res.status(409).json({error:'A new-time request is available only after the agreed start window expires.'});b.buyerRescheduleRequestedAt=nowIso();bookingHistory(b).push({at:b.buyerRescheduleRequestedAt,actor:'buyer',action:'buyer_requested_reschedule_after_missed_start'});
+    } else if(action==='buyer_request_reschedule'||action==='buyer_propose_reschedule'||action==='buyer_counter_reschedule'){
+      if(!isBuyer&&!isAdmin)return res.status(403).json({error:'Only the client can propose a replacement service time.'});if(!['start_window_expired','reschedule_pending_client'].includes(st))return res.status(409).json({error:'A replacement time can be proposed only after the start window expires or while reviewing the provider’s proposal.'});const newStart=normalizeServiceDate(req.body&&req.body.newStartAt);if(!newStart||!Number.isFinite(serviceDateMs(newStart))||serviceDateMs(newStart)<=Date.now())return res.status(400).json({error:'Choose a valid future replacement time.'});const s=streamById(b.streamId),check=streamCanTake(s,newStart,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});b.buyerRescheduleRequestedAt=nowIso();b.proposedRescheduleAt=newStart;b.rescheduleRequestedAt=b.buyerRescheduleRequestedAt;b.rescheduleReason=(st==='reschedule_pending_client'&&b.rescheduleReason)?b.rescheduleReason:'missed_start';b.rescheduleProposedBy='buyer';b.status='reschedule_pending_provider';bookingHistory(b).push({at:b.rescheduleRequestedAt,actor:'buyer',action:st==='reschedule_pending_client'?'buyer_counter_reschedule_proposed':'buyer_reschedule_proposed_after_missed_start',newStartAt:newStart});updateLinkedRequest(b,'buyer_reschedule_proposed');
+    } else if(action==='provider_accept_reschedule'){
+      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the provider can accept the customer’s proposed time.'});if(st!=='reschedule_pending_provider'||!b.proposedRescheduleAt)return res.status(409).json({error:'There is no customer-proposed replacement time awaiting provider approval.'});const newStart=normalizeServiceDate(b.proposedRescheduleAt);const s=streamById(b.streamId),check=streamCanTake(s,newStart,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});const rescheduleReason=b.rescheduleReason;b.previousStartAt=b.proposedStartAt;b.proposedStartAt=newStart;b.proposedRescheduleAt=null;b.rescheduleProposedBy=null;b.clientReadyAt=null;b.providerStartDeadline=null;b.startGraceEndsAt=null;b.startWindowExpiredAt=null;b.startExpiryReason=null;b.buyerRescheduleRequestedAt=null;if(rescheduleReason==='payment_missed'){b.status='agreement_ready';b.reservationExpiresAt=iso(Date.now()+AGREEMENT_SLOT_RESERVATION_MS);b.paymentDueAt=null;b.transactionId=null;b.rescheduleReason=null;updateLinkedRequest(b,'accept');bookingHistory(b).push({at:nowIso(),actor:'provider',action:'buyer_payment_missed_reschedule_accepted',newStartAt:b.proposedStartAt});}else{b.status='booked';b.rescheduleReason=null;b.startGraceEndsAt=iso(startWindowDeadlineMs(b));if(b.providerDefaultedAt){b.lastProviderDefaultedAt=b.providerDefaultedAt;b.providerDefaultedAt=null;}updateLinkedRequest(b,'paid_reschedule_confirmed');bookingHistory(b).push({at:nowIso(),actor:'provider',action:'buyer_reschedule_accepted',newStartAt:b.proposedStartAt});}
+    } else if(action==='provider_decline_reschedule'){
+      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the provider can decline the customer’s proposed time.'});if(st!=='reschedule_pending_provider')return res.status(409).json({error:'There is no customer-proposed time awaiting provider response.'});b.proposedRescheduleAt=null;b.rescheduleProposedBy=null;b.status='start_window_expired';b.rescheduleReason='missed_start';updateLinkedRequest(b,'start_window_expired');bookingHistory(b).push({at:nowIso(),actor:'provider',action:'buyer_reschedule_declined'});
     } else if(action==='request_reschedule'){
-      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the provider can propose a replacement time.'});if(!['booked','awaiting_client_start','reschedule_required_payment','start_window_expired'].includes(st))return res.status(409).json({error:'This booking can no longer be rescheduled from the provider console.'});const paymentMissed=st==='reschedule_required_payment',missedStart=st==='start_window_expired';const newStart=normalizeServiceDate(req.body&&req.body.newStartAt);if(!newStart||!Number.isFinite(serviceDateMs(newStart))||serviceDateMs(newStart)<=Date.now())return res.status(400).json({error:'Choose a valid future replacement time.'});const s=streamById(b.streamId),check=streamCanTake(s,newStart,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});b.proposedRescheduleAt=newStart;b.rescheduleRequestedAt=nowIso();b.rescheduleReason=paymentMissed?'payment_missed':(missedStart?'missed_start':(b.rescheduleReason||'provider_request'));b.status='reschedule_pending_client';bookingHistory(b).push({at:b.rescheduleRequestedAt,actor:'provider',action:paymentMissed?'payment_missed_reschedule_proposed':(missedStart?'missed_start_reschedule_proposed':'reschedule_requested'),newStartAt:newStart});
+      if(!isProvider&&!isAdmin)return res.status(403).json({error:'Only the provider can propose a replacement time.'});if(!['booked','awaiting_client_start','reschedule_required_payment','start_window_expired','reschedule_pending_provider'].includes(st))return res.status(409).json({error:'This booking can no longer be rescheduled from the provider console.'});const paymentMissed=st==='reschedule_required_payment',missedStart=['start_window_expired','reschedule_pending_provider'].includes(st);const newStart=normalizeServiceDate(req.body&&req.body.newStartAt);if(!newStart||!Number.isFinite(serviceDateMs(newStart))||serviceDateMs(newStart)<=Date.now())return res.status(400).json({error:'Choose a valid future replacement time.'});const s=streamById(b.streamId),check=streamCanTake(s,newStart,bookingDurationMinutes(b),b.turnaroundMinutes,b.id);if(!check.ok)return res.status(409).json({error:check.reason});b.proposedRescheduleAt=newStart;b.rescheduleRequestedAt=nowIso();b.rescheduleReason=paymentMissed?'payment_missed':(missedStart?'missed_start':(b.rescheduleReason||'provider_request'));b.rescheduleProposedBy='provider';b.status='reschedule_pending_client';updateLinkedRequest(b,'provider_reschedule_proposed');bookingHistory(b).push({at:b.rescheduleRequestedAt,actor:'provider',action:paymentMissed?'payment_missed_reschedule_proposed':(missedStart?'missed_start_reschedule_proposed':'reschedule_requested'),newStartAt:newStart});
     } else return res.status(400).json({error:'That service action is not available.'});b.updatedAt=nowIso();syncTx(b);if(tx&&dbEnabled())dbUpsertTransaction(tx).catch(()=>{});await persist('booking',b);res.json({ok:true,booking:b,availability:snapshot(itemByCode(b.itemCode))});});
 
   app.post('/api/services/bookings/:id/rating',requireAuth,async(req,res)=>{await load().catch(()=>{});prune();const b=bookings.find(x=>String(x.id)===String(req.params.id));if(!b)return res.status(404).json({error:'Booking not found.'});if(String(req.user.phone)!==String(b.buyerPhone)&&req.user.role!=='admin')return res.status(403).json({error:'Only the client can rate this service.'});if(lower(b.status)!=='awaiting_rating')return res.status(409).json({error:'This booking is not awaiting a service rating.'});if(b.clientRatingSubmittedAt)return res.status(409).json({error:'This service has already been rated.'});const quality=Number(req.body&&req.body.quality),professionalism=Number(req.body&&req.body.professionalism||quality);if(![1,2,3,4,5].includes(quality)||![1,2,3,4,5].includes(professionalism))return res.status(400).json({error:'Choose a quality and professionalism rating from 1 to 5.'});b.clientRating={quality,professionalism,wouldUseAgain:req.body&&req.body.wouldUseAgain!==false,comment:clean(req.body&&req.body.comment,500),submittedAt:nowIso()};b.clientRatingSubmittedAt=b.clientRating.submittedAt;const scored=scoreBooking(b,b.clientRating);b.status='ready_for_release';b.updatedAt=nowIso();bookingHistory(b).push({at:b.updatedAt,actor:'buyer',action:'service_rated',quality,professionalism,scoreDelta:scored.delta});const tx=syncTx(b);if(tx){tx.serviceClientRatingSubmittedAt=b.clientRatingSubmittedAt;tx.serviceReliabilityAdjustment=scored.delta;tx.serviceReliabilityScoreAfter=scored.stream.points;if(dbEnabled())dbUpsertTransaction(tx).catch(()=>{});}await persist('booking',b);logAudit(req,'service_rating_submitted',{bookingId:b.id,streamId:b.streamId,quality,delta:scored.delta,scoreAfter:scored.stream.points});res.json({ok:true,booking:b,reliability:scored,providerReliability:providerReliability(b.providerPhone)});});
