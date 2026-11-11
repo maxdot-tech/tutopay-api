@@ -4786,12 +4786,9 @@ app.get("/api/requests", requireAuth, (req, res) => {
     return res.json(requests);
   }
 
-  const myPhone = tpAuthLocalPhone(req.user.phone) || String(req.user.phone || "").trim();
-  let myReqs = requests.filter((rq) => {
-    const from = tpAuthLocalPhone(rq && rq.fromPhone) || String((rq && rq.fromPhone) || "").trim();
-    const to = tpAuthLocalPhone(rq && rq.toPhone) || String((rq && rq.toPhone) || "").trim();
-    return from === myPhone || to === myPhone;
-  });
+  let myReqs = requests.filter(
+    (rq) => rq.fromPhone === req.user.phone || rq.toPhone === req.user.phone
+  );
   if (typeof globalThis.__tpFilterServiceRequestsForUser === "function") {
     myReqs = globalThis.__tpFilterServiceRequestsForUser(req.user, myReqs);
   }
@@ -4861,54 +4858,42 @@ app.post("/api/archive/:kind/:id", requireAuth, async (req, res) => {
 });
 
 app.post("/api/requests", requireAuth, (req, res) => {
-  const { fromPhone: bodyFromPhone, toPhone: bodyToPhone, itemCode, quantity, qty, itemSnapshot } = req.body || {};
+  const { fromPhone, toPhone, itemCode, quantity, qty, itemSnapshot } = req.body || {};
 
-  if (req.user.role !== "buyer" && req.user.role !== "admin") {
+    if (req.user.role !== "buyer" && req.user.role !== "admin") {
     return res.status(403).json({ error: "Only buyers can create requests." });
   }
 
-  const authFromPhone = String(req.user.phone || "").trim();
-  const authFromLocal = tpAuthLocalPhone(authFromPhone) || authFromPhone;
-  const bodyFromLocal = tpAuthLocalPhone(bodyFromPhone) || String(bodyFromPhone || "").trim();
-  if (bodyFromPhone && bodyFromLocal !== authFromLocal && req.user.role !== "admin") {
-    return res.status(403).json({ error: "You can only send requests from your own phone number." });
+  if (req.user.phone !== fromPhone && req.user.role !== "admin") {
+    return res.status(403).json({
+      error: "You can only send requests from your own phone number.",
+    });
   }
 
-  if (!itemCode) {
-    return res.status(400).json({ error: "Missing itemCode" });
+  if (!fromPhone || !toPhone || !itemCode) {
+    return res
+      .status(400)
+      .json({ error: "Missing fromPhone, toPhone or itemCode" });
   }
 
-  // Resolve the canonical seller directly from the live listing whenever possible.
-  // This prevents a frontend phone-format mismatch from creating a request that the
-  // seller cannot retrieve later.
+  // Try live catalogue first, fall back to snapshot sent from frontend
   const item = findItem(itemCode);
-  if (item && item.archivedAt) {
-    return res.status(409).json({ error: "This listing has been archived and is no longer accepting new requests." });
-  }
-  const resolvedToPhone = String((item && item.sellerPhone) || bodyToPhone || "").trim();
-  const resolvedToLocal = tpAuthLocalPhone(resolvedToPhone) || resolvedToPhone;
-  if (!resolvedToPhone) {
-    return res.status(400).json({ error: "This listing has no seller recipient." });
-  }
-  if (resolvedToLocal === authFromLocal) {
-    return res.status(400).json({ error: "You cannot send a request to your own listing." });
-  }
-
+  if (item && item.archivedAt) return res.status(409).json({ error: "This listing has been archived and is no longer accepting new requests." });
   const requestedQty = Math.max(1, Number(quantity != null ? quantity : qty) || 1);
   const snapSource = item || itemSnapshot || null;
   const itemPricingSnapshot = snapSource ? tpPricingSnapshotForItem(snapSource, requestedQty) : null;
 
   const reqObj = {
     id: uuid(),
-    fromPhone: authFromPhone,
-    toPhone: resolvedToPhone,
+    fromPhone,
+    toPhone,
     itemCode,
     quantity: requestedQty,
     status: "open",
     createdAt: nowIso(),
     repliedAt: null,
     reply: null,
-    itemSnapshot: snapSource
+       itemSnapshot: snapSource
       ? {
           code: snapSource.code,
           title: snapSource.title,
@@ -4929,7 +4914,6 @@ app.post("/api/requests", requireAuth, (req, res) => {
 
   requests.push(reqObj);
   if (dbEnabled()) { dbUpsertRequest(reqObj).catch(() => {}); }
-  logAudit(req, "quote_request_created", { requestId:reqObj.id, fromPhone:reqObj.fromPhone, toPhone:reqObj.toPhone, itemCode:reqObj.itemCode, quantity:reqObj.quantity });
   res.status(201).json(reqObj);
 });
 
