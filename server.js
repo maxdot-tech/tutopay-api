@@ -2257,8 +2257,9 @@ function tpAuthDigits(v) {
 }
 function tpAuthLocalPhone(v) {
   let d = tpAuthDigits(v);
-  // Older records/inputs may have been kept as 26097XXXXXXX. For matching only, convert to 097XXXXXXX.
-  if (d.length === 12 && d.startsWith('260')) d = '0' + d.slice(3);
+  // Normalize standard +26097... and older +260097... records to local 097... format.
+  if (d.length === 13 && d.startsWith('2600')) d = d.slice(3);
+  else if (d.length === 12 && d.startsWith('260')) d = '0' + d.slice(3);
   return d;
 }
 function tpRequestPhoneMatches(a, b) {
