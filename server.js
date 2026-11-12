@@ -13606,3 +13606,156 @@ async function checkFinancePartnerAction(action) {
 
   console.log('[TutoPay] Admin operations reporting API loaded');
 })();
+/* ======================================================================
+   TutoPay Next v0.23 - DB-authoritative catalogue pricing sync
+   APPEND THIS BLOCK AT THE VERY END OF THE CURRENT WORKING server.js.
+
+   This is additive only. Existing R&R, payment, hold, transit, delivery,
+   release and dispute routes are not replaced.
+   ====================================================================== */
+try {
+  const TP23_MODE = (raw, body) => {
+    const direct = String(raw || '').trim();
+    const up = direct.toUpperCase();
+    const low = direct.toLowerCase();
+    if (up === 'SD' || up === 'DMP' || up === 'N') return up;
+    if (low === 'negotiable') return 'N';
+    if (low === 'percent') {
+      const minQty = Math.max(1, Number((body || {}).dmpMinQty || (body || {}).discountMinQty || 1) || 1);
+      return minQty > 1 ? 'DMP' : 'SD';
+    }
+    return 'fixed';
+  };
+
+  const TP23_KIND = (raw) => {
+    const k = String(raw || 'percent').trim().toLowerCase();
+    return ['amount','fixed','kwacha'].includes(k) ? 'amount' : 'percent';
+  };
+
+  const TP23_LITE = (it) => {
+    const out = { ...(it || {}) };
+    const urls = Array.isArray(out.imageUrls) ? out.imageUrls : (out.imageUrl ? [out.imageUrl] : []);
+    const thumb = urls.length ? urls[0] : null;
+    out.imageUrl = (typeof thumb === 'string' && thumb.startsWith('data:') && thumb.length > 2000) ? null : thumb;
+    out.imageCount = urls.length;
+    delete out.imageUrls;
+    try {
+      if (typeof globalThis.__tpServiceAvailabilityForItem === 'function' && String(out.listingType || '').toLowerCase() === 'service') {
+        out.serviceAvailability = globalThis.__tpServiceAvailabilityForItem(it);
+      }
+    } catch (_) {}
+    return out;
+  };
+
+  async function tp23DbItem(idOrCode) {
+    const key = String(idOrCode || '').trim();
+    if (!key) return null;
+    if (typeof dbEnabled === 'function' && dbEnabled() && typeof _pgPool !== 'undefined' && _pgPool) {
+      const q = await _pgPool.query(
+        `SELECT id, code, data FROM tutopay_items
+         WHERE id = $1 OR code = $1
+         ORDER BY updated_at DESC LIMIT 1`,
+        [key]
+      );
+      if (q.rows && q.rows.length) return q.rows[0].data || null;
+    }
+    try { if (typeof findItem === 'function') { const x = findItem(key); if (x) return x; } } catch (_) {}
+    try {
+      return (Array.isArray(items) ? items : []).find(x => String(x.id || '') === key || String(x.code || x.itemCode || '') === key) || null;
+    } catch (_) { return null; }
+  }
+
+  function tp23SyncMemory(saved) {
+    try {
+      if (!saved || !Array.isArray(items)) return;
+      const idx = items.findIndex(x => String(x.id || '') === String(saved.id || '') || String(x.code || '') === String(saved.code || ''));
+      if (idx >= 0) items[idx] = { ...items[idx], ...saved };
+      else items.push(saved);
+    } catch (_) {}
+  }
+
+  app.get('/api/items-live', async (req, res) => {
+    try {
+      const full = ['1','true','yes'].includes(String((req.query || {}).full || '').toLowerCase());
+      if (typeof dbEnabled === 'function' && dbEnabled() && typeof _pgPool !== 'undefined' && _pgPool) {
+        const q = await _pgPool.query('SELECT data FROM tutopay_items ORDER BY updated_at ASC');
+        const rows = (q.rows || []).map(r => r.data).filter(Boolean);
+        rows.forEach(tp23SyncMemory);
+        return res.json(full ? rows : rows.map(TP23_LITE));
+      }
+      const rows = Array.isArray(items) ? items : [];
+      return res.json(full ? rows : rows.map(TP23_LITE));
+    } catch (err) {
+      console.error('[TP23] items-live failed:', err && err.message ? err.message : err);
+      return res.status(500).json({ error: 'Could not load authoritative catalogue.' });
+    }
+  });
+
+  app.patch('/api/items/:id/pricing-live', requireAuth, async (req, res) => {
+    try {
+      const key = String(req.params.id || '').trim();
+      const item = await tp23DbItem(key);
+      if (!item) return res.status(404).json({ error: 'Item not found.' });
+
+      const role = String((req.user && (req.user.accountRole || req.user.role)) || '').toLowerCase();
+      const phone = String((req.user && req.user.phone) || '');
+      const owner = ['seller','service_provider'].includes(role) && phone === String(item.sellerPhone || '');
+      const admin = String((req.user && req.user.role) || '').toLowerCase() === 'admin';
+      if (!owner && !admin) return res.status(403).json({ error: 'Only the seller or admin can update item pricing terms.' });
+
+      const body = req.body || {};
+      const mode = TP23_MODE(body.pricingMode || body.mode || body.discountMode, body);
+      const discountKind = TP23_KIND(body.discountKind || body.discountType || body.type);
+      const discountValue = ['SD','DMP'].includes(mode)
+        ? Math.max(0, Number(body.discountValue || body.discountPercent || body.discountAmount || 0) || 0)
+        : 0;
+      const dmpMinQty = mode === 'DMP' ? Math.max(2, Number(body.dmpMinQty || body.discountMinQty || 2) || 2) : 2;
+      const note = String(body.pricingNote || body.discountNote || body.sellerPricingNote || '').trim().slice(0,180);
+      const updatedAt = (typeof nowIso === 'function' ? nowIso() : new Date().toISOString());
+      const rules = { mode, discountKind, discountValue, dmpMinQty, note, updatedAt };
+
+      let preview = Number(item.price || 0) || 0;
+      if (['SD','DMP'].includes(mode) && preview > 0) {
+        if (discountKind === 'amount') preview = Math.max(0, preview - discountValue);
+        else preview = Math.max(0, preview - (preview * Math.min(discountValue,95) / 100));
+        preview = Number(preview.toFixed(2));
+      }
+      rules.discountPricePreview = preview;
+
+      item.pricingRules = { ...rules };
+      item.pricingTerms = { ...rules };
+      item.pricingMode = mode;
+      item.discountKind = discountKind;
+      item.discountValue = discountValue;
+      item.discountPercent = discountKind === 'percent' ? discountValue : 0;
+      item.dmpMinQty = dmpMinQty;
+      item.discountMinQty = dmpMinQty;
+      item.pricingNote = note;
+      item.discountPricePreview = preview;
+      item.pricingUpdatedAt = updatedAt;
+      item.updatedAt = updatedAt;
+
+      if (typeof dbEnabled === 'function' && dbEnabled() && typeof _pgPool !== 'undefined' && _pgPool) {
+        await _pgPool.query(
+          `INSERT INTO tutopay_items(id, code, data, updated_at)
+           VALUES ($1,$2,$3::jsonb,NOW())
+           ON CONFLICT (id) DO UPDATE SET code=EXCLUDED.code, data=EXCLUDED.data, updated_at=NOW()`,
+          [String(item.id || key), item.code ? String(item.code) : null, JSON.stringify(item)]
+        );
+      } else if (typeof dbUpsertItem === 'function') {
+        await dbUpsertItem(item);
+      }
+
+      tp23SyncMemory(item);
+      try { if (typeof logAudit === 'function') logAudit(req, 'item_pricing_terms_updated_tp23', { itemCode: item.code, mode }); } catch (_) {}
+      return res.json({ ok: true, item, pricingRules: rules });
+    } catch (err) {
+      console.error('[TP23] pricing-live failed:', err && err.message ? err.message : err);
+      return res.status(500).json({ error: 'Pricing update failed.' });
+    }
+  });
+
+  console.log('[TutoPay] v0.23 DB-authoritative catalogue pricing patch loaded');
+} catch (e) {
+  console.error('[TutoPay] v0.23 catalogue pricing patch failed:', e && e.message ? e.message : e);
+}
