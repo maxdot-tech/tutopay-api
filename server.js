@@ -13759,3 +13759,40 @@ try {
 } catch (e) {
   console.error('[TutoPay] v0.23 catalogue pricing patch failed:', e && e.message ? e.message : e);
 }
+/* ======================================================================
+   TutoPay Next v0.24 - authoritative pricing route + health check
+   APPEND AT THE VERY END OF THE CURRENT WORKING server.js, then redeploy.
+   Existing R&R/payment/transaction routes are untouched.
+   ====================================================================== */
+try {
+  const TP24_VERSION='0.24';
+  const tp24Mode=(v)=>{const u=String(v||'fixed').trim().toUpperCase(),l=String(v||'fixed').trim().toLowerCase();if(['SD','DMP','N'].includes(u))return u;if(l==='negotiable')return'N';if(l==='percent')return'SD';return'fixed'};
+  const tp24Kind=(v)=>['amount','fixed','kwacha'].includes(String(v||'percent').toLowerCase())?'amount':'percent';
+  const tp24DbReady=()=>typeof dbEnabled==='function'&&dbEnabled()&&typeof _pgPool!=='undefined'&&_pgPool;
+  async function tp24GetItem(key){key=String(key||'').trim();if(tp24DbReady()){const q=await _pgPool.query('SELECT data FROM tutopay_items WHERE id=$1 OR code=$1 ORDER BY updated_at DESC LIMIT 1',[key]);if(q.rows&&q.rows.length)return q.rows[0].data||null}try{return(Array.isArray(items)?items:[]).find(x=>String(x.id||'')===key||String(x.code||'')===key)||null}catch(_){return null}}
+  function tp24SyncMemory(saved){try{if(!saved||!Array.isArray(items))return;const i=items.findIndex(x=>String(x.id||'')===String(saved.id||'')||String(x.code||'')===String(saved.code||''));if(i>=0)items[i]={...items[i],...saved};else items.push(saved)}catch(_){}}
+  function tp24Lite(it){const out={...(it||{})},urls=Array.isArray(out.imageUrls)?out.imageUrls:(out.imageUrl?[out.imageUrl]:[]),thumb=urls[0]||null;out.imageUrl=(typeof thumb==='string'&&thumb.startsWith('data:')&&thumb.length>2000)?null:thumb;out.imageCount=urls.length;delete out.imageUrls;try{if(typeof globalThis.__tpServiceAvailabilityForItem==='function'&&String(out.listingType||'').toLowerCase()==='service')out.serviceAvailability=globalThis.__tpServiceAvailabilityForItem(it)}catch(_){}return out}
+
+  app.get('/api/tp24/health',(req,res)=>res.json({ok:true,version:TP24_VERSION,db:!!tp24DbReady(),at:new Date().toISOString()}));
+
+  app.get('/api/tp24/items',async(req,res)=>{try{if(tp24DbReady()){const q=await _pgPool.query('SELECT data FROM tutopay_items ORDER BY updated_at ASC');const rows=(q.rows||[]).map(r=>r.data).filter(Boolean);rows.forEach(tp24SyncMemory);return res.json(rows.map(tp24Lite))}return res.json((Array.isArray(items)?items:[]).map(tp24Lite))}catch(e){console.error('[TP24] items',e);res.status(500).json({error:'TP24 catalogue read failed.'})}});
+  app.get('/api/tp24/items/:id',async(req,res)=>{try{const item=await tp24GetItem(req.params.id);if(!item)return res.status(404).json({error:'Item not found.'});tp24SyncMemory(item);return res.json(tp24Lite(item))}catch(e){console.error('[TP24] item read',e);res.status(500).json({error:'TP24 item read failed.'})}});
+
+  app.patch('/api/tp24/items/:id/pricing',requireAuth,async(req,res)=>{try{
+    const key=String(req.params.id||'').trim(),item=await tp24GetItem(key);if(!item)return res.status(404).json({error:'Item not found.'});
+    const phone=String(req.user&&req.user.phone||''),role=String(req.user&&req.user.role||'').toLowerCase(),accountRole=String(req.user&&req.user.accountRole||'').toLowerCase();
+    const owner=phone===String(item.sellerPhone||'')&&(['seller','service_provider'].includes(role)||['seller','service_provider'].includes(accountRole));
+    if(!owner&&role!=='admin')return res.status(403).json({error:'Only the listing owner or admin can change pricing.'});
+    const b=req.body||{},mode=tp24Mode(b.pricingMode||b.mode),kind=tp24Kind(b.discountKind),value=['SD','DMP'].includes(mode)?Math.max(0,Number(b.discountValue||0)||0):0,minQty=mode==='DMP'?Math.max(2,Number(b.dmpMinQty||2)||2):2,note=String(b.pricingNote||'').trim().slice(0,180),updatedAt=(typeof nowIso==='function'?nowIso():new Date().toISOString());
+    let preview=Number(item.price||0)||0;if(['SD','DMP'].includes(mode)&&preview>0){preview=kind==='amount'?Math.max(0,preview-value):Math.max(0,preview-(preview*Math.min(value,95)/100));preview=Number(preview.toFixed(2))}
+    const rules={mode,discountKind:kind,discountValue:value,dmpMinQty:minQty,note,discountPricePreview:preview,updatedAt};
+    Object.assign(item,{pricingMode:mode,pricingRules:{...rules},pricingTerms:{...rules},discountKind:kind,discountValue:value,discountPercent:kind==='percent'?value:0,dmpMinQty:minQty,discountMinQty:minQty,pricingNote:note,discountPricePreview:preview,pricingUpdatedAt:updatedAt,updatedAt});
+    if(tp24DbReady())await _pgPool.query(`INSERT INTO tutopay_items(id,code,data,updated_at) VALUES($1,$2,$3::jsonb,NOW()) ON CONFLICT(id) DO UPDATE SET code=EXCLUDED.code,data=EXCLUDED.data,updated_at=NOW()`,[String(item.id||key),item.code?String(item.code):null,JSON.stringify(item)]);else if(typeof dbUpsertItem==='function')await dbUpsertItem(item);
+    tp24SyncMemory(item);
+    const verify=await tp24GetItem(item.id||key),savedMode=tp24Mode(verify&&verify.pricingMode||verify&&verify.pricingRules&&verify.pricingRules.mode);
+    if(savedMode!==mode)return res.status(409).json({error:`Pricing verification failed. Saved ${savedMode}, expected ${mode}.`,savedMode});
+    try{if(typeof logAudit==='function')logAudit(req,'item_pricing_terms_updated_tp24',{itemCode:item.code,mode})}catch(_){}
+    return res.json({ok:true,version:TP24_VERSION,savedMode,item:verify||item});
+  }catch(e){console.error('[TP24] pricing',e);return res.status(500).json({error:'TP24 pricing update failed.'})}});
+  console.log('[TutoPay] TP24 authoritative pricing patch loaded');
+}catch(e){console.error('[TutoPay] TP24 patch failed:',e&&e.message?e.message:e)}
