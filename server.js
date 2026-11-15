@@ -13796,3 +13796,73 @@ try {
   }catch(e){console.error('[TP24] pricing',e);return res.status(500).json({error:'TP24 pricing update failed.'})}});
   console.log('[TutoPay] TP24 authoritative pricing patch loaded');
 }catch(e){console.error('[TutoPay] TP24 patch failed:',e&&e.message?e.message:e)}
+/* =====================================================================
+   TutoPay Next v0.25 — Authoritative Product Listing Foundation
+   APPEND TO THE VERY END OF THE CURRENT WORKING Railway server.js.
+   Adds new routes only. Existing R&R / payment / transaction routes are untouched.
+   ===================================================================== */
+(function TutoPayNextListingV025(){
+  const TP25_VERSION = "0.25";
+  const TP25_CATEGORIES = new Set([
+    "Phones & Phone Accessories","Computers & Electronics","Home Appliances (TV, fridge, cooker, etc.)","Furniture & Home Items","Clothes (Men)","Clothes (Women)","Shoes, Bags & Watches","Cosmetics & Hair Products","Food, Drinks & Groceries","Farming & Agro (seed, fertilizer, poultry)","Building Materials & Hardware","Tools & Services (repairs, plumbers, electricians)","Car Parts & Accessories","Vehicles & Motorbikes","Baby & Kids","Books & Stationery","Other"
+  ]);
+  const clean=(v,n=180)=>String(v==null?"":v).trim().slice(0,n);
+  const num=v=>{const n=Number(v);return Number.isFinite(n)?n:null};
+
+  app.get('/api/tp25/health', requireAuth, (req,res)=>res.json({ok:true,version:TP25_VERSION,listingFoundation:true}));
+
+  // Database-authoritative catalogue read for Next. This prevents one Railway
+  // process from returning an older in-memory copy after another process writes.
+  app.get('/api/tp25/items', requireAuth, async (req,res)=>{
+    try{
+      if (dbEnabled() && _pgPool){
+        const r=await _pgPool.query('SELECT data FROM tutopay_items ORDER BY updated_at DESC');
+        return res.json((r.rows||[]).map(x=>x.data).filter(Boolean));
+      }
+      return res.json(Array.isArray(items)?items:[]);
+    }catch(e){
+      console.error('[tp25 items] read failed',e);
+      return res.status(500).json({error:'Could not load catalogue from the authoritative store.'});
+    }
+  });
+
+  async function tp25NextCode(){
+    try{
+      if (dbEnabled() && _pgPool){
+        const r=await _pgPool.query("SELECT COALESCE(MAX(CASE WHEN code ~ '^[0-9]+$' THEN code::bigint ELSE 0 END),999)+1 AS next_code FROM tutopay_items");
+        const n=Number(r.rows&&r.rows[0]&&r.rows[0].next_code);if(Number.isFinite(n)&&n>0){if(typeof nextItemNumber==='number'&&n>=nextItemNumber)nextItemNumber=n+1;return String(n)}
+      }
+    }catch(e){console.warn('[tp25 items] DB code allocation fallback',e&&e.message)}
+    let code=String(nextItemNumber++);while(findItem(code))code=String(nextItemNumber++);return code;
+  }
+
+  app.post('/api/tp25/items', requireAuth, async (req,res)=>{
+    try{
+      const b=req.body||{}, sellerPhone=clean(b.sellerPhone,40), title=clean(b.title,100), details=clean(b.details,600), price=Number(b.price);
+      if(!sellerPhone)return res.status(400).json({error:'Missing seller phone number.'});
+      if(!['seller','admin'].includes(String(req.user&&req.user.role||'').toLowerCase()))return res.status(403).json({error:'Only sellers can list products.'});
+      if(String(req.user.phone||'')!==sellerPhone&&String(req.user.role||'').toLowerCase()!=='admin')return res.status(403).json({error:'You can only list items for your own account.'});
+      if(!title||!Number.isFinite(price)||price<=0)return res.status(400).json({error:'Enter a valid item title and price.'});
+      const category=clean(b.category,120);if(!TP25_CATEGORIES.has(category))return res.status(400).json({error:'Select a valid product category.'});
+      const holdHours=Number(b.holdHours);if(!Number.isFinite(holdHours)||holdHours<1||holdHours>168)return res.status(400).json({error:'Holding period must be between 1 hour and 7 days.'});
+      const pricingMode=String(b.pricingMode||b.mode||'fixed').trim();if(!['fixed','SD','DMP','N'].includes(pricingMode))return res.status(400).json({error:'Invalid pricing mode.'});
+      const imageUrls=Array.isArray(b.imageUrls)?b.imageUrls.slice(0,15):[];
+      const cache=new Map();const convert=async u=>{if(typeof u!=='string'||!u)return'';if(!u.startsWith('data:'))return u;if(cache.has(u))return cache.get(u);const saved=await persistImageDataUrl(u,{prefix:'item',folder:`tutopay/catalogue/${sellerPhone.replace(/[^0-9A-Za-z_-]+/g,'-')}`});cache.set(u,saved);return saved};
+      const converted=(await Promise.all(imageUrls.map(convert))).filter(Boolean),first=await convert(b.imageUrl||converted[0]||imageUrls[0]||'');
+      const loc=b.listingLocation&&typeof b.listingLocation==='object'?b.listingLocation:{};const lat=num(loc.lat),lng=num(loc.lng),locationText=clean(b.locationText||loc.label,180);
+      const item={
+        id:uuid(),code:await tp25NextCode(),title,details,price,sellerPhone,
+        sellerDisplayName:clean(b.sellerDisplayName,100),sellerBusinessName:clean(b.sellerBusinessName,120),sellerAvatarUrl:clean(b.sellerAvatarUrl,500),
+        holdHours,imageUrl:first||converted[0]||'',imageUrls:converted,availability:clean(b.availability,40)||'available',condition:clean(b.condition,20)||'used',category,
+        listingType:'product',locationText,listingLocation:{label:locationText,lat:lat!=null?lat:null,lng:lng!=null?lng:null,capturedAt:clean(loc.capturedAt,60)||null},createdFrom:'next-v0.25',createdAt:(typeof nowIso==='function'?nowIso():new Date().toISOString())
+      };
+      tpApplyPricingRulesToItem(item,tpPricingRulesFromBody({...b,pricingMode,mode:pricingMode},price));
+      items.push(item);
+      await dbUpsertItem(item);
+      try{if(typeof logAudit==='function')logAudit(req,'item_create_v025',{itemId:item.id,itemCode:item.code,pricingMode:item.pricingMode||item.pricingRules&&item.pricingRules.mode,holdHours:item.holdHours,category:item.category,hasGps:lat!=null&&lng!=null,imageCount:item.imageUrls.length})}catch(_){}
+      return res.status(201).json(item);
+    }catch(e){console.error('[tp25 items] create failed',e);return res.status(500).json({error:'Could not publish the product listing.'})}
+  });
+
+  console.log('[TutoPay] Next v0.25 listing foundation loaded');
+})();
