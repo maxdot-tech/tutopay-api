@@ -13866,3 +13866,45 @@ try {
 
   console.log('[TutoPay] Next v0.25 listing foundation loaded');
 })();
+
+/* =======================================================================
+   TutoPay v0.49 — DMP order-total repair
+   APPEND THIS TO THE END OF THE CURRENT SERVER FILE.
+   DMP only: preserve quantity/unit/order total and validate seller reply
+   against the full qualifying order total instead of one discounted unit.
+   Fixed / SD / Negotiable behavior is intentionally unchanged.
+   ======================================================================= */
+try {
+  const __tpPricingSnapshotForItemV049 = tpPricingSnapshotForItem;
+  tpPricingSnapshotForItem = function tpPricingSnapshotForItemV049(item, qty = 1) {
+    const snap = __tpPricingSnapshotForItemV049(item, qty);
+    const q = Math.max(1, Number(qty || 1) || 1);
+    const unit = Number(snap && snap.discountPrice || 0) || 0;
+    return {
+      ...snap,
+      quantity: q,
+      unitPrice: unit,
+      orderTotal: Number((unit * q).toFixed(2)),
+    };
+  };
+
+  const __tpPricingMaxQuoteForRequestV049 = tpPricingMaxQuoteForRequest;
+  tpPricingMaxQuoteForRequest = function tpPricingMaxQuoteForRequestV049(rq) {
+    const snap = rq && rq.itemPricingSnapshot;
+    if (snap && tpPricingMode(snap.mode) === "DMP") {
+      const qty = Math.max(1, Number((rq && (rq.quantity ?? rq.qty)) || snap.quantity || 1) || 1);
+      const unit = Number(
+        snap.discountEligible === true
+          ? (snap.discountPrice ?? snap.unitPrice ?? 0)
+          : (snap.basePrice ?? 0)
+      ) || 0;
+      const total = Number(snap.orderTotal || 0) || Number((unit * qty).toFixed(2));
+      return total > 0 ? total : 0;
+    }
+    return __tpPricingMaxQuoteForRequestV049(rq);
+  };
+
+  console.log("[TutoPay] v0.49 DMP order-total repair loaded");
+} catch (e) {
+  console.error("[TutoPay] v0.49 DMP order-total repair failed:", e && e.message ? e.message : e);
+}
