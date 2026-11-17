@@ -13908,3 +13908,29 @@ try {
 } catch (e) {
   console.error("[TutoPay] v0.49 DMP order-total repair failed:", e && e.message ? e.message : e);
 }
+/* =======================================================================
+   TutoPay v0.50 — DMP minimum-quantity persistence guard
+   APPEND THIS AFTER THE EXISTING v0.49 DMP TOTAL PATCH.
+   DMP only: preserve the seller's explicit minimum quantity exactly.
+   Fixed / SD / Negotiable behavior is unchanged.
+   ======================================================================= */
+try {
+  const __tpPricingRulesFromBodyV050 = tpPricingRulesFromBody;
+  tpPricingRulesFromBody = function tpPricingRulesFromBodyV050(body, basePrice) {
+    const b = body || {};
+    const rules = __tpPricingRulesFromBodyV050(b, basePrice);
+    const mode = tpPricingMode(b.pricingMode || b.mode || rules.mode);
+    if (mode === "DMP") {
+      const raw = b.dmpMinQty ?? b.discountMinQty;
+      const explicit = Number(raw);
+      if (Number.isFinite(explicit) && Number.isInteger(explicit) && explicit >= 2) {
+        rules.dmpMinQty = explicit;
+        rules.discountPricePreview = tpPricingDiscountedPrice(basePrice, rules, explicit);
+      }
+    }
+    return rules;
+  };
+  console.log("[TutoPay] v0.50 DMP minimum-quantity persistence guard loaded");
+} catch (e) {
+  console.error("[TutoPay] v0.50 DMP minimum-quantity guard failed:", e && e.message ? e.message : e);
+}
