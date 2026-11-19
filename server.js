@@ -14146,3 +14146,311 @@ try {
 } catch (e) {
   console.error('[TutoPay] v0.54 Service Foundation addon failed:', e && e.message ? e.message : e);
 }
+/* =======================================================================
+   TutoPay Next v0.55 — Service Enquiries & Provider Queue (append-only)
+   -----------------------------------------------------------------------
+   Requires the v0.54 Service Foundation addon to remain in server.js.
+
+   Adds:
+   - POST /api/services/:itemCode/availability
+   - GET  /api/services/bookings
+   - POST /api/services/:itemCode/bookings
+   - POST /api/services/bookings/:id/respond
+   - POST /api/services/bookings/:id/buyer-response
+
+   Design:
+   - Reuses the existing persisted `requests` JSON store for service bookings,
+     avoiding a second database schema during the pilot.
+   - Only the first 3 pending enquiries are visible to the provider.
+   - A 24-hour provider response clock begins only when an enquiry enters
+     that visible first-three queue.
+   - v0.55 stops at `agreement_ready`; protected service payment is enabled
+     in the next service phase.
+   ======================================================================= */
+try {
+  const TP55_VISIBLE_QUEUE = 3;
+  const TP55_RESPONSE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+  function tp55NowIso() {
+    try { if (typeof nowIso === 'function') return nowIso(); } catch (_) {}
+    return new Date().toISOString();
+  }
+  function tp55Clean(v, max = 500) { return String(v == null ? '' : v).trim().slice(0, max); }
+  function tp55Role(req) { return String(req && req.user ? req.user.role || '' : '').trim().toLowerCase(); }
+  function tp55IsProviderRole(req) { return ['seller', 'service_provider', 'admin'].includes(tp55Role(req)); }
+  function tp55Uuid() { try { if (typeof uuid === 'function') return uuid(); } catch (_) {} return `svc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`; }
+  function tp55DateMs(v) { const n = Date.parse(String(v || '')); return Number.isFinite(n) ? n : 0; }
+  function tp55IsService(item) { return !!item && (String(item.listingType || '').toLowerCase() === 'service' || String(item.condition || '').toLowerCase() === 'service'); }
+  function tp55Item(key) {
+    const k = String(key || '');
+    let item = null;
+    try { if (typeof findItem === 'function') item = findItem(k); } catch (_) {}
+    if (!item) item = (Array.isArray(items) ? items : []).find(x => String(x.id || '') === k || String(x.code || x.itemCode || '') === k) || null;
+    return item;
+  }
+  function tp55Bookings() { return (Array.isArray(requests) ? requests : []).filter(r => !!r && !!r.serviceBookingId); }
+  function tp55PendingStatus(b) { return String(b && (b.serviceWorkflowStatus || b.status) || '').toLowerCase() === 'pending'; }
+  function tp55PendingForProvider(phone) {
+    return tp55Bookings().filter(b => String(b.providerPhone || b.toPhone || '') === String(phone || '') && tp55PendingStatus(b))
+      .sort((a,b) => tp55DateMs(a.createdAt) - tp55DateMs(b.createdAt) || String(a.id).localeCompare(String(b.id)));
+  }
+  function tp55QueuePosition(b) {
+    if (!b || !tp55PendingStatus(b)) return null;
+    const q = tp55PendingForProvider(b.providerPhone || b.toPhone);
+    const i = q.findIndex(x => String(x.id) === String(b.id));
+    return i >= 0 ? i + 1 : null;
+  }
+  function tp55PersistRequest(b) {
+    b.updatedAt = tp55NowIso();
+    try { if (typeof dbUpsertRequest === 'function') dbUpsertRequest(b).catch(() => {}); } catch (_) {}
+  }
+  function tp55PersistItem(item) {
+    item.updatedAt = tp55NowIso();
+    try { if (typeof dbUpsertItem === 'function') dbUpsertItem(item).catch(() => {}); } catch (_) {}
+  }
+  function tp55Notify(phone, payload) {
+    try { if (typeof createNotification === 'function') createNotification(phone, payload); } catch (_) {}
+  }
+  function tp55AllowedFulfilment(item) {
+    const mode = String(item && item.deliveryMode || '').toLowerCase();
+    if (mode === 'on_site') return ['client_location'];
+    if (mode === 'remote') return ['remote'];
+    if (mode === 'provider_location') return ['provider_location'];
+    if (mode === 'hybrid') return ['client_location', 'remote', 'provider_location'];
+    return ['client_location'];
+  }
+  function tp55AvailabilityMode(item) {
+    const raw = String(item && (item.availabilityMode || (item.serviceAvailability && item.serviceAvailability.mode)) || '').toLowerCase();
+    if (['instant','time_bound','scheduled'].includes(raw)) return raw;
+    const h = Number(item && item.estimatedDurationHours || 0);
+    return h > 0 && h <= 5 ? 'instant' : h <= 24 ? 'time_bound' : 'scheduled';
+  }
+  function tp55RefreshAvailability(item) {
+    if (!item) return null;
+    const mode = tp55AvailabilityMode(item), now = Date.now();
+    const rec = item.serviceAvailability && typeof item.serviceAvailability === 'object' ? item.serviceAvailability : {};
+    rec.mode = mode;
+    rec.pendingEnquiries = tp55PendingForProvider(item.sellerPhone).filter(b => String(b.itemCode) === String(item.code)).length;
+    rec.capacityUsed = Number(rec.capacityUsed || 0);
+    if (rec.paused) rec.status = 'paused';
+    else if (mode === 'instant') rec.status = rec.liveUntil && tp55DateMs(rec.liveUntil) > now ? 'live_green' : 'offline';
+    else if (mode === 'time_bound') rec.status = 'time_bound';
+    else rec.status = 'scheduled';
+    rec.updatedAt = tp55NowIso();
+    item.serviceAvailability = rec;
+    return rec;
+  }
+  function tp55BookingView(b) {
+    if (!b) return null;
+    return {
+      ...b,
+      status: String(b.serviceWorkflowStatus || b.status || 'pending'),
+      workflowStatus: String(b.serviceWorkflowStatus || b.status || 'pending'),
+      buyerPhone: b.buyerPhone || b.fromPhone,
+      providerPhone: b.providerPhone || b.toPhone,
+      queuePosition: tp55QueuePosition(b),
+    };
+  }
+  function tp55StartVisibleReviewWindows(providerPhone) {
+    // Time out visible enquiries whose 24-hour clock has expired, then let the
+    // next queue entries move into the first three and start their own clock.
+    let guard = 0, changed = true;
+    while (changed && guard++ < 10) {
+      changed = false;
+      const visible = tp55PendingForProvider(providerPhone).slice(0, TP55_VISIBLE_QUEUE);
+      const now = Date.now();
+      for (const b of visible) {
+        if (!b.reviewWindowStartedAt) {
+          b.reviewWindowStartedAt = tp55NowIso();
+          b.responseDueAt = new Date(now + TP55_RESPONSE_WINDOW_MS).toISOString();
+          tp55PersistRequest(b);
+        }
+        if (b.responseDueAt && tp55DateMs(b.responseDueAt) <= now) {
+          b.status = 'timed_out';
+          b.serviceWorkflowStatus = 'timed_out';
+          b.timedOutAt = tp55NowIso();
+          b.responseDueAt = null;
+          tp55PersistRequest(b);
+          tp55Notify(b.buyerPhone || b.fromPhone, {
+            type:'service_enquiry_timed_out', title:'Service enquiry timed out',
+            message:`The provider did not respond to ${b.itemTitle || 'your service enquiry'} within the active review window.`,
+            requestId:b.id, itemCode:b.itemCode
+          });
+          changed = true;
+        }
+      }
+    }
+    // Ensure the final current first-three entries have active response windows.
+    const now = Date.now();
+    for (const b of tp55PendingForProvider(providerPhone).slice(0, TP55_VISIBLE_QUEUE)) {
+      if (!b.reviewWindowStartedAt) {
+        b.reviewWindowStartedAt = tp55NowIso();
+        b.responseDueAt = new Date(now + TP55_RESPONSE_WINDOW_MS).toISOString();
+        tp55PersistRequest(b);
+      }
+    }
+  }
+
+  app.get('/api/tp55/service-engine', (req,res) => res.json({
+    ok:true, version:'0.55', enquiryQueue:true, visibleProviderQueue:TP55_VISIBLE_QUEUE,
+    providerResponseWindowHours:24, paymentEnabled:false
+  }));
+
+  app.post('/api/services/:itemCode/availability', requireAuth, async (req,res) => {
+    const item = tp55Item(req.params.itemCode);
+    if (!tp55IsService(item)) return res.status(404).json({error:'Service listing not found.'});
+    if (!tp55IsProviderRole(req) || (tp55Role(req) !== 'admin' && String(req.user.phone) !== String(item.sellerPhone))) {
+      return res.status(403).json({error:'Only this service provider can change availability.'});
+    }
+    const action = String(req.body && req.body.action || '').toLowerCase();
+    const mode = tp55AvailabilityMode(item);
+    const rec = item.serviceAvailability && typeof item.serviceAvailability === 'object' ? item.serviceAvailability : {};
+    if (action === 'pause') {
+      rec.paused = true;
+    } else if (action === 'resume') {
+      rec.paused = false;
+      if (mode === 'instant' && (!rec.liveUntil || tp55DateMs(rec.liveUntil) <= Date.now())) {
+        item.serviceAvailability = rec; tp55RefreshAvailability(item); tp55PersistItem(item);
+        return res.status(409).json({error:'This Instant service has no active live window. Choose Go Live and select a duration.'});
+      }
+    } else if (action === 'go_live') {
+      if (mode !== 'instant') return res.status(400).json({error:'Go Live is only used for Instant services (1–5 hours).'});
+      const hours = Number(req.body && req.body.liveHours);
+      if (![1,2,4,8].includes(hours)) return res.status(400).json({error:'Choose a live duration of 1, 2, 4 or 8 hours.'});
+      rec.paused = false;
+      rec.liveUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+    } else return res.status(400).json({error:'Choose go_live, pause or resume.'});
+    item.serviceAvailability = rec;
+    const availability = tp55RefreshAvailability(item);
+    tp55PersistItem(item);
+    try { if (typeof logAudit === 'function') logAudit(req,'service_availability_v055',{itemCode:item.code,action,status:availability.status}); } catch (_) {}
+    return res.json({ok:true,availability});
+  });
+
+  app.get('/api/services/bookings', requireAuth, (req,res) => {
+    const role = tp55Role(req), phone = String(req.user && req.user.phone || '');
+    // Start/advance provider review windows before filtering the visible queue.
+    if (['seller','service_provider'].includes(role)) tp55StartVisibleReviewWindows(phone);
+    else {
+      // Buyer reads should still prune any queues their bookings belong to.
+      const providers = new Set(tp55Bookings().filter(b => String(b.buyerPhone || b.fromPhone) === phone).map(b => String(b.providerPhone || b.toPhone || '')));
+      for (const p of providers) if (p) tp55StartVisibleReviewWindows(p);
+    }
+    let mine = [];
+    if (role === 'admin') mine = tp55Bookings();
+    else if (['seller','service_provider'].includes(role)) {
+      const visible = new Set(tp55PendingForProvider(phone).slice(0,TP55_VISIBLE_QUEUE).map(b => String(b.id)));
+      mine = tp55Bookings().filter(b => String(b.providerPhone || b.toPhone) === phone && (!tp55PendingStatus(b) || visible.has(String(b.id))));
+    } else mine = tp55Bookings().filter(b => String(b.buyerPhone || b.fromPhone) === phone);
+    const out = mine.map(tp55BookingView).sort((a,b) => tp55DateMs(b.updatedAt || b.createdAt) - tp55DateMs(a.updatedAt || a.createdAt));
+    return res.json({ok:true,bookings:out.slice(0,250)});
+  });
+
+  app.post('/api/services/:itemCode/bookings', requireAuth, (req,res) => {
+    const role = tp55Role(req);
+    if (!['buyer','admin'].includes(role)) return res.status(403).json({error:'Only buyers can request a service.'});
+    const item = tp55Item(req.params.itemCode);
+    if (!tp55IsService(item)) return res.status(404).json({error:'Service listing not found.'});
+    if (role !== 'admin' && String(req.user.phone) === String(item.sellerPhone)) return res.status(400).json({error:'You cannot request your own service listing.'});
+    tp55RefreshAvailability(item);
+    const av = item.serviceAvailability || {}, mode = tp55AvailabilityMode(item), st = String(av.status || '').toLowerCase();
+    if (av.paused || st === 'paused') return res.status(409).json({error:'This service is currently paused.'});
+    if (mode === 'instant' && !['live_green','live_amber'].includes(st)) return res.status(409).json({error:'This Instant service is currently offline. The provider must Go Live first.'});
+
+    const neededAt = tp55Clean(req.body && req.body.neededAt, 80), location = tp55Clean(req.body && req.body.location, 180), scope = tp55Clean(req.body && req.body.scope, 600);
+    if (!neededAt || !tp55DateMs(neededAt) || tp55DateMs(neededAt) <= Date.now()) return res.status(400).json({error:'Choose a valid future service date and time.'});
+    if (!location) return res.status(400).json({error:'Enter the service location or meeting point.'});
+    if (scope.length < 10) return res.status(400).json({error:'Describe the required service a little more clearly.'});
+
+    const id = tp55Uuid(), now = tp55NowIso(), durationMinutes = Math.max(15, Number(item.estimatedDurationMinutes || Math.round(Number(item.estimatedDurationHours || 1) * 60) || 60));
+    const booking = {
+      id, serviceBookingId:id, requestType:'service', listingType:'service',
+      fromPhone:String(req.user.phone), buyerPhone:String(req.user.phone),
+      toPhone:String(item.sellerPhone), providerPhone:String(item.sellerPhone),
+      itemCode:String(item.code || item.id), itemTitle:item.title || 'Service',
+      itemSnapshot:{
+        id:item.id, code:item.code, title:item.title, price:item.price, imageUrl:item.imageUrl,
+        imageUrls:Array.isArray(item.imageUrls)?item.imageUrls:[], listingType:'service',
+        serviceCategory:item.serviceCategory, deliveryMode:item.deliveryMode, operatingMode:item.operatingMode,
+        serviceArea:item.serviceArea, chargeBasis:item.chargeBasis, rateFlexibility:item.rateFlexibility,
+        estimatedDurationMinutes:durationMinutes, completionEvidence:item.completionEvidence,
+        sellerPhone:item.sellerPhone, sellerDisplayName:item.sellerDisplayName, sellerBusinessName:item.sellerBusinessName
+      },
+      neededAt, location, scope, durationMinutes, durationHours:durationMinutes/60,
+      availabilityMode:mode, allowedFulfilmentMethods:tp55AllowedFulfilment(item),
+      fulfilmentMethod:null, status:'pending', serviceWorkflowStatus:'pending',
+      reviewWindowStartedAt:null, responseDueAt:null, timedOutAt:null,
+      proposedStartAt:null, agreedPrice:null, providerNote:'', agreedAt:null,
+      createdAt:now, updatedAt:now,
+      history:[{at:now,actor:'buyer',action:'service_enquiry_sent'}]
+    };
+    requests.push(booking);
+    tp55PersistRequest(booking);
+    tp55StartVisibleReviewWindows(item.sellerPhone);
+    tp55RefreshAvailability(item); tp55PersistItem(item);
+    tp55Notify(item.sellerPhone, {type:'service_enquiry',title:'New service enquiry',message:`A buyer requested ${item.title || 'your service'}.`,requestId:id,itemCode:item.code});
+    try { if (typeof logAudit === 'function') logAudit(req,'service_enquiry_created_v055',{bookingId:id,itemCode:item.code,providerPhone:item.sellerPhone}); } catch (_) {}
+    return res.status(201).json({ok:true,booking:tp55BookingView(booking),availability:item.serviceAvailability});
+  });
+
+  app.post('/api/services/bookings/:id/respond', requireAuth, (req,res) => {
+    const b = tp55Bookings().find(x => String(x.id) === String(req.params.id));
+    if (!b) return res.status(404).json({error:'Service enquiry not found.'});
+    if (!tp55IsProviderRole(req) || (tp55Role(req) !== 'admin' && String(req.user.phone) !== String(b.providerPhone || b.toPhone))) {
+      return res.status(403).json({error:'Only this service provider can respond.'});
+    }
+    tp55StartVisibleReviewWindows(b.providerPhone || b.toPhone);
+    if (!tp55PendingStatus(b)) return res.status(409).json({error:'This enquiry is no longer awaiting a provider response.'});
+    const pos = tp55QueuePosition(b);
+    if (!pos || pos > TP55_VISIBLE_QUEUE) return res.status(409).json({error:'Only the first three enquiries in the provider queue can be reviewed.'});
+    if (b.responseDueAt && tp55DateMs(b.responseDueAt) <= Date.now()) return res.status(409).json({error:'This enquiry response window has expired.'});
+
+    const action = String(req.body && req.body.action || '').toLowerCase(), note = tp55Clean(req.body && req.body.note,300), now = tp55NowIso();
+    if (action === 'decline') {
+      if (note.length < 3) return res.status(400).json({error:'Enter a clear reason for declining.'});
+      b.status = 'declined'; b.serviceWorkflowStatus = 'declined'; b.providerNote = note; b.responseDueAt = null;
+      b.history = Array.isArray(b.history) ? b.history : []; b.history.push({at:now,actor:'provider',action:'declined',note});
+    } else if (action === 'accept' || action === 'revise') {
+      const proposedStartAt = tp55Clean(req.body && req.body.proposedStartAt,80), price = Number(req.body && req.body.agreedPrice);
+      const durationMinutes = Number(req.body && (req.body.durationMinutes || (Number(req.body.durationHours || 0) * 60)) || b.durationMinutes || 60);
+      if (!proposedStartAt || !tp55DateMs(proposedStartAt) || tp55DateMs(proposedStartAt) <= Date.now()) return res.status(400).json({error:'Choose a valid future service date and time.'});
+      if (!Number.isFinite(price) || price <= 0) return res.status(400).json({error:'Enter a valid service price greater than zero.'});
+      if (!Number.isFinite(durationMinutes) || durationMinutes < 15 || durationMinutes > 43200) return res.status(400).json({error:'Enter a valid estimated service duration.'});
+      if (note.length < 3) return res.status(400).json({error:'Enter a short message for the potential client.'});
+      b.proposedStartAt = proposedStartAt; b.agreedPrice = Number(price.toFixed(2)); b.durationMinutes = Math.round(durationMinutes); b.durationHours = b.durationMinutes/60; b.providerNote = note;
+      b.status = 'awaiting_buyer'; b.serviceWorkflowStatus = 'awaiting_buyer'; b.responseDueAt = null;
+      b.history = Array.isArray(b.history) ? b.history : []; b.history.push({at:now,actor:'provider',action:'proposal_sent',price:b.agreedPrice,proposedStartAt,note});
+    } else return res.status(400).json({error:'Choose accept, revise or decline.'});
+    b.updatedAt = now; tp55PersistRequest(b);
+    tp55StartVisibleReviewWindows(b.providerPhone || b.toPhone);
+    const item = tp55Item(b.itemCode); if (item) { tp55RefreshAvailability(item); tp55PersistItem(item); }
+    tp55Notify(b.buyerPhone || b.fromPhone, {type:'service_provider_response',title:action==='decline'?'Service enquiry declined':'Provider proposed service terms',message:action==='decline'?note:`${b.itemTitle || 'Service'} · K${b.agreedPrice}`,requestId:b.id,itemCode:b.itemCode});
+    return res.json({ok:true,booking:tp55BookingView(b),availability:item?item.serviceAvailability:null});
+  });
+
+  app.post('/api/services/bookings/:id/buyer-response', requireAuth, (req,res) => {
+    const b = tp55Bookings().find(x => String(x.id) === String(req.params.id));
+    if (!b) return res.status(404).json({error:'Service enquiry not found.'});
+    if (tp55Role(req) !== 'admin' && (tp55Role(req) !== 'buyer' || String(req.user.phone) !== String(b.buyerPhone || b.fromPhone))) return res.status(403).json({error:'Only the requesting buyer can respond.'});
+    if (String(b.serviceWorkflowStatus || b.status).toLowerCase() !== 'awaiting_buyer') return res.status(409).json({error:'This service proposal is not awaiting buyer review.'});
+    const action = String(req.body && req.body.action || '').toLowerCase(), now = tp55NowIso();
+    if (action === 'accept') {
+      const requestedMethod = tp55Clean(req.body && req.body.fulfilmentMethod,60), allowed = Array.isArray(b.allowedFulfilmentMethods) ? b.allowedFulfilmentMethods : [];
+      if (requestedMethod && allowed.length && !allowed.includes(requestedMethod)) return res.status(400).json({error:'Choose a valid service fulfilment method.'});
+      b.fulfilmentMethod = requestedMethod || allowed[0] || null;
+      b.status = 'agreement_ready'; b.serviceWorkflowStatus = 'agreement_ready'; b.agreedAt = now;
+      b.history = Array.isArray(b.history) ? b.history : []; b.history.push({at:now,actor:'buyer',action:'proposal_accepted',fulfilmentMethod:b.fulfilmentMethod});
+    } else if (action === 'decline') {
+      b.status = 'cancelled'; b.serviceWorkflowStatus = 'cancelled';
+      b.history = Array.isArray(b.history) ? b.history : []; b.history.push({at:now,actor:'buyer',action:'proposal_declined'});
+    } else return res.status(400).json({error:'Choose accept or decline.'});
+    b.updatedAt = now; tp55PersistRequest(b);
+    const item = tp55Item(b.itemCode); if (item) { tp55RefreshAvailability(item); tp55PersistItem(item); }
+    tp55Notify(b.providerPhone || b.toPhone, {type:'service_buyer_response',title:action==='accept'?'Buyer accepted service terms':'Buyer declined service terms',message:b.itemTitle || 'Service booking',requestId:b.id,itemCode:b.itemCode});
+    return res.json({ok:true,booking:tp55BookingView(b),availability:item?item.serviceAvailability:null,paymentEnabled:false});
+  });
+
+  console.log('[TutoPay] v0.55 Service Enquiries & Provider Queue addon loaded');
+} catch (e) {
+  console.error('[TutoPay] v0.55 Service Enquiries addon failed:', e && e.message ? e.message : e);
+}
