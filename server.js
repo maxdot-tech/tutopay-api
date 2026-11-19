@@ -13934,3 +13934,215 @@ try {
 } catch (e) {
   console.error("[TutoPay] v0.50 DMP minimum-quantity guard failed:", e && e.message ? e.message : e);
 }
+
+/* =======================================================================
+   TutoPay Next v0.54 — Service Foundation (append-only)
+   -----------------------------------------------------------------------
+   Purpose:
+   - Add a dedicated service-listing creation route without replacing the
+     existing product /api/items or v0.25/v0.50 pricing routes.
+   - Persist Classic service metadata on the catalogue item JSON.
+   - Classify availability from estimated duration:
+       0.25–5h  -> instant (initially offline until Go Live in v0.55)
+       >5–24h   -> time_bound
+       >24h     -> scheduled
+   - Buyer booking/enquiry workflow is intentionally NOT added here.
+   ======================================================================= */
+try {
+  const TP54_SERVICE_CATEGORIES = new Set([
+    'home_maintenance',
+    'professional_business',
+    'technology_digital',
+    'education_tutoring',
+    'events_creative',
+    'transport_delivery',
+    'personal_care_wellness',
+    'other_review_required',
+  ]);
+
+  function tp54ServiceMode(hours) {
+    const h = Number(hours || 0);
+    if (h > 0 && h <= 5) return 'instant';
+    if (h > 5 && h <= 24) return 'time_bound';
+    if (h > 24) return 'scheduled';
+    return '';
+  }
+
+  function tp54ServiceInitialStatus(mode) {
+    if (mode === 'instant') return 'offline';
+    if (mode === 'time_bound') return 'time_bound';
+    if (mode === 'scheduled') return 'scheduled';
+    return 'offline';
+  }
+
+  function tp54Clean(v, max = 500) {
+    return String(v == null ? '' : v).trim().slice(0, max);
+  }
+
+  app.get('/api/tp54/service-foundation', (req, res) => {
+    res.json({
+      ok: true,
+      version: '0.54',
+      serviceListing: true,
+      bookingEnabled: false,
+      availabilityRules: {
+        instantMaxHours: 5,
+        timeBoundMaxHours: 24,
+        scheduledAboveHours: 24,
+      },
+    });
+  });
+
+  app.post('/api/tp54/services', requireAuth, idempotencyMiddleware, async (req, res) => {
+    try {
+      const body = req.body || {};
+      const role = String(req.user && req.user.role || '').trim().toLowerCase();
+      if (!['seller', 'service_provider', 'admin'].includes(role)) {
+        return res.status(403).json({ error: 'Service provider access required.' });
+      }
+
+      const sellerPhone = tp54Clean(body.sellerPhone, 40);
+      if (!sellerPhone) return res.status(400).json({ error: 'Missing service provider phone number.' });
+      if (role !== 'admin' && String(req.user.phone || '') !== sellerPhone) {
+        return res.status(403).json({ error: 'You can only list services for your own account.' });
+      }
+
+      const title = tp54Clean(body.title, 100);
+      const details = tp54Clean(body.details, 1000);
+      const price = Number(body.price);
+      const serviceCategory = tp54Clean(body.serviceCategory, 80);
+      const deliveryMode = tp54Clean(body.deliveryMode, 40);
+      const operatingMode = tp54Clean(body.operatingMode, 40);
+      const serviceArea = tp54Clean(body.serviceArea, 180);
+      const chargeBasis = tp54Clean(body.chargeBasis, 40);
+      const rateFlexibility = tp54Clean(body.rateFlexibility, 40);
+      const completionEvidence = tp54Clean(body.completionEvidence, 300);
+      const estimatedDurationHours = Number(body.estimatedDurationHours || (Number(body.estimatedDurationMinutes || 0) / 60));
+      const estimatedDurationMinutes = Math.round(estimatedDurationHours * 60);
+      const availabilityMode = tp54ServiceMode(estimatedDurationHours);
+      const serviceDiscountValue = rateFlexibility === 'discount' ? Number(body.serviceDiscountValue || body.discountValue || 0) : 0;
+
+      if (!title) return res.status(400).json({ error: 'Enter the service title.' });
+      if (!Number.isFinite(price) || price <= 0) return res.status(400).json({ error: 'Enter a valid starting charge.' });
+      if (!TP54_SERVICE_CATEGORIES.has(serviceCategory)) return res.status(400).json({ error: 'Choose a valid service category.' });
+      if (!['on_site', 'remote', 'provider_location', 'hybrid'].includes(deliveryMode)) return res.status(400).json({ error: 'Choose a valid service delivery method.' });
+      if (!['stationary', 'mobile', 'stationary_mobile'].includes(operatingMode)) return res.status(400).json({ error: 'Choose a valid provider movement type.' });
+      if (!['per_hour', 'per_day', 'per_completion'].includes(chargeBasis)) return res.status(400).json({ error: 'Choose a valid charge basis.' });
+      if (!['solid', 'discount', 'negotiable'].includes(rateFlexibility)) return res.status(400).json({ error: 'Choose valid service rate terms.' });
+      if (rateFlexibility === 'discount' && (!Number.isFinite(serviceDiscountValue) || serviceDiscountValue <= 0 || serviceDiscountValue > 95)) {
+        return res.status(400).json({ error: 'Service discount must be between 1 and 95 percent.' });
+      }
+      if (!Number.isFinite(estimatedDurationHours) || estimatedDurationHours < 0.25 || estimatedDurationHours > 720 || !availabilityMode) {
+        return res.status(400).json({ error: 'Enter a valid estimated service duration.' });
+      }
+      if (!serviceArea) return res.status(400).json({ error: 'Enter the service location or coverage area.' });
+      if (completionEvidence.length < 5) return res.status(400).json({ error: 'State how service completion will be confirmed.' });
+
+      const rawUrls = Array.isArray(body.imageUrls) ? body.imageUrls.slice(0, 15) : [];
+      if (body.imageUrl && !rawUrls.length) rawUrls.push(body.imageUrl);
+      if (!rawUrls.length) return res.status(400).json({ error: 'Attach at least one service or work image.' });
+
+      const cache = new Map();
+      const convert = async (u) => {
+        if (typeof u !== 'string' || !u) return '';
+        if (!u.startsWith('data:')) return u;
+        if (cache.has(u)) return cache.get(u);
+        const saved = await persistImageDataUrl(u, {
+          prefix: 'service',
+          folder: `tutopay/catalogue/${String(sellerPhone || 'unknown').replace(/[^0-9A-Za-z_-]+/g, '-')}`,
+        });
+        cache.set(u, saved);
+        return saved;
+      };
+      const imageUrls = (await Promise.all(rawUrls.map(convert))).filter(Boolean);
+      if (!imageUrls.length) return res.status(400).json({ error: 'Could not save the selected service image(s).' });
+
+      let itemNumber = String(nextItemNumber++);
+      while (findItem(itemNumber)) itemNumber = String(nextItemNumber++);
+      const now = nowIso();
+      const pricingMode = rateFlexibility === 'negotiable' ? 'N' : (rateFlexibility === 'discount' ? 'SD' : 'fixed');
+      const item = {
+        id: uuid(),
+        code: itemNumber,
+        title,
+        details,
+        price: Number(price),
+        sellerPhone,
+        sellerDisplayName: tp54Clean(body.sellerDisplayName, 120),
+        sellerBusinessName: tp54Clean(body.sellerBusinessName, 160),
+        sellerAvatarUrl: tp54Clean(body.sellerAvatarUrl, 1000),
+        listingType: 'service',
+        condition: 'service',
+        category: 'Tools & Services (repairs, plumbers, electricians)',
+        availability: 'available',
+        serviceCategory,
+        deliveryMode,
+        operatingMode,
+        serviceArea,
+        chargeBasis,
+        rateFlexibility,
+        serviceDiscountValue: rateFlexibility === 'discount' ? serviceDiscountValue : 0,
+        estimatedDurationHours,
+        estimatedDurationMinutes,
+        estimatedDuration: `${estimatedDurationHours} hour${estimatedDurationHours === 1 ? '' : 's'}`,
+        availabilityMode,
+        completionEvidence,
+        imageUrl: imageUrls[0] || '',
+        imageUrls,
+        createdAt: now,
+        updatedAt: now,
+        serviceAvailability: {
+          mode: availabilityMode,
+          status: tp54ServiceInitialStatus(availabilityMode),
+          paused: false,
+          liveUntil: null,
+          capacityUsed: 0,
+          pendingEnquiries: 0,
+          estimatedNextAvailableAt: null,
+          updatedAt: now,
+        },
+      };
+
+      const pricingBody = {
+        pricingMode,
+        mode: pricingMode,
+        discountKind: 'percent',
+        discountValue: rateFlexibility === 'discount' ? serviceDiscountValue : 0,
+        dmpMinQty: 2,
+        pricingNote: rateFlexibility === 'negotiable' ? 'Final service price is agreed in Requests & Replies.' : '',
+      };
+      try {
+        if (typeof tpApplyPricingRulesToItem === 'function' && typeof tpPricingRulesFromBody === 'function') {
+          tpApplyPricingRulesToItem(item, tpPricingRulesFromBody(pricingBody, Number(price)));
+        } else {
+          item.pricingMode = pricingMode;
+          item.discountKind = pricingBody.discountKind;
+          item.discountValue = pricingBody.discountValue;
+          item.dmpMinQty = 2;
+          item.pricingNote = pricingBody.pricingNote;
+        }
+      } catch (_) {
+        item.pricingMode = pricingMode;
+        item.discountKind = pricingBody.discountKind;
+        item.discountValue = pricingBody.discountValue;
+        item.dmpMinQty = 2;
+        item.pricingNote = pricingBody.pricingNote;
+      }
+
+      items.push(item);
+      try { if (typeof dbUpsertItem === 'function') await dbUpsertItem(item); } catch (e) {
+        console.error('[tp54] dbUpsertItem failed:', e && e.message ? e.message : e);
+        return res.status(500).json({ error: 'Service listing could not be persisted.' });
+      }
+      try { if (typeof logAudit === 'function') logAudit(req, 'service_listing_created_v054', { itemId: item.id, itemCode: item.code, serviceCategory, availabilityMode, rateFlexibility }); } catch (_) {}
+      return res.status(201).json(item);
+    } catch (err) {
+      console.error('[tp54] service listing error:', err);
+      return res.status(500).json({ error: 'Service listing creation failed.' });
+    }
+  });
+
+  console.log('[TutoPay] v0.54 Service Foundation addon loaded');
+} catch (e) {
+  console.error('[TutoPay] v0.54 Service Foundation addon failed:', e && e.message ? e.message : e);
+}
