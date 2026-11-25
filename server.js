@@ -14927,3 +14927,243 @@ try {
 } catch(e) {
   console.error('[TutoPay] v0.61 Service Fulfilment Repair failed:',e&&e.message?e.message:e);
 }
+/* =======================================================================
+   TutoPay Next v0.62 — Canonical Service Protected Payment (append-only)
+   -----------------------------------------------------------------------
+   Keep existing v0.54/v0.55/v0.59/v0.60/v0.61 patches in server.js.
+
+   Adds:
+   - POST /api/services/bookings/:id/payment-transaction-v062
+   - GET  /api/tp62/service-payment-health
+
+   Purpose:
+   v0.59 created service payments from one request representation, while
+   v0.60/v0.61 repaired amount/fulfilment in separate preflight requests.
+   A stale/duplicate representation could still be selected by v0.59.
+
+   v0.62 resolves agreement, amount, listing, fulfilment and transaction in
+   ONE route, so no repaired state is handed back to an older validator.
+   ======================================================================= */
+try {
+  function tp62NowIso(){ try { if(typeof nowIso==='function')return nowIso(); } catch(_){} return new Date().toISOString(); }
+  function tp62Role(req){ return String(req&&req.user?req.user.role||'':'').trim().toLowerCase(); }
+  function tp62Phone(v){ const d=String(v||'').replace(/\D/g,''); return d.slice(-10); }
+  function tp62Money(v){
+    if(v==null||v==='')return 0;
+    const n=Number(String(v).replace(/[^0-9.-]/g,''));
+    return Number.isFinite(n)&&n>0?Number(n.toFixed(2)):0;
+  }
+  function tp62Method(v){
+    const s=String(v||'').trim().toLowerCase().replace(/[\s-]+/g,'_');
+    if(['on_site','onsite','client_location','client_site','customer_location','buyer_location','at_client','at_client_location'].includes(s))return'client_location';
+    if(['remote','online','remote_online','remote_or_online','virtual'].includes(s))return'remote';
+    if(['provider_location','provider_site','at_provider','at_provider_location','shop_location','business_location'].includes(s))return'provider_location';
+    if(s==='hybrid')return'hybrid';
+    return s;
+  }
+  function tp62Matches(id){
+    const key=String(id||'');
+    return (Array.isArray(requests)?requests:[]).filter(r=>r&&(
+      String(r.id||'')===key || String(r.serviceBookingId||'')===key || String(r.bookingId||'')===key
+    ));
+  }
+  function tp62Status(b){ return String(b&&(b.serviceWorkflowStatus||b.workflowStatus||b.status)||'').trim().toLowerCase(); }
+  function tp62Accepted(b){
+    const st=tp62Status(b);
+    if(['agreement_ready','accepted','agreed','service_agreement_ready','payment_pending','booked'].includes(st))return true;
+    const h=Array.isArray(b&&b.history)?b.history:[]; let accepted=false;
+    for(const row of h){
+      const a=String(row&&(row.action||row.type)||'').toLowerCase();
+      if(['proposal_accepted','buyer_accepted','terms_accepted','service_terms_accepted'].includes(a))accepted=true;
+      if(['proposal_declined','buyer_declined','cancelled','canceled'].includes(a))accepted=false;
+    }
+    return accepted;
+  }
+  function tp62ProposalAmount(b){
+    const h=Array.isArray(b&&b.history)?b.history:[];
+    for(let i=h.length-1;i>=0;i--){
+      const row=h[i]||{},a=String(row.action||row.type||'').toLowerCase();
+      if(['proposal_sent','provider_proposal','service_terms_proposed','terms_proposed'].includes(a)){
+        const n=tp62Money(row.price??row.agreedPrice??row.amount??row.paymentAmount);
+        if(n>0)return n;
+      }
+    }
+    return 0;
+  }
+  function tp62AgreementAmount(b){
+    const proposal=tp62ProposalAmount(b); if(proposal>0)return proposal;
+    const vals=[
+      b&&b.agreedPrice,b&&b.agreedAmount,b&&b.paymentAmount,b&&b.acceptedAmount,
+      b&&b.providerProposal&&b.providerProposal.price,b&&b.proposal&&b.proposal.price,
+      b&&b.reply&&b.reply.price,b&&b.serviceTerms&&b.serviceTerms.price,
+      b&&b.agreement&&b.agreement.price
+    ];
+    for(const v of vals){ const n=tp62Money(v); if(n>0)return n; }
+    return 0;
+  }
+  function tp62Item(code){
+    const key=String(code||''); let item=null;
+    try{ if(typeof findItem==='function')item=findItem(key); }catch(_){}
+    if(!item)item=(Array.isArray(items)?items:[]).find(x=>String(x.id||'')===key||String(x.code||x.itemCode||'')===key)||null;
+    return item;
+  }
+  function tp62AllowedFromItem(item){
+    const mode=tp62Method(item&&item.deliveryMode);
+    if(mode==='hybrid')return['client_location','remote','provider_location'];
+    if(['client_location','remote','provider_location'].includes(mode))return[mode];
+    return[];
+  }
+  function tp62AllowedFromRecords(records){
+    const out=[];
+    for(const b of records||[]){
+      const vals=[];
+      if(Array.isArray(b&&b.allowedFulfilmentMethods))vals.push(...b.allowedFulfilmentMethods);
+      if(Array.isArray(b&&b.fulfilmentMethods))vals.push(...b.fulfilmentMethods);
+      vals.push(b&&b.fulfilmentMethod,b&&b.serviceFulfilmentMethod,b&&b.agreedFulfilmentMethod,b&&b.deliveryMode,b&&b.itemSnapshot&&b.itemSnapshot.deliveryMode);
+      for(const v of vals){
+        const m=tp62Method(v);
+        if(m==='hybrid')out.push('client_location','remote','provider_location');
+        else if(['client_location','remote','provider_location'].includes(m))out.push(m);
+      }
+    }
+    return [...new Set(out)];
+  }
+  function tp62PersistRequest(r){
+    r.updatedAt=tp62NowIso();
+    try{ if(typeof dbUpsertRequest==='function')dbUpsertRequest(r).catch(()=>{}); }catch(_){}
+  }
+  function tp62PersistTx(tx){ try{ if(typeof dbUpsertTransaction==='function')dbUpsertTransaction(tx).catch(()=>{}); }catch(_){} }
+  function tp62Notify(phone,payload){ try{ if(typeof createNotification==='function')createNotification(phone,payload); }catch(_){} }
+  function tp62View(b,bookingId,amount,method){
+    return {...b,
+      id:String(bookingId||b.serviceBookingId||b.bookingId||b.id||''),
+      serviceBookingId:String(bookingId||b.serviceBookingId||b.bookingId||b.id||''),
+      buyerPhone:b.buyerPhone||b.fromPhone||'',providerPhone:b.providerPhone||b.toPhone||'',
+      status:String(b.serviceWorkflowStatus||b.workflowStatus||b.status||''),
+      workflowStatus:String(b.serviceWorkflowStatus||b.workflowStatus||b.status||''),
+      agreedPrice:amount,agreedAmount:amount,fulfilmentMethod:method,serviceFulfilmentMethod:method
+    };
+  }
+  function tp62ExistingTx(bookingId,records){
+    const ids=new Set([String(bookingId||'')]);
+    for(const r of records||[]){ if(r&&r.transactionId)ids.add(String(r.transactionId)); }
+    return (Array.isArray(transactions)?transactions:[]).find(tx=>tx&&(
+      String(tx.serviceBookingId||tx.requestedServiceBookingId||'')===String(bookingId||'') || ids.has(String(tx.id||''))
+    )&&!['cancelled','canceled','refunded','failed'].includes(String(tx.status||'').toLowerCase()))||null;
+  }
+
+  app.get('/api/tp62/service-payment-health',(req,res)=>res.json({ok:true,version:'0.62',canonicalServicePayment:true}));
+
+  app.post('/api/services/bookings/:id/payment-transaction-v062', requireAuth, idempotencyMiddleware, async (req,res)=>{
+    const matches=tp62Matches(req.params.id);
+    if(!matches.length)return res.status(404).json({error:'Service agreement not found.'});
+
+    const accepted=matches.filter(tp62Accepted);
+    if(!accepted.length)return res.status(409).json({error:'This service request is not an accepted unpaid agreement.'});
+
+    const canonical=accepted.slice().sort((a,b)=>{
+      const aa=tp62AgreementAmount(a)>0?1:0,ba=tp62AgreementAmount(b)>0?1:0;
+      if(aa!==ba)return ba-aa;
+      return Date.parse(b.updatedAt||b.agreedAt||b.createdAt||0)-Date.parse(a.updatedAt||a.agreedAt||a.createdAt||0);
+    })[0];
+
+    const bookingId=String(canonical.serviceBookingId||canonical.bookingId||req.params.id||canonical.id||'');
+    let buyer=String(canonical.buyerPhone||canonical.fromPhone||''),provider=String(canonical.providerPhone||canonical.toPhone||'');
+    let itemCode=String(canonical.itemCode||canonical.itemSnapshot?.code||'');
+    for(const r of accepted){
+      if(!buyer)buyer=String(r.buyerPhone||r.fromPhone||'');
+      if(!provider)provider=String(r.providerPhone||r.toPhone||'');
+      if(!itemCode)itemCode=String(r.itemCode||r.itemSnapshot?.code||'');
+    }
+
+    const role=tp62Role(req);
+    if(role!=='admin'&&(role!=='buyer'||tp62Phone(req.user&&req.user.phone)!==tp62Phone(buyer)))return res.status(403).json({error:'Only the buyer who accepted these service terms can create the protected payment.'});
+
+    const existing=tp62ExistingTx(bookingId,matches);
+    if(existing){
+      for(const r of matches){
+        r.serviceBookingId=String(r.serviceBookingId||bookingId);r.transactionId=existing.id;
+        if(tp62Status(r)==='agreement_ready'){r.status='payment_pending';r.serviceWorkflowStatus='payment_pending';}
+        tp62PersistRequest(r);
+      }
+      return res.json({ok:true,reused:true,transaction:existing,booking:tp62View(canonical,bookingId,tp62AgreementAmount(canonical),tp62Method(existing.serviceFulfilmentMethod||canonical.fulfilmentMethod))});
+    }
+
+    let amount=0;
+    for(const r of accepted){amount=tp62AgreementAmount(r);if(amount>0)break;}
+    if(amount<=0)for(const r of matches){amount=tp62AgreementAmount(r);if(amount>0)break;}
+    if(amount<=0)return res.status(400).json({error:'The accepted service agreement has no recoverable payment amount. Ask the provider to resend the service terms.'});
+
+    const displayed=tp62Money(req.body&&req.body.displayedAmount);
+    if(displayed>0&&Math.abs(displayed-amount)>0.009)return res.status(409).json({error:`The accepted service amount changed from K${displayed.toFixed(2)} to K${amount.toFixed(2)}. Review the agreement before paying.`});
+
+    const item=tp62Item(itemCode);
+    if(!item)return res.status(404).json({error:'The service listing linked to this agreement could not be found.'});
+    if(provider&&tp62Phone(item.sellerPhone)!==tp62Phone(provider))return res.status(409).json({error:'The service provider no longer matches the accepted agreement.'});
+    if(!provider)provider=String(item.sellerPhone||'');
+
+    let allowed=tp62AllowedFromItem(item);
+    if(!allowed.length)allowed=tp62AllowedFromRecords(accepted.length?accepted:matches);
+    if(!allowed.length)return res.status(400).json({error:'The service listing has no usable fulfilment method. The provider must review the service listing.'});
+
+    const requested=tp62Method(req.body&&req.body.fulfilmentMethod);
+    let method='';
+    if(allowed.length===1){
+      // Single-mode listing is authoritative; ignore stale legacy aliases on the booking.
+      method=allowed[0];
+    }else{
+      if(!requested||requested==='hybrid'||!allowed.includes(requested))return res.status(400).json({error:'Choose how this hybrid service will be fulfilled before creating payment.'});
+      method=requested;
+    }
+
+    // Apply the same KYC amount controls used by ordinary protected transactions.
+    try{
+      const buyerUser=findUserByPhone(req.user.phone)||{kycLevel:req.user.kycLevel,kycStatus:req.user.kycStatus};
+      ensureUserKycDefaults(buyerUser);
+      const kycLevel=getEffectiveKycLevel(buyerUser),limits=KYC_LIMITS[kycLevel]||KYC_LIMITS.basic;
+      if(amount>limits.maxPerTx)return res.status(400).json({error:`Amount exceeds your per-transaction limit for your KYC level (${limits.maxPerTx} ZMW).`});
+      const today=new Date().toISOString().slice(0,10);
+      const todayTotal=(Array.isArray(transactions)?transactions:[]).filter(t=>tp62Phone(t.fromPhone)===tp62Phone(req.user.phone)&&typeof t.amount==='number'&&t.createdAt&&t.createdAt.startsWith(today)).reduce((sum,t)=>sum+t.amount,0);
+      if(todayTotal+amount>limits.maxDaily)return res.status(400).json({error:`This payment would exceed your daily limit for your KYC level (${limits.maxDaily} ZMW total per day).`});
+    }catch(e){
+      console.error('[TutoPay v0.62] service KYC validation failed:',e&&e.message?e.message:e);
+      return res.status(500).json({error:'Could not validate payment limits for this service transaction.'});
+    }
+
+    const tx={
+      id:uuid(),fromPhone:buyer,toPhone:provider,itemCode:String(itemCode||item.code||item.id),
+      itemTitle:canonical.itemTitle||item.title||'Service',serviceTitle:canonical.itemTitle||item.title||'Service',
+      amount:Number(amount.toFixed(2)),deliveryMethod:'service_fulfilment',deliveryPoint:canonical.location||canonical.serviceLocation||'',
+      liveLocation:null,status:'pending_payment',createdAt:tp62NowIso(),paymentProvider:PAYMENTS_MODE,paymentStatus:'unpaid',paymentRef:null,paidAt:null,
+      holdDurationHours:0,holdExpiresAt:null,holdStartedAt:null,transitStartedAt:null,completedAt:null,disputeActive:false,dispute:null,disputeDocs:[],
+      serviceBookingId:bookingId,requestedServiceBookingId:bookingId,serviceFulfilmentMethod:method,serviceFulfilmentStatus:'payment_pending',
+      serviceStartAt:canonical.proposedStartAt||canonical.agreedStartAt||canonical.neededAt||null,
+      serviceDurationMinutes:Number(canonical.durationMinutes||Math.round(Number(canonical.durationHours||1)*60)||60),
+      itemSnapshot:{...(canonical.itemSnapshot||{}),code:item.code,title:item.title,price:item.price,listingType:'service',serviceCategory:item.serviceCategory,
+        deliveryMode:item.deliveryMode,chargeBasis:item.chargeBasis,completionEvidence:item.completionEvidence,imageUrl:item.imageUrl||'',
+        imageUrls:Array.isArray(item.imageUrls)?item.imageUrls:(item.imageUrl?[item.imageUrl]:[])}
+    };
+    try{ if(typeof ensureTxReconDefaults==='function')ensureTxReconDefaults(tx); }catch(_){}
+    transactions.push(tx);tp62PersistTx(tx);
+
+    const at=tp62NowIso();
+    for(const r of matches){
+      r.serviceBookingId=String(r.serviceBookingId||bookingId);r.buyerPhone=r.buyerPhone||r.fromPhone||buyer;r.providerPhone=r.providerPhone||r.toPhone||provider;
+      if(!r.fromPhone)r.fromPhone=r.buyerPhone;if(!r.toPhone)r.toPhone=r.providerPhone;if(!r.itemCode)itemCode&& (r.itemCode=itemCode);
+      r.agreedPrice=amount;r.agreedAmount=amount;r.allowedFulfilmentMethods=[...allowed];r.fulfilmentMethod=method;r.serviceFulfilmentMethod=method;r.agreedFulfilmentMethod=method;
+      r.status='payment_pending';r.serviceWorkflowStatus='payment_pending';r.transactionId=tx.id;r.paymentStartedAt=at;
+      r.history=Array.isArray(r.history)?r.history:[];
+      if(!r.history.some(h=>String(h&&h.transactionId||'')===String(tx.id)&&String(h&&h.action||'')==='protected_payment_created'))r.history.push({at,actor:'buyer',action:'protected_payment_created',transactionId:tx.id,amount:tx.amount,fulfilmentMethod:method});
+      tp62PersistRequest(r);
+    }
+
+    try{ if(typeof logAudit==='function')logAudit(req,'service_protected_transaction_created_v062',{bookingId,txId:tx.id,amount:tx.amount,providerPhone:provider,fulfilmentMethod:method}); }catch(_){}
+    tp62Notify(provider,{type:'service_payment_started',title:'Buyer started protected payment',message:`Protected payment for ${canonical.itemTitle||item.title||'the service'} is awaiting confirmation.`,requestId:bookingId,txId:tx.id,itemCode});
+
+    return res.status(201).json({ok:true,version:'0.62',transaction:tx,booking:tp62View({...canonical,status:'payment_pending',serviceWorkflowStatus:'payment_pending',transactionId:tx.id},bookingId,amount,method),fulfilmentMethod:method,agreedPrice:amount});
+  });
+
+  console.log('[TutoPay] v0.62 Canonical Service Protected Payment loaded');
+} catch(e) {
+  console.error('[TutoPay] v0.62 Canonical Service Payment failed:',e&&e.message?e.message:e);
+}
