@@ -14650,3 +14650,156 @@ try {
 } catch(e) {
   console.error('[TutoPay] v0.59 Service Protected Payment addon failed:',e&&e.message?e.message:e);
 }
+/* =======================================================================
+   TutoPay Next v0.60 — Service Payment Agreement Amount Repair (append-only)
+   -----------------------------------------------------------------------
+   Keep the existing v0.54, v0.55 and v0.59 service patches in server.js.
+
+   Adds:
+   - POST /api/services/bookings/:id/payment-prepare-v060
+   - GET  /api/tp60/service-payment-health
+
+   Why this exists:
+   Some accepted service agreements can be represented in more than one
+   request/service shape. v0.59 expected the accepted amount only at the
+   top-level `agreedPrice`. v0.60 resolves the authoritative accepted amount
+   from the persisted provider proposal/history and normalizes all matching
+   records before the existing v0.59 transaction route runs.
+
+   Security:
+   - The browser-supplied displayedAmount is never used as the payment amount.
+   - The amount must be recoverable from server-side accepted agreement data.
+   - Catalogue/listing price is deliberately NOT used as a fallback.
+   ======================================================================= */
+try {
+  function tp60NowIso(){ try { if(typeof nowIso==='function') return nowIso(); } catch(_) {} return new Date().toISOString(); }
+  function tp60Role(req){ return String(req&&req.user?req.user.role||'':'').trim().toLowerCase(); }
+  function tp60Money(v){
+    if(v==null||v==='')return 0;
+    const n=Number(String(v).replace(/[^0-9.-]/g,''));
+    return Number.isFinite(n)&&n>0?Number(n.toFixed(2)):0;
+  }
+  function tp60Matches(id){
+    const key=String(id||'');
+    return (Array.isArray(requests)?requests:[]).filter(r=>r && (
+      String(r.id||'')===key ||
+      String(r.serviceBookingId||'')===key ||
+      String(r.bookingId||'')===key
+    ));
+  }
+  function tp60Status(b){ return String(b&&(b.serviceWorkflowStatus||b.workflowStatus||b.status)||'').trim().toLowerCase(); }
+  function tp60Accepted(b){
+    const st=tp60Status(b);
+    if(['agreement_ready','accepted','agreed','service_agreement_ready'].includes(st))return true;
+    const h=Array.isArray(b&&b.history)?b.history:[];
+    let accepted=false;
+    for(const row of h){
+      const a=String(row&&(row.action||row.type)||'').toLowerCase();
+      if(['proposal_accepted','buyer_accepted','terms_accepted','service_terms_accepted'].includes(a))accepted=true;
+      if(['proposal_declined','buyer_declined','cancelled','canceled'].includes(a))accepted=false;
+    }
+    return accepted;
+  }
+  function tp60ProposalAmount(b){
+    const h=Array.isArray(b&&b.history)?b.history:[];
+    for(let i=h.length-1;i>=0;i--){
+      const row=h[i]||{}, action=String(row.action||row.type||'').toLowerCase();
+      if(['proposal_sent','provider_proposal','service_terms_proposed','terms_proposed'].includes(action)){
+        const n=tp60Money(row.price??row.agreedPrice??row.amount??row.paymentAmount);
+        if(n>0)return n;
+      }
+    }
+    return 0;
+  }
+  function tp60AgreementAmount(b){
+    const proposal=tp60ProposalAmount(b);
+    if(proposal>0)return proposal;
+    const candidates=[
+      b&&b.agreedPrice,
+      b&&b.agreedAmount,
+      b&&b.paymentAmount,
+      b&&b.acceptedAmount,
+      b&&b.providerProposal&&b.providerProposal.price,
+      b&&b.proposal&&b.proposal.price,
+      b&&b.reply&&b.reply.price,
+      b&&b.serviceTerms&&b.serviceTerms.price,
+      b&&b.agreement&&b.agreement.price
+    ];
+    for(const v of candidates){ const n=tp60Money(v); if(n>0)return n; }
+    return 0;
+  }
+  function tp60Persist(r){
+    r.updatedAt=tp60NowIso();
+    try{ if(typeof dbUpsertRequest==='function') dbUpsertRequest(r).catch(()=>{}); }catch(_){}
+  }
+  function tp60View(b,amount){
+    return {...b,
+      id:String(b.serviceBookingId||b.bookingId||b.id||''),
+      serviceBookingId:String(b.serviceBookingId||b.bookingId||b.id||''),
+      buyerPhone:b.buyerPhone||b.fromPhone||'',
+      providerPhone:b.providerPhone||b.toPhone||'',
+      status:String(b.serviceWorkflowStatus||b.workflowStatus||b.status||''),
+      workflowStatus:String(b.serviceWorkflowStatus||b.workflowStatus||b.status||''),
+      agreedPrice:amount,
+      agreedAmount:amount
+    };
+  }
+
+  app.get('/api/tp60/service-payment-health',(req,res)=>res.json({ok:true,version:'0.60',agreementAmountRepair:true}));
+
+  app.post('/api/services/bookings/:id/payment-prepare-v060', requireAuth, async (req,res)=>{
+    const matches=tp60Matches(req.params.id);
+    if(!matches.length)return res.status(404).json({error:'Service agreement not found.'});
+
+    const accepted=matches.filter(tp60Accepted);
+    const pool=accepted.length?accepted:matches;
+    const canonical=pool.slice().sort((a,b)=>{
+      const aa=tp60AgreementAmount(a)>0?1:0, ba=tp60AgreementAmount(b)>0?1:0;
+      if(aa!==ba)return ba-aa;
+      return Date.parse(b.updatedAt||b.agreedAt||b.createdAt||0)-Date.parse(a.updatedAt||a.agreedAt||a.createdAt||0);
+    })[0];
+
+    if(!tp60Accepted(canonical))return res.status(409).json({error:'This service request is not an accepted unpaid agreement.'});
+
+    const role=tp60Role(req), buyer=String(canonical.buyerPhone||canonical.fromPhone||'');
+    if(role!=='admin' && (role!=='buyer' || String(req.user.phone||'')!==buyer))return res.status(403).json({error:'Only the buyer who accepted these service terms can prepare the protected payment.'});
+
+    let amount=0;
+    for(const r of pool){ amount=tp60AgreementAmount(r); if(amount>0)break; }
+    if(amount<=0){
+      // Last chance: inspect every matching representation, but still never use catalogue price.
+      for(const r of matches){ amount=tp60AgreementAmount(r); if(amount>0)break; }
+    }
+    if(amount<=0)return res.status(400).json({error:'The accepted service agreement has no recoverable payment amount. Ask the provider to resend the service terms.'});
+
+    const bookingId=String(canonical.serviceBookingId||canonical.bookingId||canonical.id||req.params.id);
+    const provider=String(canonical.providerPhone||canonical.toPhone||'');
+    const itemCode=String(canonical.itemCode||canonical.itemSnapshot?.code||'');
+
+    // Normalize every server-side representation of this same accepted agreement.
+    for(const r of matches){
+      r.serviceBookingId=String(r.serviceBookingId||bookingId);
+      r.buyerPhone=r.buyerPhone||r.fromPhone||buyer;
+      r.providerPhone=r.providerPhone||r.toPhone||provider;
+      if(!r.fromPhone)r.fromPhone=r.buyerPhone;
+      if(!r.toPhone)r.toPhone=r.providerPhone;
+      if(!r.itemCode&&itemCode)r.itemCode=itemCode;
+      r.agreedPrice=amount;
+      r.agreedAmount=amount;
+      if(tp60Accepted(r)){
+        r.status='agreement_ready';
+        r.serviceWorkflowStatus='agreement_ready';
+      }
+      tp60Persist(r);
+    }
+
+    try{ if(typeof logAudit==='function')logAudit(req,'service_payment_amount_normalized_v060',{bookingId,amount,representations:matches.length}); }catch(_){}
+
+    const repaired=matches.find(r=>String(r.id||'')===String(req.params.id)) || matches.find(r=>String(r.serviceBookingId||'')===bookingId) || canonical;
+    return res.json({ok:true,version:'0.60',agreedPrice:amount,booking:tp60View(repaired,amount)});
+  });
+
+  console.log('[TutoPay] v0.60 Service Payment Agreement Amount Repair loaded');
+} catch (e) {
+  console.error('[TutoPay] v0.60 Service Payment Amount Repair failed:', e&&e.message?e.message:e);
+}
