@@ -15167,3 +15167,129 @@ try {
 } catch(e) {
   console.error('[TutoPay] v0.62 Canonical Service Payment failed:',e&&e.message?e.message:e);
 }
+/* =======================================================================
+   TutoPay Next v0.63 — Service Payment Gate Bridge (append-only hotfix)
+   -----------------------------------------------------------------------
+   Keep all existing server code and v0.54-v0.62 patches.
+
+   Root cause fixed:
+   The legacy service payment gate can validate against an older Classic
+   in-memory booking representation, while TutoPay Next v0.55-v0.62 stores
+   the active accepted/payment-pending service agreement in `requests`.
+   A newly-created v0.62 transaction can therefore be valid, but the old
+   gate still sees the Classic booking as agreement_ready and rejects /pay.
+
+   This patch keeps the original gate as the first authority. If it rejects,
+   we only recover when the canonical request-store service agreement proves
+   that the exact transaction is the active payment for that exact booking.
+   ======================================================================= */
+try {
+  const __tpServicePaymentGateBeforeV063 =
+    (typeof globalThis.__tpServicePaymentGate === 'function')
+      ? globalThis.__tpServicePaymentGate
+      : null;
+
+  function tp63Phone(v) {
+    const d = String(v || '').replace(/\D/g, '');
+    return d.slice(-10);
+  }
+  function tp63Money(v) {
+    if (v == null || v === '') return 0;
+    const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+    return Number.isFinite(n) ? Number(n.toFixed(2)) : 0;
+  }
+  function tp63Status(r) {
+    return String(r && (r.serviceWorkflowStatus || r.workflowStatus || r.status) || '')
+      .trim().toLowerCase();
+  }
+  function tp63ServiceRows(bookingId) {
+    const key = String(bookingId || '');
+    return (Array.isArray(requests) ? requests : []).filter(r => r && (
+      String(r.serviceBookingId || '') === key ||
+      String(r.bookingId || '') === key ||
+      (!!r.serviceBookingId && String(r.id || '') === key)
+    ));
+  }
+  function tp63Persist(r) {
+    try {
+      if (typeof dbUpsertRequest === 'function') dbUpsertRequest(r).catch(() => {});
+    } catch (_) {}
+  }
+
+  globalThis.__tpServicePaymentGate = function tp63ServicePaymentGate(tx) {
+    if (!tx || !tx.serviceBookingId) return { ok: true };
+    if (String(tx.paymentStatus || '').toLowerCase() === 'paid') return { ok: true };
+
+    let legacy = null;
+    try {
+      if (__tpServicePaymentGateBeforeV063) {
+        legacy = __tpServicePaymentGateBeforeV063(tx);
+        if (!legacy || legacy.ok !== false) return legacy || { ok: true };
+      }
+    } catch (e) {
+      console.warn('[TutoPay v0.63] legacy service payment gate threw:', e && e.message ? e.message : e);
+    }
+
+    const bookingId = String(tx.serviceBookingId || tx.requestedServiceBookingId || '');
+    const rows = tp63ServiceRows(bookingId);
+    const linked = rows.find(r =>
+      tp63Status(r) === 'payment_pending' &&
+      String(r.transactionId || '') === String(tx.id || '')
+    );
+
+    if (!linked) {
+      return legacy && legacy.ok === false
+        ? legacy
+        : { ok: false, error: 'This protected-payment window is no longer active. Reopen the agreed service request and start payment again.' };
+    }
+
+    const buyer = linked.buyerPhone || linked.fromPhone || '';
+    const provider = linked.providerPhone || linked.toPhone || '';
+    const itemCode = linked.itemCode || linked.itemSnapshot?.code || '';
+    const agreedAmount = tp63Money(
+      linked.agreedPrice ?? linked.agreedAmount ?? linked.paymentAmount ?? linked.acceptedAmount
+    );
+    const txAmount = tp63Money(tx.amount);
+
+    if (buyer && tp63Phone(buyer) !== tp63Phone(tx.fromPhone)) {
+      return { ok: false, error: 'The protected payment no longer matches the buyer in the accepted service agreement.' };
+    }
+    if (provider && tp63Phone(provider) !== tp63Phone(tx.toPhone)) {
+      return { ok: false, error: 'The protected payment no longer matches the provider in the accepted service agreement.' };
+    }
+    if (itemCode && String(itemCode) !== String(tx.itemCode || '')) {
+      return { ok: false, error: 'The protected payment no longer matches the accepted service.' };
+    }
+    if (agreedAmount > 0 && txAmount > 0 && Math.abs(agreedAmount - txAmount) > 0.009) {
+      return { ok: false, error: 'The protected payment amount no longer matches the accepted service agreement.' };
+    }
+
+    const dueAt = linked.paymentDueAt || null;
+    if (dueAt && Number.isFinite(Date.parse(dueAt)) && Date.parse(dueAt) <= Date.now()) {
+      return { ok: false, error: 'The protected-payment window expired. Reopen the agreed service request and start payment again.' };
+    }
+
+    // Normalize the canonical record so all later Next service-payment syncs
+    // see the same link. This does not change amount/counterparty/service.
+    linked.serviceBookingId = String(linked.serviceBookingId || bookingId);
+    linked.status = 'payment_pending';
+    linked.serviceWorkflowStatus = 'payment_pending';
+    linked.transactionId = String(tx.id || '');
+    linked.updatedAt = (typeof nowIso === 'function' ? nowIso() : new Date().toISOString());
+    tp63Persist(linked);
+
+    return {
+      ok: true,
+      paymentDueAt: dueAt,
+      source: 'next_request_store_v063'
+    };
+  };
+
+  app.get('/api/tp63/service-payment-gate-health', (req, res) => {
+    res.json({ ok: true, version: '0.63', servicePaymentGateBridge: true });
+  });
+
+  console.log('[TutoPay] v0.63 Service Payment Gate Bridge loaded');
+} catch (e) {
+  console.error('[TutoPay] v0.63 Service Payment Gate Bridge failed:', e && e.message ? e.message : e);
+}
