@@ -14454,3 +14454,199 @@ try {
 } catch (e) {
   console.error('[TutoPay] v0.55 Service Enquiries addon failed:', e && e.message ? e.message : e);
 }
+/* =======================================================================
+   TutoPay Next v0.59 — Service Agreement -> Protected Payment (append-only)
+   -----------------------------------------------------------------------
+   Requires the existing v0.54 Service Foundation and v0.55 Service
+   Enquiries & Provider Queue addons to remain in server.js.
+
+   Adds:
+   - POST /api/services/bookings/:id/payment-transaction
+   - POST /api/services/bookings/:id/payment-sync
+   - GET  /api/tp59/service-payment-health
+
+   Design:
+   - The server, not the browser, supplies the agreed service amount/provider.
+   - Reuses TutoPay's existing transaction + /pay rails.
+   - Links each service transaction permanently to serviceBookingId.
+   - Payment confirmation promotes payment_pending -> booked.
+   ======================================================================= */
+try {
+  function tp59NowIso(){ try { if (typeof nowIso === 'function') return nowIso(); } catch(_) {} return new Date().toISOString(); }
+  function tp59Role(req){ return String(req && req.user ? req.user.role || '' : '').trim().toLowerCase(); }
+  function tp59Booking(id){
+    const key=String(id||'');
+    return (Array.isArray(requests)?requests:[]).find(r=>r && (String(r.serviceBookingId||'')===key || (!!r.serviceBookingId && String(r.id||'')===key))) || null;
+  }
+  function tp59Status(b){ return String(b && (b.serviceWorkflowStatus || b.status) || '').trim().toLowerCase(); }
+  function tp59Item(code){
+    const key=String(code||''); let item=null;
+    try { if(typeof findItem==='function') item=findItem(key); } catch(_) {}
+    if(!item) item=(Array.isArray(items)?items:[]).find(x=>String(x.id||'')===key||String(x.code||x.itemCode||'')===key)||null;
+    return item;
+  }
+  function tp59PersistBooking(b){ b.updatedAt=tp59NowIso(); try{ if(typeof dbUpsertRequest==='function') dbUpsertRequest(b).catch(()=>{}); }catch(_){} }
+  function tp59PersistTx(tx){ try{ if(typeof dbUpsertTransaction==='function') dbUpsertTransaction(tx).catch(()=>{}); }catch(_){} }
+  function tp59Notify(phone,payload){ try{ if(typeof createNotification==='function') createNotification(phone,payload); }catch(_){} }
+  function tp59View(b){
+    return {...b,
+      id:String(b.serviceBookingId||b.id||''),
+      serviceBookingId:String(b.serviceBookingId||b.id||''),
+      buyerPhone:b.buyerPhone||b.fromPhone,
+      providerPhone:b.providerPhone||b.toPhone,
+      status:String(b.serviceWorkflowStatus||b.status||''),
+      workflowStatus:String(b.serviceWorkflowStatus||b.status||'')
+    };
+  }
+  function tp59ExistingTx(b){
+    const bid=String(b && (b.serviceBookingId||b.id)||'');
+    return (Array.isArray(transactions)?transactions:[]).find(tx=>tx &&
+      (String(tx.serviceBookingId||tx.requestedServiceBookingId||'')===bid || (b.transactionId && String(tx.id)===String(b.transactionId))) &&
+      !['cancelled','canceled','refunded','failed'].includes(String(tx.status||'').toLowerCase())) || null;
+  }
+  function tp59AllowedMethods(b,item){
+    const fromBooking=Array.isArray(b.allowedFulfilmentMethods)?b.allowedFulfilmentMethods.filter(Boolean):[];
+    if(fromBooking.length) return fromBooking;
+    const mode=String(item && item.deliveryMode || '').toLowerCase();
+    if(mode==='remote')return['remote'];
+    if(mode==='provider_location')return['provider_location'];
+    if(mode==='hybrid')return['client_location','remote','provider_location'];
+    return['client_location'];
+  }
+
+  app.get('/api/tp59/service-payment-health',(req,res)=>res.json({ok:true,version:'0.59',servicePayment:true,usesExistingPaymentRail:true}));
+
+  app.post('/api/services/bookings/:id/payment-transaction', requireAuth, idempotencyMiddleware, async (req,res)=>{
+    const b=tp59Booking(req.params.id);
+    if(!b)return res.status(404).json({error:'Service agreement not found.'});
+    const role=tp59Role(req), buyer=String(b.buyerPhone||b.fromPhone||''), provider=String(b.providerPhone||b.toPhone||'');
+    if(role!=='admin' && (role!=='buyer' || String(req.user.phone)!==buyer)) return res.status(403).json({error:'Only the buyer who accepted these service terms can create the protected payment.'});
+
+    const existing=tp59ExistingTx(b);
+    if(existing){
+      if(!b.transactionId)b.transactionId=existing.id;
+      if(tp59Status(b)==='agreement_ready'){b.status='payment_pending';b.serviceWorkflowStatus='payment_pending';tp59PersistBooking(b);}
+      return res.json({ok:true,reused:true,transaction:existing,booking:tp59View(b)});
+    }
+    if(tp59Status(b)!=='agreement_ready') return res.status(409).json({error:'This service request is not an accepted unpaid agreement.'});
+
+    const amount=Number(b.agreedPrice||0);
+    if(!Number.isFinite(amount)||amount<=0)return res.status(400).json({error:'The accepted service agreement has no valid payment amount.'});
+    const item=tp59Item(b.itemCode);
+    if(!item)return res.status(404).json({error:'The service listing linked to this agreement could not be found.'});
+    if(String(item.sellerPhone||provider)!==provider)return res.status(409).json({error:'The service provider no longer matches the accepted agreement.'});
+
+    const allowed=tp59AllowedMethods(b,item), requested=String(req.body&&req.body.fulfilmentMethod||b.fulfilmentMethod||'').trim();
+    const method=requested||allowed[0]||'client_location';
+    if(allowed.length&&!allowed.includes(method))return res.status(400).json({error:'Choose a valid agreed service fulfilment method.'});
+
+    // Apply the same KYC amount controls used by ordinary TutoPay transactions.
+    try{
+      const buyerUser=findUserByPhone(req.user.phone)||{kycLevel:req.user.kycLevel,kycStatus:req.user.kycStatus};
+      ensureUserKycDefaults(buyerUser);
+      const kycLevel=getEffectiveKycLevel(buyerUser), limits=KYC_LIMITS[kycLevel]||KYC_LIMITS.basic;
+      if(amount>limits.maxPerTx)return res.status(400).json({error:`Amount exceeds your per-transaction limit for your KYC level (${limits.maxPerTx} ZMW).`});
+      const today=new Date().toISOString().slice(0,10);
+      const todayTotal=(Array.isArray(transactions)?transactions:[]).filter(t=>t.fromPhone===req.user.phone&&typeof t.amount==='number'&&t.createdAt&&t.createdAt.startsWith(today)).reduce((sum,t)=>sum+t.amount,0);
+      if(todayTotal+amount>limits.maxDaily)return res.status(400).json({error:`This payment would exceed your daily limit for your KYC level (${limits.maxDaily} ZMW total per day).`});
+    }catch(e){
+      console.error('[TutoPay v0.59] service KYC validation failed:',e&&e.message?e.message:e);
+      return res.status(500).json({error:'Could not validate payment limits for this service transaction.'});
+    }
+
+    const tx={
+      id:uuid(),
+      fromPhone:buyer,
+      toPhone:provider,
+      itemCode:String(b.itemCode||item.code||item.id),
+      itemTitle:b.itemTitle||item.title||'Service',
+      serviceTitle:b.itemTitle||item.title||'Service',
+      amount:Number(amount.toFixed(2)),
+      deliveryMethod:'service_fulfilment',
+      deliveryPoint:b.location||'',
+      liveLocation:null,
+      status:'pending_payment',
+      createdAt:tp59NowIso(),
+      paymentProvider:PAYMENTS_MODE,
+      paymentStatus:'unpaid',
+      paymentRef:null,
+      paidAt:null,
+      holdDurationHours:0,
+      holdExpiresAt:null,
+      holdStartedAt:null,
+      transitStartedAt:null,
+      completedAt:null,
+      disputeActive:false,
+      dispute:null,
+      disputeDocs:[],
+      serviceBookingId:String(b.serviceBookingId||b.id),
+      requestedServiceBookingId:String(b.serviceBookingId||b.id),
+      serviceFulfilmentMethod:method,
+      serviceFulfilmentStatus:'payment_pending',
+      serviceStartAt:b.proposedStartAt||b.neededAt||null,
+      serviceDurationMinutes:Number(b.durationMinutes||Math.round(Number(b.durationHours||1)*60)||60),
+      itemSnapshot:{
+        ...(b.itemSnapshot||{}),
+        code:item.code,
+        title:item.title,
+        price:item.price,
+        listingType:'service',
+        serviceCategory:item.serviceCategory,
+        deliveryMode:item.deliveryMode,
+        chargeBasis:item.chargeBasis,
+        completionEvidence:item.completionEvidence,
+        imageUrl:item.imageUrl||'',
+        imageUrls:Array.isArray(item.imageUrls)?item.imageUrls:(item.imageUrl?[item.imageUrl]:[])
+      }
+    };
+    try{ if(typeof ensureTxReconDefaults==='function')ensureTxReconDefaults(tx); }catch(_){}
+    transactions.push(tx); tp59PersistTx(tx);
+
+    b.fulfilmentMethod=method;
+    b.status='payment_pending'; b.serviceWorkflowStatus='payment_pending';
+    b.transactionId=tx.id; b.paymentStartedAt=tp59NowIso();
+    b.history=Array.isArray(b.history)?b.history:[];
+    b.history.push({at:b.paymentStartedAt,actor:'buyer',action:'protected_payment_created',transactionId:tx.id,amount:tx.amount});
+    tp59PersistBooking(b);
+
+    try{ if(typeof logAudit==='function')logAudit(req,'service_protected_transaction_created_v059',{bookingId:b.serviceBookingId||b.id,txId:tx.id,amount:tx.amount,providerPhone:provider}); }catch(_){}
+    tp59Notify(provider,{type:'service_payment_started',title:'Buyer started protected payment',message:`Protected payment for ${b.itemTitle||'the service'} is awaiting confirmation.`,requestId:b.serviceBookingId||b.id,txId:tx.id,itemCode:b.itemCode});
+    return res.status(201).json({ok:true,transaction:tx,booking:tp59View(b)});
+  });
+
+  app.post('/api/services/bookings/:id/payment-sync', requireAuth, async (req,res)=>{
+    const b=tp59Booking(req.params.id);
+    if(!b)return res.status(404).json({error:'Service booking not found.'});
+    const role=tp59Role(req), buyer=String(b.buyerPhone||b.fromPhone||''), provider=String(b.providerPhone||b.toPhone||'');
+    if(role!=='admin'&&String(req.user.phone)!==buyer&&String(req.user.phone)!==provider)return res.status(403).json({error:'You are not part of this service booking.'});
+
+    const requestedTx=String(req.body&&req.body.transactionId||'');
+    let tx=requestedTx?(Array.isArray(transactions)?transactions:[]).find(t=>String(t.id)===requestedTx):null;
+    if(!tx)tx=tp59ExistingTx(b);
+    if(!tx)return res.status(404).json({error:'Protected service transaction not found.'});
+    if(String(tx.serviceBookingId||tx.requestedServiceBookingId||'')!==String(b.serviceBookingId||b.id))return res.status(409).json({error:'This transaction is not linked to the selected service booking.'});
+
+    const paid=String(tx.paymentStatus||'').toLowerCase()==='paid'||!!tx.paidAt;
+    const previous=tp59Status(b);
+    if(paid){
+      b.status='booked'; b.serviceWorkflowStatus='booked';
+      b.paidAt=tx.paidAt||tp59NowIso(); b.bookedAt=b.bookedAt||b.paidAt;
+      tx.serviceFulfilmentStatus='booked'; tx.serviceBookedAt=b.bookedAt;
+      if(previous!=='booked'){
+        b.history=Array.isArray(b.history)?b.history:[];
+        b.history.push({at:tp59NowIso(),actor:'system',action:'protected_payment_confirmed',transactionId:tx.id});
+        tp59Notify(provider,{type:'service_payment_confirmed',title:'Protected payment confirmed',message:`${b.itemTitle||'Service'} is now booked.`,requestId:b.serviceBookingId||b.id,txId:tx.id,itemCode:b.itemCode});
+        tp59Notify(buyer,{type:'service_booking_confirmed',title:'Service booking confirmed',message:`Payment is protected and ${b.itemTitle||'the service'} is now booked.`,requestId:b.serviceBookingId||b.id,txId:tx.id,itemCode:b.itemCode});
+      }
+      tp59PersistBooking(b); tp59PersistTx(tx);
+      try{ if(typeof logAudit==='function'&&previous!=='booked')logAudit(req,'service_payment_confirmed_v059',{bookingId:b.serviceBookingId||b.id,txId:tx.id,amount:tx.amount}); }catch(_){}
+    }else if(previous==='agreement_ready'){
+      b.status='payment_pending';b.serviceWorkflowStatus='payment_pending';b.transactionId=tx.id;tp59PersistBooking(b);
+    }
+    return res.json({ok:true,paid,transaction:tx,booking:tp59View(b)});
+  });
+
+  console.log('[TutoPay] v0.59 Service Protected Payment addon loaded');
+} catch(e) {
+  console.error('[TutoPay] v0.59 Service Protected Payment addon failed:',e&&e.message?e.message:e);
+}
