@@ -14803,3 +14803,127 @@ try {
 } catch (e) {
   console.error('[TutoPay] v0.60 Service Payment Amount Repair failed:', e&&e.message?e.message:e);
 }
+/* =======================================================================
+   TutoPay Next v0.61 — Service Payment Fulfilment Normalization (append-only)
+   -----------------------------------------------------------------------
+   Keep v0.54, v0.55, v0.59 and v0.60 patches in server.js.
+
+   Adds:
+   - POST /api/services/bookings/:id/payment-prepare-v061
+   - GET  /api/tp61/service-payment-health
+
+   Purpose:
+   Older/newer service records can use equivalent fulfilment labels such as
+   `on_site` and `client_location`. v0.59 validates the values literally.
+   This preflight canonicalizes the agreement immediately before the existing
+   protected-payment route runs.
+   ======================================================================= */
+try {
+  function tp61NowIso(){ try { if(typeof nowIso==='function')return nowIso(); } catch(_){} return new Date().toISOString(); }
+  function tp61Role(req){ return String(req&&req.user?req.user.role||'':'').trim().toLowerCase(); }
+  function tp61Method(v){
+    const s=String(v||'').trim().toLowerCase().replace(/[\s-]+/g,'_');
+    if(['on_site','onsite','client_location','client_site','customer_location','buyer_location','at_client','at_client_location'].includes(s))return'client_location';
+    if(['remote','online','remote_online','remote_or_online','virtual'].includes(s))return'remote';
+    if(['provider_location','provider_site','at_provider','at_provider_location','shop_location','business_location'].includes(s))return'provider_location';
+    if(s==='hybrid')return'hybrid';
+    return s;
+  }
+  function tp61Matches(id){
+    const key=String(id||'');
+    return (Array.isArray(requests)?requests:[]).filter(r=>r&&(
+      String(r.id||'')===key || String(r.serviceBookingId||'')===key || String(r.bookingId||'')===key
+    ));
+  }
+  function tp61Item(code){
+    const key=String(code||''); let item=null;
+    try{ if(typeof findItem==='function')item=findItem(key); }catch(_){}
+    if(!item)item=(Array.isArray(items)?items:[]).find(x=>String(x.id||'')===key||String(x.code||x.itemCode||'')===key)||null;
+    return item;
+  }
+  function tp61AllowedFromItem(item){
+    const mode=tp61Method(item&&item.deliveryMode);
+    if(mode==='hybrid')return['client_location','remote','provider_location'];
+    if(['client_location','remote','provider_location'].includes(mode))return[mode];
+    return['client_location'];
+  }
+  function tp61Allowed(b,item){
+    let source=Array.isArray(b&&b.allowedFulfilmentMethods)?b.allowedFulfilmentMethods:[];
+    let out=[];
+    for(const v of source){
+      const m=tp61Method(v);
+      if(m==='hybrid')out.push('client_location','remote','provider_location');
+      else if(['client_location','remote','provider_location'].includes(m))out.push(m);
+    }
+    if(!out.length)out=tp61AllowedFromItem(item);
+    return [...new Set(out)];
+  }
+  function tp61Persist(r){
+    r.updatedAt=tp61NowIso();
+    try{ if(typeof dbUpsertRequest==='function')dbUpsertRequest(r).catch(()=>{}); }catch(_){}
+  }
+  function tp61View(b){
+    return {...b,
+      id:String(b.serviceBookingId||b.bookingId||b.id||''),
+      serviceBookingId:String(b.serviceBookingId||b.bookingId||b.id||''),
+      buyerPhone:b.buyerPhone||b.fromPhone||'',
+      providerPhone:b.providerPhone||b.toPhone||'',
+      status:String(b.serviceWorkflowStatus||b.workflowStatus||b.status||''),
+      workflowStatus:String(b.serviceWorkflowStatus||b.workflowStatus||b.status||'')
+    };
+  }
+
+  app.get('/api/tp61/service-payment-health',(req,res)=>res.json({ok:true,version:'0.61',fulfilmentNormalization:true}));
+
+  app.post('/api/services/bookings/:id/payment-prepare-v061', requireAuth, async (req,res)=>{
+    const matches=tp61Matches(req.params.id);
+    if(!matches.length)return res.status(404).json({error:'Service agreement not found.'});
+
+    const canonical=matches.slice().sort((a,b)=>Date.parse(b.updatedAt||b.agreedAt||b.createdAt||0)-Date.parse(a.updatedAt||a.agreedAt||a.createdAt||0))[0];
+    const buyer=String(canonical.buyerPhone||canonical.fromPhone||'');
+    const role=tp61Role(req);
+    if(role!=='admin'&&(role!=='buyer'||String(req.user.phone||'')!==buyer))return res.status(403).json({error:'Only the buyer can prepare this service payment.'});
+
+    const itemCode=String(canonical.itemCode||canonical.itemSnapshot?.code||'');
+    const item=tp61Item(itemCode);
+    if(!item)return res.status(404).json({error:'The service listing linked to this agreement could not be found.'});
+
+    let allowed=tp61Allowed(canonical,item);
+    // Prefer listing capabilities when legacy booking values disagree with the listing.
+    const listingAllowed=tp61AllowedFromItem(item);
+    const overlap=allowed.filter(x=>listingAllowed.includes(x));
+    if(overlap.length)allowed=overlap; else allowed=listingAllowed;
+
+    const requested=tp61Method(req.body&&req.body.fulfilmentMethod);
+    const existing=tp61Method(canonical.fulfilmentMethod||canonical.serviceFulfilmentMethod||canonical.agreedFulfilmentMethod||'');
+    let method=requested||existing||'';
+    if(method==='hybrid')method='';
+    if(method&&!allowed.includes(method)){
+      // Legacy aliases have already been canonicalized. A remaining mismatch is real.
+      return res.status(400).json({error:'Choose a valid agreed service fulfilment method.'});
+    }
+    if(!method){
+      if(allowed.length===1)method=allowed[0];
+      else return res.status(400).json({error:'Choose how this hybrid service will be fulfilled before creating payment.'});
+    }
+
+    const bookingId=String(canonical.serviceBookingId||canonical.bookingId||canonical.id||req.params.id);
+    for(const r of matches){
+      r.serviceBookingId=String(r.serviceBookingId||bookingId);
+      r.allowedFulfilmentMethods=[...allowed];
+      r.fulfilmentMethod=method;
+      r.serviceFulfilmentMethod=method;
+      r.agreedFulfilmentMethod=method;
+      tp61Persist(r);
+    }
+
+    try{ if(typeof logAudit==='function')logAudit(req,'service_fulfilment_normalized_v061',{bookingId,itemCode,method,allowed}); }catch(_){}
+
+    const repaired=matches.find(r=>String(r.id||'')===String(req.params.id))||canonical;
+    return res.json({ok:true,version:'0.61',fulfilmentMethod:method,allowedFulfilmentMethods:allowed,booking:tp61View(repaired)});
+  });
+
+  console.log('[TutoPay] v0.61 Service Payment Fulfilment Normalization loaded');
+} catch(e) {
+  console.error('[TutoPay] v0.61 Service Fulfilment Repair failed:',e&&e.message?e.message:e);
+}
