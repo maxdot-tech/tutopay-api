@@ -15293,3 +15293,99 @@ try {
 } catch (e) {
   console.error('[TutoPay] v0.63 Service Payment Gate Bridge failed:', e && e.message ? e.message : e);
 }
+/* =======================================================================
+   TutoPay Next v0.64 — Canonical Service Payment Options (append-only)
+   -----------------------------------------------------------------------
+   Keep all existing server code and v0.54-v0.63 patches.
+
+   Fixes the Hybrid service dead-end where the frontend payment sheet could
+   render without a fulfilment selector while v0.62 correctly required one.
+   The frontend now asks this endpoint for the exact fulfilment choices that
+   the server derives from the live service listing/agreement.
+   ======================================================================= */
+try {
+  function tp64Phone(v){ const d=String(v||'').replace(/\D/g,''); return d.slice(-10); }
+  function tp64Method(v){
+    const s=String(v||'').trim().toLowerCase().replace(/[\s-]+/g,'_');
+    if(['on_site','onsite','client_location','client_site','customer_location','buyer_location','at_client','at_client_location'].includes(s))return'client_location';
+    if(['remote','online','remote_online','remote_or_online','virtual'].includes(s))return'remote';
+    if(['provider_location','provider_site','at_provider','at_provider_location','shop_location','business_location'].includes(s))return'provider_location';
+    if(s==='hybrid')return'hybrid';
+    return s;
+  }
+  function tp64Rows(id){
+    const key=String(id||'');
+    return (Array.isArray(requests)?requests:[]).filter(r=>r&&(
+      String(r.id||'')===key || String(r.serviceBookingId||'')===key || String(r.bookingId||'')===key
+    ));
+  }
+  function tp64Item(code){
+    const key=String(code||''); let it=null;
+    try{ if(typeof findItem==='function')it=findItem(key); }catch(_){}
+    if(!it)it=(Array.isArray(items)?items:[]).find(x=>String(x.id||'')===key||String(x.code||x.itemCode||'')===key)||null;
+    return it;
+  }
+  function tp64AllowedFromMode(v){
+    const m=tp64Method(v);
+    if(m==='hybrid')return['client_location','remote','provider_location'];
+    if(['client_location','remote','provider_location'].includes(m))return[m];
+    return[];
+  }
+  function tp64AllowedFromRows(rows){
+    const out=[];
+    for(const r of rows||[]){
+      const vals=[];
+      if(Array.isArray(r&&r.allowedFulfilmentMethods))vals.push(...r.allowedFulfilmentMethods);
+      if(Array.isArray(r&&r.fulfilmentMethods))vals.push(...r.fulfilmentMethods);
+      vals.push(r&&r.fulfilmentMethod,r&&r.serviceFulfilmentMethod,r&&r.agreedFulfilmentMethod,r&&r.deliveryMode,r&&r.itemSnapshot&&r.itemSnapshot.deliveryMode);
+      for(const v of vals){
+        const m=tp64Method(v);
+        if(m==='hybrid')out.push('client_location','remote','provider_location');
+        else if(['client_location','remote','provider_location'].includes(m))out.push(m);
+      }
+    }
+    return [...new Set(out)];
+  }
+
+  app.get('/api/services/bookings/:id/payment-options-v064', requireAuth, (req,res)=>{
+    const rows=tp64Rows(req.params.id);
+    if(!rows.length)return res.status(404).json({error:'Service agreement not found.'});
+
+    const canonical=rows.slice().sort((a,b)=>Date.parse(b.updatedAt||b.agreedAt||b.createdAt||0)-Date.parse(a.updatedAt||a.agreedAt||a.createdAt||0))[0];
+    const buyer=String(canonical.buyerPhone||canonical.fromPhone||rows.find(r=>r.buyerPhone||r.fromPhone)?.buyerPhone||rows.find(r=>r.fromPhone)?.fromPhone||'');
+    const role=String(req.user&&req.user.role||'').toLowerCase();
+    if(role!=='admin' && (role!=='buyer'||tp64Phone(req.user&&req.user.phone)!==tp64Phone(buyer))){
+      return res.status(403).json({error:'Only the buyer can view service payment options.'});
+    }
+
+    let itemCode=String(canonical.itemCode||canonical.itemSnapshot?.code||'');
+    if(!itemCode){
+      const withItem=rows.find(r=>r.itemCode||r.itemSnapshot?.code);
+      itemCode=String(withItem?.itemCode||withItem?.itemSnapshot?.code||'');
+    }
+    const item=tp64Item(itemCode);
+    let allowed=item?tp64AllowedFromMode(item.deliveryMode):[];
+    if(!allowed.length)allowed=tp64AllowedFromRows(rows);
+    if(!allowed.length)return res.status(400).json({error:'This service has no usable fulfilment method. The provider must review the service listing.'});
+
+    const stored=tp64Method(canonical.fulfilmentMethod||canonical.serviceFulfilmentMethod||canonical.agreedFulfilmentMethod||'');
+    const selected=allowed.includes(stored)?stored:(allowed.length===1?allowed[0]:'');
+
+    return res.json({
+      ok:true,
+      version:'0.64',
+      bookingId:String(canonical.serviceBookingId||canonical.bookingId||req.params.id||canonical.id||''),
+      itemCode,
+      deliveryMode:tp64Method(item&&item.deliveryMode||canonical.deliveryMode||canonical.itemSnapshot?.deliveryMode||''),
+      allowedFulfilmentMethods:allowed,
+      selectedFulfilmentMethod:selected,
+      requiresChoice:allowed.length>1,
+      source:item?'live_service_listing':'service_agreement_fallback'
+    });
+  });
+
+  app.get('/api/tp64/service-payment-options-health',(req,res)=>res.json({ok:true,version:'0.64',canonicalServicePaymentOptions:true}));
+  console.log('[TutoPay] v0.64 Canonical Service Payment Options loaded');
+} catch(e){
+  console.error('[TutoPay] v0.64 Canonical Service Payment Options failed:',e&&e.message?e.message:e);
+}
